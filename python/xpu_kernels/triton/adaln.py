@@ -11,26 +11,31 @@ computation.
 Keeping the row in registers is bit-identical (0/12,205,056) and measures 1.56x
 (0.206 -> 0.132 ms per call at 3973 x 3072).  Same caveat as `xpu_rope.py`:
 `num_warps=4` is load-bearing (the shipped kernel's default; at 1, 2 or 8 the
-reduction layout changes and hundreds of values move), and `_self_test()`
+reduction layout changes and hundreds of values move), and the gate (`_GATE`)
 re-checks bit-equality per process so a Triton upgrade degrades to
 correct-but-slower rather than changing the image.
 
 `subtract_mean=True` (real LayerNorm) is not covered and is not on this path.
 
-MOSS_NO_ADALN_ROWS=1 disables it (A/B and escape hatch).
+XPU_KERNELS_NO_ADALN=1 disables it (the legacy MOSS_NO_ADALN_ROWS is
+accepted); that flag is both the A/B switch and the escape hatch.
 """
 
+import logging
 import os
 
 import torch
 
-_ENABLED = os.environ.get("MOSS_NO_ADALN_ROWS", "") != "1"
+from ._gate import ACCELERATORS, Gate, probe_device
+
+log = logging.getLogger(__name__)
+
+# Load-bearing, same reason as the rope kernel: the shipped kernel's default, and
+# at 1, 2 or 8 the reduction layout changes and hundreds of values move.
+NUM_WARPS = 4
 
 _kernel = None
 _triton = None
-_verified = None
-_WHY = None          # why the last self-test said what it said
-_REFERENCE = None    # injected reference implementation, see set_reference()
 
 try:
     import triton
@@ -69,7 +74,7 @@ except Exception:  # pragma: no cover - no triton on this box
 
 
 def enabled():
-    return _ENABLED and _kernel is not None
+    return _kernel is not None and _GATE.disabled_by is None
 
 
 def _shipped_path_is_triton():
@@ -81,6 +86,9 @@ def _shipped_path_is_triton():
     """
     try:
         import comfy_kitchen
+    except Exception:
+        return True  # not running inside ComfyUI: no dispatch to contradict
+    try:
         return bool(comfy_kitchen.registry.is_available("triton"))
     except Exception:
         return False
@@ -94,23 +102,21 @@ def _flat(x, scale, shift):
     x_flat = x.reshape(n, d)
     if not x_flat.is_contiguous():
         x_flat = x_flat.contiguous()
-    from comfy_kitchen.backends._modulation import adaln_prep_modulation
-
-    scale_flat, scale_group = adaln_prep_modulation(scale, x, n, d)
-    shift_flat, shift_group = adaln_prep_modulation(shift, x, n, d)
+    scale_flat, scale_group = _prep_modulation(scale, x, n, d)
+    shift_flat, shift_group = _prep_modulation(shift, x, n, d)
     return orig_shape, x_flat, n, d, scale_flat, scale_group, shift_flat, shift_group
 
 
 def usable(x, scale, shift):
     if not enabled() or not _shipped_path_is_triton():
         return False
-    if x.device.type != "xpu" or x.dtype not in (torch.bfloat16, torch.float32):
+    if x.device.type not in ACCELERATORS or x.dtype not in (torch.bfloat16, torch.float32):
         return False
     if x.ndim < 2 or x.shape[-1] == 0 or x.shape[-1] > 4096:
         return False  # the shipped kernel loops over d in that case
     if x.shape[-1] % 2:
         return False
-    return _self_test()
+    return _GATE.ok()
 
 
 def _run(x, scale, shift, eps):
@@ -123,40 +129,34 @@ def _run(x, scale, shift, eps):
         eps,
         block_d=min(_triton.next_power_of_2(d), 4096),
         dtype=tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float32,
-        num_warps=4)  # num_warps=4 is load-bearing
+        num_warps=NUM_WARPS)
     return out.reshape(orig_shape)
 
 
-def _self_test():
-    global _verified
-    if _verified is not None:
-        return _verified
-    _verified = False
-    try:
-        shipped = _REFERENCE if _REFERENCE is not None else _default_reference()
+def _prep_modulation(t, x, n, d):
+    """Flatten a scale/shift tensor to (rows, d) + a broadcast group.
 
-        gen = torch.Generator(device="xpu").manual_seed(0)
-        x = (torch.randn(256, 3072, generator=gen, device="xpu") * 0.5).to(torch.bfloat16)
-        scale = torch.randn(1, 3072, generator=gen, device="xpu") * 0.1
-        shift = torch.randn(1, 3072, generator=gen, device="xpu") * 0.1
-        ref = shipped(x, scale, shift, 1e-6)
-        got = _run(x, scale, shift, 1e-6)
-        bad = (got.view(torch.int16) != ref.view(torch.int16)).sum().item()
-        import logging
-        if bad == 0:
-            logging.info("xpu_adaln: single-pass rms_adaln active, bit-identical "
-                         "to the shipped kernel on the self-test")
-            _verified = True
-        else:
-            logging.warning("xpu_adaln: self-test found %d differing values, "
-                            "falling back to the shipped rms_adaln", bad)
-    except Exception as exc:
-        global _WHY
-        _WHY = f"unverified: {exc}"
-        import logging
-        logging.warning("xpu_adaln: self-test failed (%s), using the shipped "
-                        "rms_adaln", exc)
-    return _verified
+    comfy_kitchen's helper keeps a broadcast over inner dims as one row per
+    distinct vector; without it we materialise the broadcast instead.  Both copy
+    the same values -- the grouping only avoids redundant read traffic -- so the
+    choice cannot change a result.
+    """
+    try:
+        from comfy_kitchen.backends._modulation import adaln_prep_modulation
+    except Exception:
+        flat = t.expand_as(x).reshape(n, d)
+        return (flat if flat.is_contiguous() else flat.contiguous()), 1
+    return adaln_prep_modulation(t, x, n, d)
+
+
+def _probe_forward(ref):
+    """One row-block, bf16, with a scale/shift that is not all ones."""
+    device = probe_device()
+    gen = torch.Generator(device=device).manual_seed(0)
+    x = (torch.randn(256, 3072, generator=gen, device=device) * 0.5).to(torch.bfloat16)
+    scale = torch.randn(1, 3072, generator=gen, device=device) * 0.1
+    shift = torch.randn(1, 3072, generator=gen, device=device) * 0.1
+    return {"x": (_run(x, scale, shift, 1e-6), ref(x, scale, shift, 1e-6))}
 
 
 def _default_reference():
@@ -165,24 +165,37 @@ def _default_reference():
     return rms_adaln
 
 
+_GATE = Gate(
+    "rms_adaln", _probe_forward,
+    default_reference=_default_reference,
+    env="XPU_KERNELS_NO_ADALN", legacy_env="MOSS_NO_ADALN_ROWS",
+    num_warps=NUM_WARPS,
+)
+
+
 def set_reference(fn=None):
-    """Point the self-test at a reference implementation, or clear it.
+    """Point the gate at the implementation it must match, or clear it.
 
     ``fn`` must have the signature ``fn(x, scale, shift, eps) -> x'`` and be the
-    implementation the caller falls back to; the gate only proves anything
-    against that.  Without it, ComfyUI's kernel is used when importable.
+    path the caller falls back to.  Without it, ``comfy_kitchen``'s kernel is
+    used when importable; otherwise the kernel stays inactive.
     """
-    global _REFERENCE, _verified, _WHY
-    _REFERENCE, _verified, _WHY = fn, None, None
+    _GATE.set_reference(fn)
+
+
+def gates():
+    """This module's permission slips, by name (for the status report)."""
+    return {"rms_adaln": _GATE}
 
 
 def describe():
     """One line: is this kernel in use, and if not, why."""
-    if not _ENABLED:
-        return "disabled: MOSS_NO_ADALN_ROWS=1"
-    ok = _self_test()
-    why = _WHY or ("verified against the reference" if ok else "self-test mismatch")
-    return f"{'active' if ok else 'inactive'}: {why}"
+    return _GATE.describe()
+
+
+def _self_test():
+    """Kept for callers that predate the gate object."""
+    return _GATE.ok()
 
 
 def rms_adaln(x, scale, shift, eps=1e-6):

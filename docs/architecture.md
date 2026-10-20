@@ -169,3 +169,30 @@ Matching it needs exactly the tiling that is absent here, and even a generous
 for the 0.15 ms epilogue the fusion would delete. So the pipeline uses
 `torch._int_mm` and the GEMM stays a standalone, CPU-verified reference
 implementation.
+## Verification: what makes these kernels safe to drop in
+
+Every kernel here is a *schedule* change over arithmetic that already exists in
+the caller. That is deliberate — a fused kernel that also changes the arithmetic
+cannot be proven, only measured — and it gives one acceptance test: the kernel
+must reproduce the bits of the chain it replaces, on this machine and in this
+process.
+
+* The INT8 side is verified by the suites in `debug/` (`verify_epilogue.py`,
+  `verify_situ_fusion.py`, `verify_acc_rope.py`, ...) against the unfused chain,
+  plus the pipeline-level PNG hashes recorded in `docs/performance.md`.
+* The Triton side verifies itself at first use through `triton/_gate.py`: it runs
+  the kernel and the caller's fallback on synthetic inputs at the production
+  shape, compares bit patterns, and latches the verdict. A mismatch or an
+  un-runnable probe disables the kernel for the rest of the process.
+* `tests/test_gate.py` pins the gate's failure modes on CPU, so the verification
+  machinery itself has a test that does not need a GPU.
+
+The two rules that follow from this, and that are easy to get wrong:
+
+1. **Do not tune a launch parameter that changes a reduction order.** For the
+   Triton kernels that is `num_warps`; at 1 it is 1.6x faster and 36/12.2M values
+   differ. The gate catches it, which is why it is a code change and not a knob.
+2. **A backward pass is verified against `torch.autograd` of the eager chain**,
+   as a pair with its forward (one probe, both outputs), with a float64
+   gradcheck where an algebraic identity is involved. See
+   `docs/adding-a-kernel.md`.

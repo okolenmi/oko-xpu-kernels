@@ -64,8 +64,11 @@ Two design rules in those files worth copying even if the kernels are rewritten:
    against the shipped chain on first use and disables itself on any mismatch.
    A custom kernel in a training loop that silently changes numerics is worse
    than a slow one.
-2. **One env flag per kernel** (`MOSS_NO_ROPE_ROWS`, `MOSS_NO_ADALN_ROWS`) so a
-   suspect result can be bisected without a code change.
+2. **One env flag per kernel** (`XPU_KERNELS_NO_ROPE`, `XPU_KERNELS_NO_ADALN`;
+   the legacy `MOSS_NO_*` names are accepted) so a suspect result can be
+   bisected without a code change. The gate is shared
+   (`triton/_gate.py`, CPU-tested in `tests/test_gate.py`), so a new kernel only
+   has to supply a probe, not a verification mechanism.
 
 Caveat: both kernels are written for MossImage's exact dtypes and shapes
 (bf16, `dim=3072`, 24 heads × 128, `num_warps=4` because a different warp count

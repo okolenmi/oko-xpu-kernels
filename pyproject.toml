@@ -24,3 +24,8 @@ where = ["python"]
 
 [tool.setuptools.package-data]
 xpu_kernels = ["*.so"]
+"xpu_kernels.int8" = ["*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]

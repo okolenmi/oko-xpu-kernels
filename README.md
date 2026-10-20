@@ -25,6 +25,7 @@ written up in `docs/` so they do not have to be rediscovered.
 | [`docs/performance.md`](docs/performance.md) | all measurements, device ceilings, stage tables, **the fair BF16 comparison** |
 | [`docs/experiments.md`](docs/experiments.md) | what was tried, including the dead ends, so they are not repeated |
 | [`python/xpu_kernels`](python/xpu_kernels/__init__.py) | the Python package: `xpu_kernels.int8` (ConvRot INT8) and `xpu_kernels.triton` (rope, adaLN) |
+| [`docs/adding-a-kernel.md`](docs/adding-a-kernel.md) | the structure every addition follows: gate, escape hatch, reference, evidence |
 | [`docs/for-b580-diffusion-training.md`](docs/for-b580-diffusion-training.md) | what a *training* project on the same card can reuse (and what it must not) |
 | [`debug/README.md`](debug/README.md) | the measurement instruments and how to re-run them |
 
@@ -131,15 +132,21 @@ k.set_reference(k.rope, my_rms_rope)        # once, before first use
 q, kk = k.rope.rms_rope_split_half(q, kk, freqs_cis, q_scale, k_scale)
 x = k.adaln.rms_adaln(x, scale, shift)
 
-print(k.status())   # rms_rope : active: verified against the reference
-                    # rms_adaln: active: verified against the reference
+print(k.status())   # rms_rope          : active: verified against the reference (1572864 values), num_warps=4
+                    # rms_rope_dequant  : active: verified against the reference (1572864 values), num_warps=4
+                    # rms_adaln         : active: verified against the reference (786432 values), num_warps=4
 ```
 
 If `comfy_kitchen` is importable, its kernels are the default reference and no
 `set_reference` is needed. Without a reference the kernels stay inactive and
 `status()` says why — a kernel whose numerics nobody has pinned down is not
-worth the speed. `MOSS_NO_ROPE_ROWS=1` / `MOSS_NO_ADALN_ROWS=1` disable them
-outright.
+worth the speed. `XPU_KERNELS_NO_ROPE=1` / `XPU_KERNELS_NO_ADALN=1` disable them
+outright (the legacy `MOSS_NO_*` names still work).
+
+The gate itself is shared and tested on CPU (`tests/test_gate.py`): it coalesces
+"verified once per process", "any mismatch disables the kernel for the rest of
+the process", and "never pass a probe that could not run". `docs/adding-a-kernel.md`
+is the checklist for a new kernel, including the backward-pass rules.
 
 Measured on this card, 42-block DiT at M≈3974: rope 2.34× (35.7 → 15.3 ms per
 forward), adaLN 1.56× (12.7 → 8 ms), both bit-exact. A different `num_warps`
@@ -191,22 +198,24 @@ C API and `docs/architecture.md` for the algorithm.
 include/xpu_kernels/convrot.h   public C API (callable on torch XPU data_ptr())
 src/xpuint8.cpp                 both SYCL kernels + C API
 build.sh                        builds build/libxpuint8.so with icpx (version-pinned)
-python/xpu_kernels/int8.py      torch-only binding: prepare_weight, linear, Int8Linear, ...
-python/xpu_kernels/triton/      rope.py, adaln.py: single-pass kernels + their gates
+python/xpu_kernels/int8/        torch-only binding: _lib.py loader, ops.py, selftest.py
+python/xpu_kernels/triton/      rope.py, adaln.py: single-pass kernels + _gate.py
 pyproject.toml                  `pip install .` for another project
 benchmarks/bench_pipeline.py    end-to-end: eager vs fused vs BF16
 benchmarks/bench_int8.py        torch _int_mm vs BF16 microbenchmark
 reference/convrot_linear.py     portable PyTorch ConvRot reference
 kernels/                        standalone experiments (DPAS probes, GEMM, per-kernel tests)
 debug/                          measurement instruments and the verification harnesses
-docs/                           architecture, performance, experiments, findings
+docs/                           architecture, performance, experiments, findings, how to add a kernel
+tests/                          CPU-only unit tests (the gate's contract)
 ```
 
 ## Build and run
 
 ```bash
 ./build.sh                        # -> build/libxpuint8.so
-PYTHONPATH=python python -m xpu_kernels
+PYTHONPATH=python python -m xpu_kernels      # self-test: int8 + every gate
+PYTHONPATH=python python -m pytest tests/ -q # CPU-only: the gate's contract
 python benchmarks/bench_pipeline.py
 python debug/bench_bf16_fair.py   # the honest INT8-vs-BF16 number
 ```

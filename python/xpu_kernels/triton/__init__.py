@@ -12,32 +12,51 @@ are meant to be *bit-identical* to it, not merely close:
 ``adaln.rms_adaln(x, scale, shift, eps=1e-6)``
     RMSNorm + adaLN modulation (``x * rsqrt(mean(x^2)+eps) * (1+scale) + shift``).
 
-The discipline both follow, and the reason they are safe to drop into a model:
-they verify themselves once per process against an established reference and
-then either engage or fall back, permanently, for that process.  See
-``set_reference`` in each module and ``status()`` below.
+The rule every kernel here follows, and the reason they are safe to drop into a
+model: each one verifies itself once per process against a reference
+implementation and then either engages or falls back, permanently, for that
+process.  See :class:`xpu_kernels.triton._gate.Gate` for the contract, and
+``set_reference`` below for supplying the reference.
 
     import xpu_kernels.triton as k
-    k.set_reference(k.rope, my_reference)      # your fallback path, once
-    print(k.status())                          # active / inactive + why
+    k.set_reference(k.rope, my_rms_rope)      # your fallback path, once
+    print(k.status())                         # active / inactive + why
 """
 
 from __future__ import annotations
 
 from . import adaln, rope
+from ._gate import Gate
 
-__all__ = ["adaln", "rope", "status", "set_reference"]
+__all__ = ["Gate", "adaln", "rope", "gates", "set_reference", "status"]
+
+_MODULES = (rope, adaln)
+
+
+def gates():
+    """Every gate in the package, by kernel name."""
+    out = {}
+    for module in _MODULES:
+        out.update(module.gates())
+    return out
 
 
 def set_reference(module, fn=None):
     """Set (or clear) the reference implementation for one kernel module.
 
-    ``module`` is ``rope`` or ``adaln``; ``fn`` is the implementation that
-    module falls back to, so the gate compares like with like.
+    ``module`` is ``rope``, ``adaln``, or their name as a string; ``fn`` is the
+    implementation that module falls back to, so the gate compares like with
+    like.  Without a reference the kernels stay inactive.
     """
+    if isinstance(module, str):
+        module = {"rope": rope, "adaln": adaln}[module]
     module.set_reference(fn)
 
 
 def status():
-    """One line per kernel: whether it is in use on this machine, and why not."""
-    return [f"rms_rope  : {rope.describe()}", f"rms_adaln : {adaln.describe()}"]
+    """One line per kernel: whether it is in use on this machine, and why not.
+
+    Runs the verification of anything that has not been verified yet in this
+    process, so the answer is about the kernels as they would run now.
+    """
+    return [f"{name:18s}: {gate.describe()}" for name, gate in gates().items()]

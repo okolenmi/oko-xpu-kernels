@@ -34,29 +34,35 @@ things that must not be "optimised" back:
     it forces a layout conversion that makes the kernel *slower* than the
     shipped one (1.43 ms vs 1.37 ms), so the schedule win would be thrown away.
 
-`debug/probe_rope_variants.py` is the evidence for both statements, and
-`_self_test()` re-checks the whole thing once per process against the shipped
-kernel on synthetic strided tensors, falling back to it if anything differs --
-so a Triton upgrade that changes its layouts degrades to correct-but-slower
-instead of changing the image.
+`debug/probe_rope_variants.py` is the evidence for both statements, and the
+gate (`_GATE`, see `_gate.py`) re-checks the whole thing once per process against
+the shipped kernel on synthetic strided tensors, falling back to it if anything
+differs -- so a Triton upgrade that changes its layouts degrades to
+correct-but-slower instead of changing the image.
 
-MOSS_NO_ROPE_ROWS=1 disables it entirely (A/B and escape hatch).
+XPU_KERNELS_NO_ROPE=1 disables it entirely (the legacy MOSS_NO_ROPE_ROWS
+is accepted); the flag is both the A/B switch and the escape hatch.
 """
 
+import logging
 import os
 
 import torch
 
-_ENABLED = os.environ.get("MOSS_NO_ROPE_ROWS", "") != "1"
+from ._gate import ACCELERATORS, Gate, probe_device
+
+log = logging.getLogger(__name__)
+
+# Load-bearing: Triton's reduction order follows the block layout, so a different
+# warp count moves the last bit of `inv_rms` (num_warps=1 is 1.6x faster and
+# produces 36/12.2M mismatches).  Changing it is a code change the gate must
+# re-approve -- see debug/probe_rope_variants.py.
+NUM_WARPS = 4
 
 _kernel = None
 _kernel_dq = None
 _triton = None
 _import_error = None
-_verified = None
-_verified_dq = None
-_WHY = None          # why the last self-test said what it said
-_REFERENCE = None    # injected reference implementation, see set_reference()
 _logged = False
 
 try:
@@ -223,7 +229,7 @@ def _bucket(x, freqs_cis):
 
 
 def enabled():
-    return _ENABLED and _kernel is not None
+    return _kernel is not None and _GATE.disabled_by is None
 
 
 def _shipped_path_is_triton():
@@ -236,6 +242,9 @@ def _shipped_path_is_triton():
     """
     try:
         import comfy_kitchen
+    except Exception:
+        return True  # not running inside ComfyUI: no dispatch to contradict
+    try:
         return bool(comfy_kitchen.registry.is_available("triton"))
     except Exception:
         return False
@@ -255,7 +264,7 @@ def _rows(x, freqs_cis, scale, epsilon, split_half=True):
         freqs_cis.stride(4), freqs_cis.stride(5),
         epsilon,
         block_dim=_triton.next_power_of_2(D), n_pairs=D // 2,
-        split_half=split_half, num_warps=4)  # num_warps=4 is load-bearing
+        split_half=split_half, num_warps=NUM_WARPS)
     return out
 
 
@@ -287,55 +296,31 @@ def _rows_dq(acc, freqs_cis, scale, epsilon, x_scale, w_scale, split_half=True):
         freqs_cis.stride(4), freqs_cis.stride(5),
         epsilon,
         block_dim=_triton.next_power_of_2(D), n_pairs=D // 2,
-        split_half=split_half, num_warps=4)  # num_warps=4 is load-bearing
+        split_half=split_half, num_warps=NUM_WARPS)
     return out
 
 
-def _self_test():
-    """Once per process: is this kernel still bit-identical to the shipped one?
+def _probe_forward(ref):
+    """Synthetic strided q/k, the layout the model actually passes.
 
-    Uses its own generator so the sampler's noise stream is untouched, and a
-    strided q/k pair because that is the layout `model.py` actually passes.
+    Its own generator, so the sampler's noise stream is untouched.  Both q and k
+    are returned: a failure should say which one moved.
     """
-    global _verified
-    if _verified is not None:
-        return _verified
-    _verified = False
-    try:
-        shipped = _REFERENCE if _REFERENCE is not None else _default_reference()
-
-        gen = torch.Generator(device="xpu").manual_seed(0)
-        B, S, H, D = 1, 256, 24, 128
-        qkv = (torch.randn(B, S, 3 * H * D, generator=gen,
-                           device="xpu") * 0.3).to(torch.bfloat16)
-        q, k, _ = qkv.chunk(3, dim=-1)
-        q = q.view(B, S, H, D)
-        k = k.view(B, S, H, D)
-        scale = torch.rand(D, generator=gen, device="xpu") * 0.2 + 0.9
-        ang = torch.rand(B, S, 1, D // 2, generator=gen, device="xpu") * 3.0
-        pe = torch.stack([torch.stack([ang.cos(), -ang.sin()], -1),
-                          torch.stack([ang.sin(), ang.cos()], -1)], -2)
-        ref_q, ref_k = shipped(q, k, pe, scale, None, 1e-6)
-        got_q, got_k = _rows(q, pe, scale, 1e-6), _rows(k, pe, scale, 1e-6)
-        same = (got_q.view(torch.int16).equal(ref_q.view(torch.int16))
-                and got_k.view(torch.int16).equal(ref_k.view(torch.int16)))
-        bad = (got_q.view(torch.int16) != ref_q.view(torch.int16)).sum().item()
-        bad += (got_k.view(torch.int16) != ref_k.view(torch.int16)).sum().item()
-        import logging
-        if same:
-            logging.info("xpu_rope: single-pass rms_rope active, bit-identical "
-                         "to the shipped kernel on the self-test")
-            _verified = True
-        else:
-            logging.warning("xpu_rope: self-test found %d differing values, "
-                            "falling back to the shipped rms_rope kernel", bad)
-    except Exception as exc:
-        global _WHY
-        _WHY = f"unverified: {exc}"
-        import logging
-        logging.warning("xpu_rope: self-test failed (%s), using the shipped "
-                        "rms_rope kernel", exc)
-    return _verified
+    device = probe_device()
+    gen = torch.Generator(device=device).manual_seed(0)
+    B, S, H, D = 1, 256, 24, 128
+    qkv = (torch.randn(B, S, 3 * H * D, generator=gen,
+                       device=device) * 0.3).to(torch.bfloat16)
+    q, k, _ = qkv.chunk(3, dim=-1)
+    q = q.view(B, S, H, D)
+    k = k.view(B, S, H, D)
+    scale = torch.rand(D, generator=gen, device=device) * 0.2 + 0.9
+    ang = torch.rand(B, S, 1, D // 2, generator=gen, device=device) * 3.0
+    pe = torch.stack([torch.stack([ang.cos(), -ang.sin()], -1),
+                      torch.stack([ang.sin(), ang.cos()], -1)], -2)
+    ref_q, ref_k = ref(q, k, pe, scale, None, 1e-6)
+    return {"q": (_rows(q, pe, scale, 1e-6), ref_q),
+            "k": (_rows(k, pe, scale, 1e-6), ref_k)}
 
 
 def _default_reference():
@@ -344,81 +329,80 @@ def _default_reference():
     return rms_rope_split_half
 
 
+def _probe_dequant(ref):
+    """Does the fused dequant+rope match dequant -> rope, bit for bit?
+
+    The reference dequant is the same fp32 expression in torch, which is what
+    `xpuint8_dequant_epilogue` computes (two fp32 multiplies and a
+    round-to-nearest-even bf16 store; `debug/bench_epilogue.py` cross-checks the
+    two).  The rope half is then the reference kernel, so a mismatch means
+    either the dequant rounding or the reduction moved.
+    """
+    device = probe_device()
+    gen = torch.Generator(device=device).manual_seed(1)
+    B, S, H, D = 1, 256, 24, 128
+    M, C = B * S, 3 * H * D
+    acc = torch.randint(-(2 ** 23), 2 ** 23, (M, C), generator=gen,
+                        device=device, dtype=torch.int32)
+    xs = torch.rand(M, generator=gen, device=device) * 0.02 + 0.001
+    ws = torch.rand(C, generator=gen, device=device) * 0.02 + 0.001
+    scale = torch.rand(D, generator=gen, device=device) * 0.2 + 0.9
+    ang = torch.rand(B, S, 1, D // 2, generator=gen, device=device) * 3.0
+    pe = torch.stack([torch.stack([ang.cos(), -ang.sin()], -1),
+                      torch.stack([ang.sin(), ang.cos()], -1)], -2)
+
+    achunk = acc.view(B, S, 3 * H * D)
+    pairs = {}
+    for name, lo in (("q", 0), ("k", H * D)):
+        sl = achunk[:, :, lo:lo + H * D].view(B, S, H, D)
+        w = ws[lo:lo + H * D]
+        ref_x = (acc[:, lo:lo + H * D].to(torch.float32)
+                 * (w * xs[:, None])).to(torch.bfloat16).view(B, S, H, D)
+        want, _ = ref(ref_x, ref_x, pe, scale, None, 1e-6)
+        pairs[name] = (_rows_dq(sl, pe, scale, 1e-6, xs.view(B, S), w), want)
+    return pairs
+
+
+_GATE = Gate(
+    "rms_rope", _probe_forward,
+    default_reference=_default_reference,
+    env="XPU_KERNELS_NO_ROPE", legacy_env="MOSS_NO_ROPE_ROWS",
+    num_warps=NUM_WARPS,
+)
+# The fused dequant variant is a separate permission: it consumes an int32
+# accumulator, so it can be wrong in ways the bf16 kernel is not.
+_GATE_DQ = Gate(
+    "rms_rope_dequant", _probe_dequant,
+    default_reference=_default_reference,
+    env="XPU_KERNELS_NO_ROPE", legacy_env="MOSS_NO_ROPE_ROWS",
+    num_warps=NUM_WARPS,
+)
+
+
 def set_reference(fn=None):
-    """Point the self-test at a reference implementation, or clear it.
+    """Point both gates at the implementation they must match, or clear them.
 
-    The gate exists to prove this kernel is bit-identical to *your* established
-    path, so it can only be meaningful against that path: ``fn`` must have the
-    signature ``fn(q, k, freqs_cis, scale, k_scale, epsilon) -> (q, k)`` and be
-    the implementation the caller falls back to.  Without it, ComfyUI's kernel
-    is used when importable; otherwise the fused kernel stays disabled and
-    ``describe()`` says so.
+    ``fn`` must have the signature ``fn(q, k, freqs_cis, scale, k_scale, eps)``
+    and be the path the caller falls back to.  Without it, ``comfy_kitchen``'s
+    kernel is used when importable; otherwise both kernels stay inactive.
     """
-    global _REFERENCE, _verified, _WHY
-    _REFERENCE, _verified, _WHY = fn, None, None
+    _GATE.set_reference(fn)
+    _GATE_DQ.set_reference(fn)
 
 
-def describe():
+def gates():
+    """This module's permission slips, by name (for the status report)."""
+    return {"rms_rope": _GATE, "rms_rope_dequant": _GATE_DQ}
+
+
+def describe(which="rms_rope"):
     """One line: is this kernel in use, and if not, why."""
-    if not _ENABLED:
-        return "disabled: MOSS_NO_ROPE_ROWS=1"
-    ok = _self_test()
-    why = _WHY or ("verified against the reference" if ok else "self-test mismatch")
-    return f"{'active' if ok else 'inactive'}: {why}"
+    return {"rms_rope": _GATE, "rms_rope_dequant": _GATE_DQ}[which].describe()
 
 
-def _self_test_dequant():
-    """Once per process: does the fused dequant+rope match dequant -> rope?
-
-    The reference dequant is the same fp32 expression in torch, which is the
-    arithmetic `xpuint8_dequant_epilogue` performs (two fp32 multiplies and a
-    round-to-nearest-even bf16 store; `debug/bench_epilogue.py` cross-checks
-    the two against each other).  The rope half is then the shipped kernel, so
-    a mismatch means either the dequant rounding or the reduction moved.
-    """
-    global _verified_dq
-    if _verified_dq is not None:
-        return _verified_dq
-    _verified_dq = False
-    try:
-        from comfy_kitchen.backends.triton.rms_rope import (
-            rms_rope_split_half as shipped,
-        )
-
-        gen = torch.Generator(device="xpu").manual_seed(1)
-        B, S, H, D = 1, 256, 24, 128
-        M, C = B * S, 3 * H * D
-        acc = torch.randint(-(2 ** 23), 2 ** 23, (M, C), generator=gen,
-                            device="xpu", dtype=torch.int32)
-        xs = torch.rand(M, generator=gen, device="xpu") * 0.02 + 0.001
-        ws = torch.rand(C, generator=gen, device="xpu") * 0.02 + 0.001
-        scale = torch.rand(D, generator=gen, device="xpu") * 0.2 + 0.9
-        ang = torch.rand(B, S, 1, D // 2, generator=gen, device="xpu") * 3.0
-        pe = torch.stack([torch.stack([ang.cos(), -ang.sin()], -1),
-                          torch.stack([ang.sin(), ang.cos()], -1)], -2)
-
-        achunk = acc.view(B, S, 3 * H * D)
-        bad = 0
-        for lo in (0, H * D):
-            sl = achunk[:, :, lo:lo + H * D].view(B, S, H, D)
-            w = ws[lo:lo + H * D]
-            ref = (acc[:, lo:lo + H * D].to(torch.float32)
-                   * (w * xs[:, None])).to(torch.bfloat16).view(B, S, H, D)
-            ref_q, _ = shipped(ref, ref, pe, scale, None, 1e-6)
-            got = _rows_dq(sl, pe, scale, 1e-6, xs.view(B, S), w)
-            bad += (got.view(torch.int16) != ref_q.view(torch.int16)).sum().item()
-        import logging
-        if bad == 0:
-            logging.info("xpu_rope: fused dequant+rms_rope is bit-identical "
-                         "to dequant -> shipped rms_rope on the self-test")
-            _verified_dq = True
-        else:
-            logging.warning("xpu_rope: dequant self-test found %d differing "
-                            "values, keeping the separate epilogue", bad)
-    except Exception as exc:
-        import logging
-        logging.warning("xpu_rope: dequant self-test failed (%s)", exc)
-    return _verified_dq
+def _self_test():
+    """Kept for callers that predate the gate object."""
+    return _GATE.ok()
 
 
 def dequant_ready():
@@ -427,12 +411,12 @@ def dequant_ready():
         return False
     if not _shipped_path_is_triton():
         return False
-    return _self_test_dequant()
+    return _GATE_DQ.ok()
 
 
 def dequant_usable(x_acc, freqs_cis):
     """True when the fused dequant+rope kernel can take this INT8 accumulator."""
-    if x_acc.dtype != torch.int32 or x_acc.device.type != "xpu":
+    if x_acc.dtype != torch.int32 or x_acc.device.type not in ACCELERATORS:
         return False
     if not _bucket(x_acc, freqs_cis):
         return False
@@ -453,13 +437,13 @@ def rms_rope_split_half_dequant(q_acc, k_acc, freqs_cis, q_w, k_w, x_scale,
 def usable(x, freqs_cis, rot_dim=0):
     if not enabled() or not _shipped_path_is_triton():
         return False
-    if x.dtype != torch.bfloat16 or x.device.type != "xpu":
+    if x.dtype != torch.bfloat16 or x.device.type not in ACCELERATORS:
         return False
     if rot_dim and rot_dim != x.shape[3]:
         return False  # partial rotary: not fused in the shipped kernel either
     if not _bucket(x, freqs_cis):
         return False
-    return _self_test()
+    return _GATE.ok()
 
 
 def rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6, rot_dim=0):

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build the native probes in debug/native and debug/native/rejected.
+#
+# These are standalone SYCL programs: each one measures or falsifies a specific
+# hypothesis and prints its result. They are the evidence behind the tables in
+# docs/performance.md, so they are kept in the repo rather than in /tmp.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ICPX="${ICPX:-icpx}"
+OUT="${OUT:-$HERE/bin}"
+
+# DPC++ needs its own runtime on the library path (no root, no system install).
+if [[ -d /home/okolenmi/.local/oneapi/opt/intel/oneapi/compiler/2026.0/lib ]]; then
+    export LD_LIBRARY_PATH="/home/okolenmi/.local/oneapi/opt/intel/oneapi/compiler/2026.0/lib:/home/okolenmi/.local/oneapi/opt/intel/oneapi/umf/1.1/lib:/home/okolenmi/.local/oneapi/opt/intel/oneapi/tbb/2023.0/lib/intel64/gcc4.8:${LD_LIBRARY_PATH:-}"
+fi
+
+mkdir -p "$OUT"
+
+build_one() {
+    local src="$1" name="$2"
+    "$ICPX" -O3 -fsycl -std=c++17 "$src" -o "$OUT/$name"
+    echo "  built $OUT/$name"
+}
+
+echo "building native probes -> $OUT"
+build_one "$HERE/probe_bandwidth.cpp"           probe_bandwidth
+build_one "$HERE/probe_rotate_ablation.cpp"     probe_rotate_ablation
+build_one "$HERE/probe_epilogue.cpp"            probe_epilogue
+build_one "$HERE/probe_ffn_situ.cpp"            probe_ffn_situ
+build_one "$HERE/probe_tanh_exact.cpp"          probe_tanh_exact
+build_one "$HERE/probe_lane_utilisation.cpp"    probe_lane_utilisation
+build_one "$HERE/probe_bf16_rotate.cpp"         probe_bf16_rotate
+build_one "$HERE/probe_load_store_width.cpp"    probe_load_store_width
+
+# GEMM probes: correctness-verified against a CPU reference, used to show that
+# the hand-written GEMM is L2-bandwidth bound rather than DPAS bound.
+if [[ -f "$HERE/../../kernels/int8_gemm_v3.cpp" ]]; then
+    build_one "$HERE/../../kernels/int8_gemm_v3.cpp" gemm_v3
+    build_one "$HERE/../../kernels/int8_gemm_v4.cpp" gemm_v4
+fi
+
+# oneDNN probe: needs the oneDNN 3.9 (2025.3) runtime from Intel's apt repo.
+# It is not part of the library -- it is the probe that closed the "fuse the
+# dequant epilogue into the GEMM" lever -- so it is built only if the
+# dependency has been fetched.
+DNNL_ROOT="${DNNL_ROOT:-$HOME/.local/oneapi-dnnl-2025.3}"
+if [[ -d "$DNNL_ROOT/include" && -d "$DNNL_ROOT/lib" ]]; then
+    "$ICPX" -O3 -fsycl -std=c++17 "$HERE/probe_dnnl_fused.cpp" -o "$OUT/probe_dnnl_fused" \
+        -I"$DNNL_ROOT/include" -L"$DNNL_ROOT/lib" -ldnnl -Wl,-rpath,"$DNNL_ROOT/lib"
+    echo "  built $OUT/probe_dnnl_fused"
+else
+    echo "  skipping probe_dnnl_fused (no oneDNN at $DNNL_ROOT; see docs)"
+fi
+
+# Negative-result experiments, kept because their failure modes are the reason
+# several plausible optimisations are not in the library.
+REJ="$HERE/rejected"
+for f in "$REJ"/*.cpp; do
+    [[ -e "$f" ]] || continue
+    build_one "$f" "rej_$(basename "$f" .cpp)"
+done
+
+echo "done."

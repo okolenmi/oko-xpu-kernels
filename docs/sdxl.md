@@ -163,7 +163,6 @@ pre-rotated: adopting the INT8 path means storing the base pre-rotated, so the
 bf16 comparison must use the rotated weights, or it is not a comparison at all.
 
 ## 5. The whole step, in the training project's own UNet (measured)
-
 The numbers above are per layer. The step is the question that matters, and
 it was measured in the training project's own SDXL UNet (its `next/` tree,
 borrowed read-only; the instrument is `debug/probe_sdxl_trainer_step.py`,
@@ -202,6 +201,30 @@ activity, one 512×512 step: **0.263 s over 12 171 kernel calls**):
 So the library's INT8 path works on the 45 %, and **the convolutions — 22 %
 of the step, and 334.8 M of the UNet's parameters — are the largest piece it
 cannot reach** (item 4).
+
+### The same step, in the training project's own run
+
+The numbers above are from the library's probe (the denoiser alone, batch 1).
+The trainer's own command line (`--resolution 512 --batch 4 --rank 16
+--batch-area 1.5 --param adapter.base_precision=int8 --graph`) says the same
+thing about the whole step:
+
+| run | the replayed step | the live memory |
+|---|---|---|
+| int8 base, **no** `buckets.max_shapes` | **never replays** (0 in 20 steps) | 3489 MB |
+| int8 base, `buckets.max_shapes=4` | 1452 ms (12 replays in 24) | 3489 MB |
+| **bf16** base, `buckets.max_shapes=4` | 1324 ms (12 replays in 24) | 5548 MB |
+| int8 base, `int8_grad=int8`, `max_shapes=4` | 1481 ms (12 replays in 24) | 3489 MB |
+
+* **The step is device-bound, not host-bound**: the graph buys **1.16×** here
+  (1539 ms eager → 1324 ms replayed), not the 2× the old tree's numbers show.
+  The host is ~15 % of the step.
+* **The int8 base costs +10-12 % and saves 2.06 GB** — the same +10-12 % the
+  probe measures, so the int8 base does what the library says.
+* **`buckets.max_shapes` is the difference between a graph and no graph.**
+  Without it every step's shape is new, the graph's three-sighting warm-up
+  never completes, each new shape costs 4-5 s to compile and capture, and the
+  graph is captured and **never replayed**.
 
 ### The host direction: finished inside the capture, not outside it
 

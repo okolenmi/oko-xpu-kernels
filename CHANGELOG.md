@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+*Documentation and measurement only — no behaviour change.*
+
+* **The docs were audited and rewritten.** The README was a front door with an
+  optimization log, an ESIMD layout description, a status table and three
+  copies of the performance tables inside it; it is now a front door
+  (**4 899 → 779 words**) and the long material lives where it belongs: the
+  API in `docs/api.md`, the hardware in `docs/architecture.md`, the
+  measurements in `docs/performance.md`, the dead ends in
+  `docs/experiments.md`. The TODO is now a ranked list of *open* items with a
+  one-line record of the closed ones (**3 905 → 1 291 words**). Three
+  documents took over what the README used to carry — the API, the SDXL plan
+  and the vendor report — so the total is 21 100 words against 24 700, and
+  what came out of it was duplication, not information.
+* **The broken references were fixed.** `docs/todo.md` pointed at a report file
+  that was not in the repository (`docs/report-reduce-over-group.md`, now
+  written), and the trainer's document pointed at a document that has never
+  existed here (`docs/xpu_int8_perf_findings.md` → `docs/performance.md`).
+  The stale claims were corrected too: the wheel's platform tag in
+  `docs/publishing.md` was still `linux_x86_64`, the release procedure did not
+  say that a release is **two** dispatches (a rehearsal, then the upload), and
+  the version numbers were still 0.2.0.
+* **SDXL was measured, and there is a plan.** `docs/sdxl.md` and
+  `debug/probe_sdxl_shapes.py`. The headline findings:
+  * 86 % of SDXL's parameters (2990 M of 3469 M) are eligible for the INT8
+    path; the excluded are the 3×3 convolutions (416 M) and the 640/320-dim
+    linears (62 M);
+  * at SDXL's own shapes the INT8 path is **2.5× faster** on the FFN's
+    down-projection, at parity on the attention projections, and **1.5×
+    slower** on the FFN's up-projection — the int32 accumulator (6 bytes per
+    output element) costs more there than the int8 GEMM saves;
+  * below M≈1024 the device is idle and the *host* is the cost: 0.25 ms per
+    INT8 call against 0.10 ms for bf16, which the device-graph capture
+    removes;
+  * the 64-element ConvRot group, which was going to reach SDXL's narrow
+    linears, is worth **1.8 %** of the model, not 15 % — the earlier estimate
+    was wrong, and the idea is closed by measurement.
+* `debug/verify_published_wheel.sh` is now part of the repo: it downloads the
+  *published* wheel, checks that it carries its own `.so`, runs every gate
+  from it, and renders the reference image with it (md5
+  `a2aacfda45409493a490b0402b61f850`). It is the check that a release is good,
+  and it is a script now, not a habit.
+
 ## 0.3.0
 
 *Released after 0.2.0, which shipped the INT8 path, the two Triton kernels and

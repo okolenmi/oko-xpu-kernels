@@ -1,10 +1,11 @@
 # Publishing
 
 The short version: bump `pyproject.toml` and `python/xpu_kernels/__init__.py`,
-tag `vX.Y.Z`, push the tag, and then dispatch the release workflow by hand
-with that tag and `publish: true`. It builds both artifacts, uploads them to
-PyPI, and attaches the same artifacts to the GitHub Release. Nothing else is
-allowed to publish, and a push publishes nothing.
+tag `vX.Y.Z`, push the tag, and then dispatch the release workflow **twice**:
+first with `publish: false` (the rehearsal — it builds and checks everything and
+uploads nothing to PyPI), then with `publish: true` (the real thing). Both
+artifacts go to PyPI and to the GitHub Release. Nothing else is allowed to
+publish, and a push publishes nothing.
 
 ## One-time setup
 
@@ -110,20 +111,24 @@ git tag -a v0.3.0 -m "0.3.0, built with oneAPI 2025.3.2"
 git push origin main v0.3.0
 ```
 
-Then **Actions -> release -> Run workflow**:
+Then **Actions -> release -> Run workflow**, twice:
 
 | input | value |
 |---|---|
 | `tag` | `v0.3.0` (the tag must already exist) |
-| `publish` | `false` to build and check only, `true` to upload to PyPI |
+| `publish` | `false` for the rehearsal, `true` for the upload |
 
 The `publish: false` run is the rehearsal: it builds both artifacts, checks
 the platform tag against the `.so`, and attaches the files to the GitHub
 Release, without touching PyPI. That is where a broken oneAPI install shows
 up. The `publish: true` run does the same and uploads.
 
+Both runs are needed, and the second one is a *dispatch*, not a re-run of a
+job: the rehearsal proves the whole path on the tag's own commit, and the
+upload is a separate, deliberate act with its own yes/no.
+
 The tag message is where the toolchain goes. The version cannot carry it: PyPI
-rejects local version identifiers (`0.2.1+oneapi2025.3`) because PEP 440
+rejects local version identifiers (`0.3.1+oneapi2025.3`) because PEP 440
 reserves them for private builds, and pip ignores them when matching a
 requirement anyway.
 
@@ -136,29 +141,36 @@ uploads only what is missing.
 
 The CI build proves the wheel is well formed, not that it computes the same
 numbers as the local build. The published wheel is what a consumer gets, so
-install it and run the project's own gate against it:
+it is installed and run against the project's own gate:
 
 ```bash
-pip install --no-deps --force-reinstall xpu-kernels==0.2.0
-python -c 'import xpu_kernels; print(xpu_kernels.available(), xpu_kernels.device_name())'
-# then the PNG gate, which must still produce the recorded md5
+bash debug/verify_published_wheel.sh 0.3.0
 ```
 
-The gate can also be pointed at the published `.so` without installing
-anything, because the loader reads `XPU_KERNELS_LIB` first:
+The script downloads the wheel from PyPI into a scratch prefix, checks that it
+carries its own `.so`, runs `python -m xpu_kernels` from it (every gate must
+verify), then starts the ComfyUI server with `XPU_KERNELS_LIB` pointing at the
+`.so` **inside the downloaded wheel** — confirmed through `/proc/<pid>/maps`,
+so it is not the repo's build that is being tested — renders the reference
+image and compares the md5 with the recorded `a2aacfda45409493a490b0402b61f850`.
+It restarts the server afterwards and leaves the machine as it found it.
+
+To do it by hand:
 
 ```bash
-unzip -o -q xpu_kernels-0.2.0-py3-none-manylinux_2_35_x86_64.whl -d /tmp/pub
+pip install --no-deps --force-reinstall xpu-kernels==0.3.0
+python -c 'import xpu_kernels; print(xpu_kernels.available(), xpu_kernels.device_name())'
+unzip -o -q xpu_kernels-0.3.0-py3-none-manylinux_2_35_x86_64.whl -d /tmp/pub
 XPU_KERNELS_LIB=/tmp/pub/xpu_kernels/int8/libxpuint8.so bash debug/server.sh --deterministic
 # check what was loaded:  grep libxpuint8 /proc/$(pgrep -f 'ComfyUI/[m]ain.py')/maps
 ```
 
-**Done for 0.2.0.** The published `.so` is *not* byte-identical to the local
-build (md5 `b4427b80…` against `7867d110…`): the CI build was compiled on
-ubuntu-22.04 with GCC 12.3.0, the local one with the system's GCC 16.2.1. The
-requirements are the same -- glibc at most `GLIBC_2.32`, libstdc++ at most
-`GLIBCXX_3.4.21` -- and the PNG gate against the published `.so` produced
-`a2aacfda45409493a490b0402b61f850`, the same md5 as every earlier gate run.
+**Done for 0.2.0 and 0.3.0.** The published `.so` is *not* byte-identical to
+the local build (the CI build was compiled on ubuntu-22.04 with GCC 12.3.0,
+the local one with the system's GCC 16.2.1). The requirements are the same --
+glibc at most `GLIBC_2.32`, libstdc++ at most `GLIBCXX_3.4.21` -- and the PNG
+gate against the published `.so` produced `a2aacfda45409493a490b0402b61f850`,
+the same md5 as every earlier gate run.
 
 A note on PyPI's caches: the JSON API can answer for a few minutes with the
 file list from before an upload, so `pip download` may pick the sdist even
@@ -174,18 +186,12 @@ under the same version.
 
 * **sdist** -- installs anywhere with no toolchain. `import xpu_kernels` works,
   `available()` is `False`, INT8 calls raise a message naming `build.sh`.
-* **wheel** (`py3-none-linux_x86_64`) -- carries `libxpuint8.so` linked against
-  the oneAPI 2025.3 SYCL runtime. `pip` prefers it on Linux/x86-64, so that is
-  what a normal `pip install xpu-kernels` gets. On a machine with a different
-  runtime it degrades to the sdist behaviour; the fix is `./build.sh` from the
-  unpacked sdist and `XPU_KERNELS_LIB` pointing at the result.
+* **wheel** (`py3-none-manylinux_2_35_x86_64`) -- carries `libxpuint8.so`
+  linked against the oneAPI 2025.3 SYCL runtime. `pip` prefers it on
+  Linux/x86-64, so that is what a normal `pip install xpu-kernels` gets. On a
+  machine with a different runtime it degrades to the sdist behaviour; the fix
+  is `./build.sh` from the unpacked sdist and `XPU_KERNELS_LIB` pointing at
+  the result.
 
 Both are also attached to the GitHub Release, which is the way to pin one exact
 binary without an index.
-
-## Dry run
-
-The `publish: false` run is the rehearsal: it builds and checks everything and
-uploads nothing. TestPyPI would need a second pending publisher on
-<https://test.pypi.org>; not worth it for a package whose failure mode is "the
-upload was rejected", which is loud and free.

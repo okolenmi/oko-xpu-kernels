@@ -56,7 +56,7 @@ shape this compiler gets wrong.
 
 ### The structural finding
 
-`rejected/rotate_floor_analysis.cpp` isolates the cause:
+`debug/native/rejected/rotate_floor_analysis.cpp` isolates the cause:
 
 ```
 same copy loop, 16 registers held live   0.402 ms
@@ -103,7 +103,8 @@ The same kernel's *row max* is a different story: the barrier + serial
 local-memory loop that gates every store costs 24 % of the FFN epilogue, and one
 `sycl::reduce_over_group` gets 16 % of the kernel back (bit-identical output,
 interleaved) -- not shipped because the construct once killed the host process.
-`docs/performance.md`, "The FFN epilogue's row max".
+`docs/performance.md`, "The FFN epilogue's row max", and the report to the
+vendor in `docs/report-reduce-over-group.md`.
 
 ---
 
@@ -138,9 +139,12 @@ bisecting it. Always go through `debug/common.load_lib()`.
 
 ## 6. Still untried
 
-Splitting a group across 4 lanes so it is 64 elements per lane (4 zmm instead
-of 16), with one cross-lane axis. A 512-bit cross-lane exchange needs 16
-`select_from_group` calls, so the same verdict as the shared-memory version is
-expected — but it is the only register-pressure reduction that has not actually
-been built. Its upside is bounded: it cannot beat the 0.27 ms register-resident
-floor, only approach the 0.12 ms streaming one.
+Nothing, for the rotate: the last open shape (splitting a group across 4
+lanes) was built and measured, and the answer was that the obstacle is not the
+exchange but the *reduction domain* — splitting the groups makes the row's
+scale cross sub-groups, which costs a barrier (1.33 ms) or a second pass
+(0.75 ms) against the 0.402 ms the rotate costs now. See
+`docs/performance.md`, "What is left: the rotate's floor", and
+`debug/native/probe_cross_lane.cpp`. The route that would work — a scale per
+block instead of per row — changes the numbers, so it is a design decision
+rather than an optimisation.

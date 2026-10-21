@@ -114,6 +114,14 @@ on 50.4 MB versus 74 GB/s for rotate+quantize on 37.8 MB.
 | 1 | `src/xpuint8.cpp` `launch_convrot_quant` | bf16 [M,K] -> int8 [M,K] + fp32 [M] scales |
 | 2 | `src/xpuint8.cpp` `launch_rotate_bf16` | bf16 [M,K] -> bf16 [M,K], rotation only |
 | 3 | `src/xpuint8.cpp` `launch_dequant_epilogue` | int32 [M,N] -> bf16 [M,N], scales + bias |
+| 4 | `src/xpuint8.cpp` `launch_dequant_weight` | int8 [N,K] + fp32 [N] -> bf16 [N,K], rotation undone in the same pass |
+
+Kernel 4 is the backward's weight-only path. It reads the int8 and writes the
+bf16 in one pass — three bytes per parameter against the torch chain's fifteen
+— and it is bit-identical to the chain because the arithmetic is the chain's,
+in the chain's order: the fp32 multiply, the bf16 rounding, *then* the
+rotation (the rounding has to happen before the butterfly, which is what makes
+the two agree).
 
 One work-item per 16-lane sub-group; one sub-group owns one row; lane `l` owns
 ConvRot group `l`. Kernels 1 and 2 are templated on how many groups fit in a
@@ -126,6 +134,9 @@ butterflies with the stores is 1.44x slower *and* produced wrong results
 straight 16-register convert+store loop.
 
 ## DPAS layout (for the hand-written GEMM)
+
+The GEMM is a dead end (see below), but the layout is recorded because
+`kernels/int8_gemm_v4.cpp` is where to start if it is ever revisited.
 
 ```
 dpas<8, 1, int, s8, s8, 512, 32>(B, A)
@@ -150,7 +161,6 @@ with `AN == R*32` bytes of A holding R rows, and
 `ResultN == R * ExecutionSize`. That is `kernels/int8_gemm_v4.cpp`. It cuts
 instructions per unit of work by 2.5x and is nonetheless **slower** (28 vs 43
 TOPS at R=8) because the 8-zmm accumulator operand costs more than it saves.
-It is kept because it is the right place to start if the GEMM is ever revisited.
 
 This ESIMD build has **no arithmetic operators on `simd<>`** (only `dpas`), so
 accumulators are `vec<int32_t,16>` and operands/results are bridged with
@@ -208,25 +218,18 @@ cannot be proven, only measured — and it gives one acceptance test: the kernel
 must reproduce the bits of the chain it replaces, on this machine and in this
 process.
 
-* The INT8 side is verified by the suites in `debug/` (`verify_epilogue.py`,
-  `verify_situ_fusion.py`, `verify_acc_rope.py`, ...) against the unfused chain,
-  plus the pipeline-level PNG hashes recorded in `docs/performance.md`.
-* The Triton side verifies itself at first use through `triton/_gate.py`: it runs
-  the kernel and the caller's fallback on synthetic inputs at the production
-  shape, compares bit patterns, and latches the verdict. A mismatch or an
-  un-runnable probe disables the kernel for the rest of the process.
+* The INT8 side is verified by the suites in `debug/` (`verify_situ.py`,
+  `verify_capture_guards.py`, `verify_int8_capture.py`, `verify_linear_dw.py`)
+  against the unfused chain, plus the pipeline-level PNG hashes.
+* The Triton side verifies itself at first use through `triton/_gate.py`: it
+  runs the kernel and the caller's fallback on synthetic inputs at the
+  production shape, compares bit patterns, and latches the verdict. A mismatch
+  or an un-runnable probe disables the kernel for the rest of the process.
 * `tests/test_gate.py` pins the gate's failure modes on CPU, so the verification
   machinery itself has a test that does not need a GPU.
 
-The two rules that follow from this, and that are easy to get wrong:
-
-1. **Do not tune a launch parameter that changes a reduction order.** For the
-   Triton kernels that is `num_warps`; at 1 it is 1.6x faster and 36/12.2M values
-   differ. The gate catches it, which is why it is a code change and not a knob.
-2. **A backward pass is verified against `torch.autograd` of the eager chain**,
-   as a pair with its forward (one probe, both outputs), with a float64
-   gradcheck where an algebraic identity is involved. See
-   `docs/adding-a-kernel.md`.
+The checklist, and the two rules that are easy to get wrong, are in
+`docs/adding-a-kernel.md`.
 
 ## Capturing a step
 

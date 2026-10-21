@@ -1,37 +1,70 @@
-# debug/ — measurement instruments
+# debug/ — the instruments
 
-These are the probes that produced every number in `docs/performance.md`.
-They live here rather than in `/tmp` because they are the evidence: if someone
+Every number in `docs/performance.md` came from a script in here. They live in
+the repo rather than in `/tmp` because they are the evidence: if someone
 disagrees with a conclusion, they should be able to re-run the experiment.
 
 ## Setup
 
 ```bash
-export PATH=/home/okolenmi/.local/oneapi/opt/intel/oneapi/compiler/2026.0/bin:$PATH
-./build.sh                  # builds build/libxpuint8.so (needed by the .py probes)
-./debug/native/build.sh     # builds the standalone SYCL probes into debug/native/bin
+export SYCL_ROOT=/home/okolenmi/.local/oneapi-2025.3/2025.3
+./build.sh                  # -> build/libxpuint8.so   (the Python probes need it)
+./debug/native/build.sh     # -> debug/native/bin/*    (the standalone SYCL probes)
 ```
 
-`debug/native/build.sh` also puts the DPC++ runtime on `LD_LIBRARY_PATH`
-itself, since there is no root and no system-wide install.
+`debug/native/build.sh` puts the DPC++ runtime on `LD_LIBRARY_PATH` itself,
+since there is no root and no system-wide install. A standalone probe run by
+hand needs:
 
-## Python probes (need `build/libxpuint8.so`)
+```bash
+export LD_LIBRARY_PATH=$SYCL_ROOT/lib:$SYCL_ROOT/lib/x64
+export LEVEL_ZERO_V1_SDK_PATH=/home/okolenmi/.local/levelzero
+```
 
-| script | question it answers | headline answer |
+## The verifiers (the important ones)
+
+These answer "is this correct", and they are the ones to re-run after any
+change:
+
+| script | what it proves |
+|---|---|
+| `verify_linear_dx.py` | `linear_dx` against autograd, and the INT8 weight's own error |
+| `verify_linear_dw.py` | `linear_dw` against autograd of the dequantized weight (bit-identical) |
+| `verify_capture_guards.py` | the capture refusals, and `Int8Linear.dx` replaying bit-identically |
+| `verify_int8_capture.py` | the INT8 forward and both backwards captured and replayed bit-identically |
+| `verify_graph_capture.py` | the rope and adaLN forwards *and* backwards captured and replayed bit-identically |
+| `verify_rotate_scales.py` | the rotation against float64 (the eager bf16 bmm is up to 40 % wrong) |
+| `verify_published_wheel.sh` | the **published** wheel renders the recorded PNG md5 — the download, the install, the gate, and the server restart |
+| `verify_situ.py`, `verify_ffn_fusion.py`, `verify_qkv_rope_fuse.py` | the fused paths against the unfused chains |
+| `verify_quant_lib.py` | the Triton quantizer against the torch chain, within the gate's budget |
+
+## The probes (the ones that measure)
+
+| script | question | headline answer |
 |---|---|---|
+| `bench_bf16_fair.py` | **does INT8 beat BF16 when both pay for the rotation?** | parity, 15-17 % faster at M=1024; loses at M=512 |
 | `bench_stages.py` | where does end-to-end time go? | rotate 0.52 / `_int_mm` 0.50 / epilogue 0.15 ms at M=4096 |
-| `bench_bf16_fair.py` | **does INT8 beat BF16 when both pay for the rotation?** | INT8 is 5-15% faster for M>=1024, loses at M=512 |
-| `verify_rotate_scales.py` | is the rotation numerically right? | matches float64 to 6.4e-08; eager bf16 bmm is up to 40% wrong |
+| `bench_ffn_fusion.py`, `bench_qkv_chain.py` | what does each fusion buy? | the FFN's intermediate is 2 GEMMs + 3 memory passes |
 | `probe_gemm_shapes.py` | why is the hand-written GEMM only 43 TOPS? | L2-bandwidth bound at ~4 TB/s, not DPAS bound |
-| `probe_intmm_layout.py` | is `torch._int_mm` layout- or packing-sensitive? | no; `_weight_int8pack_mm` needs a float A so is not an int8xint8 path |
-| `probe_n_blocking.py` | can N-blocking keep the int32 accumulator in L2? | no — blocked `_int_mm` costs 2x what it saves |
-| `probe_alloc_cost.py` | how expensive are the pipeline temporaries? | `torch.empty` is 0.004 ms regardless of size |
-| `probe_load_ab.py` | paired A/B of two library builds | the method to use for any small effect; the GPU drifts 10-30% with thermals |
+| `probe_linear_dx_variants.py` | bf16 dequant or an int8 GEMM for the backward? | 2.08 ms against 2.75 ms — a memory option, not a speed one |
+| `probe_rope_variants.py`, `probe_adaln_variants.py` | which schedule? | the fused one, bit-exact, 2.34× / 1.56× |
+| `probe_rope_backward.py`, `probe_adaln_backward.py` | the backwards | 14.3× / 6.3× against the eager chain |
+| `probe_intmm_layout.py` | is `_int_mm` layout- or packing-sensitive? | no; `_weight_int8pack_mm` needs a float A, so it is not an int8 path |
+| `probe_n_blocking.py` | can N-blocking keep the accumulator in L2? | no — blocked `_int_mm` costs 2× what it saves |
+| `probe_alloc_cost.py` | how expensive are the temporaries? | `torch.empty` is 0.004 ms regardless of size |
+| `probe_load_ab.py` | paired A/B of two library builds | the method to use for any small effect |
+| `probe_sdxl_shapes.py` | the INT8-vs-BF16 ratio at **SDXL's** shapes and token counts | 2.5× faster on the FFN's down-projection, 1.5× slower on its up-projection (the int32 accumulator), and host-bound below M≈1024 |
 
 `bench_bf16_fair.py` is the one that matters most: the original
 `benchmarks/bench_pipeline.py` compares INT8 against a BF16 `linear()` that
 omits the activation rotation, which is not a fair comparison — ConvRot needs
 the rotation on both paths.
+
+The `ab_*.sh` scripts are the A/B harnesses for the ComfyUI-side changes
+(rope, tanh, the FFN fusion, the library build); `probe_moss.py` renders the
+reference image through the ComfyUI server, and `server.sh` starts it. The
+recorded gate is **md5 `a2aacfda45409493a490b0402b61f850`** — seed 1234,
+3 steps, `--deterministic`.
 
 ## Native probes (standalone SYCL, no torch)
 
@@ -41,32 +74,26 @@ Run any of them as `./debug/native/bin/<name> [args]`.
 |---|---|---|
 | `probe_rotate_ablation` | which part of the rotate costs what? | load+store 0.273, transform 0.134, abs-max 0.025 ms |
 | `probe_bandwidth` | what are the real DRAM ceilings? | ~310 GB/s read / ~330 GB/s write at 25 MB |
-| `probe_epilogue` | is the scalar bf16 convert costing anything? | no — 88% of the bandwidth floor |
-| `probe_lane_utilisation` | do the 4 idle lanes at K=3072 cost 25%? | no, it's a cache-size effect |
-| `probe_bf16_rotate` | best store pattern for the BF16 rotate? | flat store loop, 1.44x faster than interleaved |
+| `probe_epilogue` | is the scalar bf16 convert costing anything? | no — 88 % of the bandwidth floor |
+| `probe_ffn_situ` | the row max: butterfly or `reduce_over_group`? | `reduce_over_group` is 16 % faster and bit-identical, but it once killed the host — `PROBE_REDUCE=1` |
+| `probe_cross_lane` | can the rotate's last open shape be built? | no: the reduction domain, not the exchange |
+| `probe_bf16_rotate` | best store pattern for the BF16 rotate? | a flat store loop, 1.44× faster than interleaved |
+| `probe_lane_utilisation` | do the 4 idle lanes at K=3072 cost 25 %? | no, it is a cache-size effect |
 | `probe_load_store_width` | do 64-byte loads help? | no |
+| `probe_tanh_exact` | is `expm1(2x)/(expm1(2x)+2)` bf16-identical to `tanh`? | yes, for every finite bf16 input |
+| `reproduce_reduce_over_group` | does `reduce_over_group` still kill the process? | not on driver 1.17.39758 — but no fix was ever claimed |
 
-### rejected/
-
-Experiments that did **not** work. They are kept because each one closes off a
-plausible-looking optimisation, and several of them were only rejected after
-real work:
-
-- `rotate_variants` — fp16 butterfly: **2x slower**
-- `rotate_shared_memory` — staging the strided axis through LDS: **2.4x slower**
-- `rotate_three_pass` — rotate+stage / reduce / quantize: **1.4x slower**
-- `rotate_workgroup_size` — work-group 16..256: flat, not a lever
-- `rotate_pack_and_width` — int8 pack and store width: no difference
-- `conversion_costs` — also records the SYCL type limits (no 64-wide `vec`,
-  no free `sycl::convert`) that force the scalar pack loops
-- `simd_width_check` — confirms `vec<float,16>` really is 512-bit and near peak
+`debug/native/rejected/` holds the experiments that did not work (the fp16
+butterfly, the shared-memory staging, the three-pass version, the work-group
+sweep). They are kept because each one closes off a plausible-looking
+optimisation, and several were rejected only after real work.
 
 ## Timing discipline
 
 The B580 is noisy enough that a single mean over 20 iterations is not
 trustworthy — the same binary has measured 0.52 and 0.63 ms for the same call.
 Everything here takes **min over several reps of mean over N**, via
-`common.bench`.
+`common.bench`. Ratios come from *interleaved* rounds in one process.
 
 One artefact to be aware of: a kernel that repeatedly writes the *same* output
 buffer measures faster than one writing a fresh buffer, because the first keeps

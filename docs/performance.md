@@ -1,8 +1,10 @@
 # Performance
 
-Intel Arc B580, `torch 2.12.1+xpu`, DPC++ 2026.0. Unless stated otherwise,
-M=4096, K=N=3072, ConvRot group size 256. All timings are **min over 3 reps of
-mean over 20 iterations** — a single mean over 20 on this GPU is not
+Intel Arc B580, `torch 2.12.1+xpu`. The shipped library is built with
+**oneAPI 2025.3** (the pin in `build.sh`); the standalone probes were also run
+under 2026.0, and the A/B conclusions were identical under both. Unless stated
+otherwise, M=4096, K=N=3072, ConvRot group size 256. All timings are **min over
+3 reps of mean over 20 iterations** — a single mean over 20 on this GPU is not
 trustworthy (the same binary has measured 0.52 and 0.63 ms for one call).
 
 Reproduce with the probes in `debug/` (see `debug/README.md`).
@@ -45,10 +47,6 @@ what the unfair comparison gave.
 
 The spread above is thermal, not noise between runs: the warm-GPU runs cluster
 closer to 1.0 and the cold-GPU runs spread wider. Read the range, not a point.
-
-**INT8 is at parity to 15% faster for M>=1024 and ~7% slower at M=512**, with
-4x less weight memory. That is a usable trade, and it is a different conclusion
-from what an unfair comparison gives.
 
 > An earlier version of `benchmarks/bench_pipeline.py` compared INT8 against
 > `F.linear(x, wbf, bias)` — a BF16 path with **no activation rotation** — and
@@ -295,8 +293,12 @@ the ConvRot rotation — the rotation is its own inverse) and the GEMM is
 is in the forward — 1.27 % there for this synthetic matrix. The gradient error is
 not an extra layer of noise on top of the forward's, it *is* the forward's.
 
-`prepare_weight` costs 3.0 ms for the same matrix, so quantizing a 3.7 B model is
-~0.4 s each way. That is a one-time startup cost, not a step cost.
+`prepare_weight` costs 3.0 ms for the same matrix (0.172 ns/param), so
+quantizing a 3.7 B model is ~0.4 s each way. That is a one-time startup cost
+*if* the base is frozen — but it is a **per-step** cost for a trainable int8
+weight, and there the C kernel does the same work 16.7x faster (38 ms for
+3.7 B). The two are not the same function, so that is a decision, not a swap
+(`docs/todo.md` item 1).
 
 ### The quantized-`dy` variant: a memory option, not a speed one
 
@@ -424,15 +426,13 @@ slope's noise floor. Against that: this construct used to kill the process
 the probe). A gate cannot catch that -- the failure is the process dying, not a
 wrong number. So the production kernels keep the butterfly + local-memory form.
 
-What changed on 2026-10-21: it no longer crashes. The isolated reproducer
-(`debug/native/reproduce_reduce_over_group.cpp`: 8 work-group sizes x 4
-reduction ops x 200 launches x 5 processes, both toolchains, Level Zero) and the
-full kernel above ran without a fault -- ~35 000 reductions of real work-group
-widths (the epilogue itself uses 512), no crash and no wrong result. That is a
-statement about driver `1.17.39758` and this machine, not a fix claim -- no
-changelog entry was found and the crash was never filed upstream. The probe
-therefore keeps the variant behind `PROBE_REDUCE=1` with a bit-exactness check
-against mode 0, so the next driver bump can re-test it in one command:
+It no longer crashes (driver `1.17.39758`, both toolchains, ~35 000
+reductions of real work-group widths), which is a statement about this driver
+and this machine, **not a fix claim** -- no changelog entry was found and the
+crash was never filed upstream before the report in
+`docs/report-reduce-over-group.md`, which was sent to the vendor. The probe
+keeps the variant behind `PROBE_REDUCE=1` with a bit-exactness check against
+mode 0, so the next driver bump can re-test it in one command:
 
     PROBE_REDUCE=1 ./debug/native/bin/probe_ffn_situ 3973 8192 device
 
@@ -458,34 +458,35 @@ peak. The shape sweep says why:
 TOPS is flat for every cacheable shape and traffic sits at ~4 TB/s in all of
 them. It saturates L2. It only falls off when the working set leaves L2.
 
-`kernels/int8_gemm_v4.cpp` uses the two DPAS forms v3 ignores (accumulator
-operand, `RepeatCount=R`), which cut instructions per unit of work by 2.5x. It
-is **slower**: 28 TOPS at R=8. See `docs/architecture.md`.
-
-**Decision: keep `torch._int_mm`.** 151 TOPS, fully blocked and double-buffered.
+**Decision: keep `torch._int_mm`.** 151 TOPS, fully blocked and
+double-buffered. The reasoning is in `docs/architecture.md`; the two rejected
+DPAS forms are in `docs/experiments.md`.
 
 ---
 
 ## Things that turned out not to be problems
 
-Recorded because each looked like headroom.
+Recorded because each looked like headroom. The full list, with the probes,
+is in `docs/experiments.md`; the two that are easiest to mistake for a
+result:
 
-| hypothesis | measurement |
-|---|---|
-| idle lanes at K=3072 (4/16 busy) cost 25% | no — K=1024 (4/16 busy) is the *fastest* per element; it's a cache-size effect |
-| several rows per work-group | 1.6-3x **loss** |
-| N-blocking the GEMM to keep `acc` in L2 | blocked `_int_mm` 0.99 ms vs 0.50, vs 0.13 saved |
-| 64-byte stores | no measurable difference |
-| 64-byte loads | no measurable difference -- paired A/B, 0.995x, bit-identical (`debug/probe_load_ab.py`) |
-| `vec<int32_t>` pack instead of scalar float packs | no measurable difference |
-| rounding-bit trick for float→bf16 | **2x slower** (0.24 vs 0.135) — the scalar loop is already vectorised |
-| AOT `-fsycl-targets=spir64_gen12` | unavailable: this compiler accepts only generic `spir64` |
-| `_int_mm` layout / packing sensitivity | within noise; `_weight_int8pack_mm` needs a **float** A, so it is not an int8xint8 path |
-| `torch.empty` in the hot path | 0.004 ms regardless of size |
-| `vec<float,16>` silently 256-bit | no — ~10 T float-ops/s, near peak |
+* **idle lanes at K=3072** (4 of 16 busy) cost 25 % — no: K=1024, with the
+  same 4/16 busy, is the *fastest* per element. It is a cache-size effect.
+* **several rows per work-group** — a 1.6-3x *loss*.
 
 All three SYCL runtimes present on this machine (level_zero, NEO OpenCL,
 rusticl/Mesa) give identical performance, so JIT choice is not a factor.
+
+---
+
+## The headline, at other shapes
+
+The headline number — INT8 at parity with BF16 — was measured at K=N=3072.
+**SDXL has no such shape**, and at SDXL's own shapes the ratio is not parity:
+2.5x faster on the FFN's down-projection, 1.5x slower on its up-projection
+(the int32 accumulator), and host-bound below M≈1024. That measurement, and
+what it means for a model, is in `docs/sdxl.md`
+(`debug/probe_sdxl_shapes.py`).
 
 ---
 
@@ -550,7 +551,7 @@ pass, which inside a device-graph capture means the allocation is replayed on
 every step. The fused kernel's only allocation is its output.
 
 The trainer's side of this is in `docs/nf4-storage-vision.md` in the
-trainer's tree.
+*trainer's* tree (`B580-diffusion-training/docs/`), not here.
 
 ## The bf16 path: what is left, measured
 
@@ -571,9 +572,10 @@ pre-norm block: folding it into the norm's epilogue would save one launch and
 one read-write pass per add (~84 launches and ~6 ms of device time per step
 in a 42-block model, in a step that is host-bound). It is training-safe --
 the add's backward is the identity -- but the payoff is small next to the
-capture, which removes the launches altogether.
+capture, which removes the launches altogether. It is item 4 in
+`docs/todo.md`.
 
-## What is left
+## What is left: the rotate's floor (closed)
 
 **The rotate's structural floor is not reachable, and the last open shape
 cannot be built at the shapes that matter.** This took a measurement to
@@ -632,17 +634,10 @@ property of the format rather than a missing kernel.
 ## Timing discipline
 
 The GPU drifts 10-30% over a benchmarking session with thermals, which is
-**larger than most of the effects being measured**. Two consequences:
-
-1. Everything reported as a ratio (INT8/BF16, old/new) is taken from
-   *interleaved* rounds in one process, not from separate runs.
-   `debug/probe_load_ab.py` is the template: load two builds, alternate
-   between them 7 times, compare medians.
-
-2. A separate-run comparison will invent effects that are not there. An early
-   64-byte-load A/B was run that way and appeared to show a 10% regression;
-   the paired comparison shows 0.995x. The earlier conclusion was wrong and
-   was retracted.
-
-A single mean over 20 iterations is not trustworthy on this device — the same
-binary has measured 0.52 and 0.73 ms for one call.
+**larger than most of the effects being measured**. Everything reported as a
+ratio is therefore taken from *interleaved* rounds in one process, never from
+separate runs — `debug/probe_load_ab.py` is the template, and
+`debug/probe_sdxl_shapes.py` is the same idea applied to SDXL's shapes. A
+single mean over 20 iterations is not trustworthy on this device: the same
+binary has measured 0.52 and 0.73 ms for one call. The rules are written out
+in `debug/README.md`.

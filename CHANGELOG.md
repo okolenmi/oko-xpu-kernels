@@ -69,6 +69,23 @@
   chain** at SDXL's shapes (2.178 ms against 3.281 ms at M=4096), and at
   parity with bf16 at the big M (0.93×).
 
+* **SDXL's step was measured in the training project's own UNet** (its `next/`
+  tree, borrowed read-only; `debug/probe_sdxl_trainer_step.py`, the report in
+  the trainer's `docs/sdxl-int8-measurements.md`). The trade, at 768×768 with
+  the trainer's own checkpointing and capture pattern:
+
+  | arm | eager step | captured step | host time | aten calls | weights | peak |
+  |---|---|---|---|---|---|---|
+  | the UNet as it is (bf16) | 400.7 ms | **565.6 ms** | 1058 ms | 44 277 | 4.89 GB | 5.23 GB |
+  | the INT8 linears | 986.0 ms | **628.1 ms** | 2735 ms | 85 822 | 2.84 GB | 3.21 GB |
+  | + the fused GEGLU FFN | 1038.6 ms | **624.4 ms** | 2741 ms | 85 822 | 2.85 GB | 3.21 GB |
+
+  The INT8 path **doubles the host cost** (four extra kernels per linear), so
+  it is 2.5-2.7× slower eagerly and only **10-12 % slower under the
+  capture**, where it saves **42 % of the weight memory and 39 % of the
+  peak**. The fused GEGLU, 1.2-1.5× on the FFN in isolation, is invisible in
+  the whole step.
+
 * The PNG gate is unchanged (`a2aacfda45409493a490b0402b61f850`) with the
   rebuilt library, and `python -m xpu_kernels` now checks the fused GEGLU
   against the unfused chain as part of the self-test.

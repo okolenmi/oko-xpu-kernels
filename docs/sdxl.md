@@ -162,15 +162,42 @@ different function from a bf16 base (0.9 %), and an SDXL checkpoint is *not*
 pre-rotated: adopting the INT8 path means storing the base pre-rotated, so the
 bf16 comparison must use the rotated weights, or it is not a comparison at all.
 
-## 5. What to measure next
+## 5. The whole step, in the training project's own UNet (measured)
+
+The numbers above are per layer. The step is the question that matters, and
+it was measured in the training project's own SDXL UNet (its `next/` tree,
+borrowed read-only; the instrument is `debug/probe_sdxl_trainer_step.py`,
+the report is in the trainer's `docs/sdxl-int8-measurements.md`).
+
+768×768, batch 1, the base frozen (the LoRA-shaped step), with the
+trainer's own checkpointing and its own capture pattern:
+
+| arm | eager step | **captured step** | host time | aten calls | weights | peak |
+|---|---|---|---|---|---|---|
+| the UNet as it is (bf16) | 400.7 ms | **565.6 ms** | 1058 ms | 44 277 | 4.89 GB | 5.23 GB |
+| the library's INT8 linears | 986.0 ms | **628.1 ms** | 2735 ms | 85 822 | 2.84 GB | 3.21 GB |
+| + the library's fused GEGLU FFN | 1038.6 ms | **624.4 ms** | 2741 ms | 85 822 | 2.85 GB | 3.21 GB |
+
+Three things fall out of it:
+
+* **The INT8 path doubles the host cost** (four extra kernels per linear), so
+  it is 2.5-2.7× slower *eagerly*. It is only viable under the capture.
+* **Under the capture it costs 10-12 % of the step** and saves 42 % of the
+  weight memory and 39 % of the peak. On a 12 GB card that is the difference
+  between fitting and not.
+* **The fused GEGLU does not move the whole step**: 1.2-1.5× of the FFN is
+  invisible in the step, because the FFN is a small part of it. It is free
+  and bit-identical, but it is not a lever on the step.
+
+## 6. What to measure next
 
 1. The int8 convolution epilogue, if item 4 is ever taken up: whether a
    per-(channel, output-channel) scale can be folded into an epilogue at all.
-2. A whole-step SDXL measurement with the capture, to see whether the INT8
-   path's device cost (finding b) and its host cost (finding c) are what the
-   step actually pays — and whether the fused FFN's 1.2-1.5× survives a
-   captured step, where the launch count no longer matters.
-3. The *per-layer* choice: with the fusion in place, the INT8 path is at
+2. The *per-layer* choice: with the fusion in place, the INT8 path is at
    parity with bf16 at the big M and slower at the small one, so which layers
    should be INT8 at all is a question with a measurement behind it, not a
    blanket rule.
+3. The step-level trade for the *trainable* base (the straight-through path):
+   the 22.6 ms of re-quantization per step, against the memory the int8
+   base saves and the accuracy it costs. The frozen base was measured (above);
+   the trainable one has not.

@@ -119,6 +119,7 @@ shapes, and at parity with bf16 at the big M.
 | the fused weight dequantizer | 215 → 63 ms for 2.17 B parameters, bit-identical |
 | the fused weight *preparation* | `prepare_weight_fused`: 15.5× the chain (22.6 ms against 350 ms for 2.17 B, per step), the error unchanged — `debug/verify_prepare_fused.py` |
 | the straight-through INT8 linear | `TrainableInt8Linear`: a bf16 parameter quantized every forward, `dW` the bf16 model's bit for bit, capture-safe — `debug/verify_trainable_int8.py` |
+| the SDXL step, measured in the trainer's own UNet | the INT8 path is 2.5-2.7x slower eagerly (it doubles the host cost) and 10-12 % slower under the capture, where it saves 42 % of the weight memory and 39 % of the peak — `debug/probe_sdxl_trainer_step.py` |
 | the SDXL parameter map and the speed at SDXL's shapes | 86 % of the parameters are INT8-eligible; the INT8 path is 2.5× faster on the FFN's down-projection and 1.5× slower on its up-projection (the int32 accumulator) — `debug/probe_sdxl_shapes.py`, `docs/sdxl.md` |
 | SDXL's activation in the fused FFN | `geglu_erf` and `gelu_erf`, bit-identical to torch's chains (the erf-GELU proved over every bf16 value); 1.2-1.5× faster than the unfused INT8 chain — `debug/verify_ffn_geglu.py` |
 | a 64-element ConvRot group | closed by measurement: the layers it would reach are 1.8 % of SDXL, not 15 % |

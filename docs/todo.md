@@ -134,10 +134,37 @@ Nothing open here. The next lever is not in this stage.
 
 ## 4. Switch ComfyUI to import this package
 
-`comfy/xpu_rope.py` and `comfy/xpu_adaln.py` are copies. Replacing them with
-imports needs the gate to be exercised in the server and the reference PNGs
-re-verified (`seed 1234: a2aacfda…`, `seed 2345: 2cc08eae…`). No perf change
-expected; the point is one copy.
+**Done for the Triton half** (ComfyUI `1fa5478b`). `comfy/xpu_rope.py` and
+`comfy/xpu_adaln.py` are now re-export shims over `xpu_kernels.triton.*`; every
+name is mirrored, private ones included, so `model.py` did not change. The
+package is installed editable into that venv, so which code runs is decided by
+the install and not by the working directory.
+
+Verified end to end, because a shim is exactly the kind of change that can leave
+a stale copy silently in place: seed 1234, 3 steps, `--deterministic`, fresh
+server -> `moss-image_00001_.png` md5 `a2aacfda45409493a490b0402b61f850`,
+identical to the pre-switch reference. The server log shows the three forward
+gates verifying against `comfy_kitchen` on first use and the qkv dequant fusion
+engaged; the two backward gates correctly stay unprobed under `no_grad`.
+
+**Not done: the INT8 wrapper.** `comfy/xpu_int8.py` is not a duplicate and cannot
+be a shim -- it is a superset (717 lines) with model-shaped entry points the
+package does not have:
+
+| ComfyUI entry point | what it is |
+|---|---|
+| `convrot_int8_linear` | ConvRot linear with residual / input-act / return-acc options, falls back by returning None |
+| `convrot_ffn_situ` | `situ(up_gate(x)) @ down.T` in one pass, consuming the up-projection's int32 accumulator |
+| `convrot_int8_acc` | the GEMM without an epilogue |
+| `dequant_epilogue_slice` | bf16 dequant of a column slice of a wider accumulator (the v third of fused qkv) |
+
+- [ ] **move those four into `xpu_kernels.int8`**, plus the timing/stat
+      scaffolding (`STATS`, `timing_stats`, `reset_caches`) if it is wanted
+      outside ComfyUI. Only then can `comfy/xpu_int8.py` become a shim. They are
+      the reusable API — a trainer swapping in an INT8 linear wants
+      `convrot_int8_linear`'s signature, not `linear` plus five decisions. This
+      is a real refactor, not a re-export: the C ABI is already shared, so it is
+      only wrapper code that is duplicated today.
 
 ## 5. Packaging and CI
 

@@ -126,6 +126,12 @@ those numbers trustworthy, and it transfers as-is:
 
 ## 6. What does not transfer
 
+- **How to consume it:** this is not hypothetical any more. ComfyUI installs
+  the package editable (`pip install -e ../xpu-kernels`) and imports
+  `xpu_kernels.triton.{rope,adaln}` directly, with its own old copies reduced to
+  re-export shims; the switch was verified by a seed-1234 render whose PNG md5
+  did not change. Do the same from the training project: one editable install,
+  no vendored copies.
 - INT8 in the training graph: `dL/dx` **is** available now —
   `dequant_weight(w8, w_scale)` once, then `linear_dx(dy, w)` (or
   `Int8Linear.dx(dy)`). It is exact against autograd of the same GEMM and 0.9 %

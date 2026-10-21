@@ -240,7 +240,7 @@ C API and `docs/architecture.md` for the algorithm.
 | Triton rope **backward** | working, **14.3×** on fwd+bwd vs the eager chain, differentiable wrapper |
 | Triton `rms_norm + adaLN` | working, **1.56×**, bit-identical, **differentiable** (fwd+bwd **6.3×** vs eager) |
 | INT8 `dL/dx` (weight-only) | working, **exact** vs the same GEMM in autograd, 0.9 % from the unquantized weight (that is the INT8 weight); dequant is one-time |
-| INT8 `dW`, quantized-`dy` gradient | **not implemented** — design and the scale-layout argument in [`docs/todo.md`](docs/todo.md) |
+| INT8 `dW`, quantized-`dy` gradient | quantized-`dy` **measured** (a memory option, not a speed one); `dW` not implemented — see [`docs/todo.md`](docs/todo.md) |
 | Device-graph capture | rope and adaLN fwd+bwd captured in one `XPUGraph` each, replay bit-identical, **host time 648–1282 → 40–82 µs** per stage |
 
 ## Layout

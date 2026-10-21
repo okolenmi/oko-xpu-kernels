@@ -275,9 +275,10 @@ class Gate:
             why = f"disabled: {self.disabled_by}"
         raise RuntimeError(
             f"{self.name}: the fused kernel is not verified on this machine "
-            f"({why}). Use the fallback, or give the gate a reference to "
-            f"compare against: xpu_kernels.triton.set_reference({self.name!r}, "
-            f"your_fallback) -- and check xpu_kernels.triton.status() for why.")
+            f"({why}). Use the fallback, or give the gate something to compare "
+            f"against: xpu_kernels.triton.set_reference(module, your_fallback) "
+            f"-- the modules are 'rope' and 'adaln', and "
+            f"xpu_kernels.triton.status() says which kernel is closed and why.")
 
     def describe(self) -> str:
         """One line for a status report; runs the verification if needed."""

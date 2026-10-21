@@ -165,6 +165,23 @@ those numbers trustworthy, and it transfers as-is:
   stream is capturing, and the gate refuses to run its self-test there (the
   probe synchronizes). `require_capture_ready` is the same check as an
   exception. `capture_status()` returns the same information as a list.
+
+  **One thing to do in your init, or the fused kernels will refuse to run.**
+  The gate compares a kernel against *the implementation it replaces*, and its
+  default reference is `comfy_kitchen` — which your environment does not have.
+  So the gate is closed there, and since the entry points now ask their own
+  gate, `rms_rope_split_half` raises instead of running unverified. Give it
+  your own fallback to compare against:
+
+  ```python
+  import xpu_kernels.triton as kt
+  kt.set_reference("rope", your_rms_rope)     # your eager chain
+  kt.set_reference("adaln", your_rms_adaln)
+  ```
+
+  Then the gate proves the kernel against *your* fallback, which is the
+  comparison that means something. `kt.status()` says which kernel is closed
+  and why; `xpu_kernels.capture_status()` says the same for a whole step.
 - The graph-capture and `addcmul_` findings — MossImage-specific.
 - Prompt/text encoding: closed here as "fast enough", no result worth porting.
 - The ComfyUI memory-accounting patch: their code is already correct.

@@ -17,8 +17,10 @@ from .ops import (
     dequant_act_quantize,
     dequant_slice,
     dequant_weight,
-    linear_dx_int8,
+    int8_linear,
     linear,
+    linear_dw,
+    linear_dx_int8,
     linear_acc,
     linear_dx,
     prepare_weight,
@@ -105,11 +107,26 @@ def selftest(verbose: bool = True) -> bool:
                        / q_chain.float().norm())
     scale_same = bool(s_fused.view(torch.int32).equal(s_chain.view(torch.int32)))
 
+    # the autograd op: without it an INT8 layer in a training graph would
+    # produce no gradient at all, silently.
+    xi = x.detach().clone().requires_grad_(True)
+    out = int8_linear(xi, w8, ws, None, mode="dense")
+    out.backward(dy)
+    ag_dx = xi.grad
+    dx_gemm_rel = float((ag_dx.float() - (dy @ w_deq).float()).norm()
+                        / (dy @ w_deq).float().norm())
+    dw = linear_dw(dy, x)
+    xr = x.detach().clone().requires_grad_(True)
+    wr = w_deq.detach().clone().requires_grad_(True)
+    torch.nn.functional.linear(xr, wr).backward(dy)
+    dw_rel = float((dw.float() - wr.grad.float()).norm() / wr.grad.float().norm())
+
     ok = (same and slice_same and rel < 0.02 and q2.dtype == torch.int8
           and code_diff <= 1 and scale_rel < 0.05
           and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03
           and dx_q_rel < 0.04
-          and quant_rel < 2e-3 and scale_same)
+          and quant_rel < 2e-3 and scale_same
+          and dx_gemm_rel < 1e-6 and dw_rel < 1e-6)
     if verbose:
         print(f"device            : {device_name()}")
         print(f"INT8 vs bf16      : relative error {rel:.4f} (expect < 0.02)")
@@ -123,5 +140,7 @@ def selftest(verbose: bool = True) -> bool:
         print(f"backward dx, int8 GEMM (weight stays quantized): rel {dx_q_rel:.4f}")
         print(f"fused quantizer vs chain: {quant_diff} of {q_fused.numel()} values "
               f"differ, rel {quant_rel:.2e}, scales exact: {scale_same}")
+        print(f"autograd op: dx vs the same GEMM rel {dx_gemm_rel:.2e}, "
+              f"dW vs autograd rel {dw_rel:.2e}")
         print("PASS" if ok else "FAIL")
     return ok

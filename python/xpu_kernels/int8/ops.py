@@ -118,6 +118,17 @@ def dequant_weight(w8, w_scale):
     """
     if w8.dtype != torch.int8:
         raise TypeError(f"w8 must be int8, got {w8.dtype}")
+    if is_capturing():
+        # A full-precision copy of the weight, inside a device-graph capture,
+        # would be captured and re-computed on every replay -- ~0.4 s per step
+        # for a 3.7 B model.  Materialize it before capturing; the INT8
+        # backward ("mode='int8'") needs no copy at all.
+        raise RuntimeError(
+            "dequant_weight() materializes a full-precision copy of the "
+            "weight; inside a device-graph capture it would be captured and "
+            "re-computed on every replay. Call it before capturing, or use "
+            "the int8 backward (xpu_kernels.int8_linear(..., mode='int8')), "
+            "which needs no copy at all.")
     w = w8.to(torch.float32) * w_scale.to(torch.float32).reshape(-1, 1)
     return rotate(w.to(torch.bfloat16))
 
@@ -133,6 +144,115 @@ def linear_dx(dy, w):
     if dy.shape[-1] != w.shape[0]:
         raise ValueError(f"dy has {dy.shape[-1]} columns but w has {w.shape[0]} rows")
     return dy @ w
+
+
+def linear_dw(dy, x):
+    """``dL/dW`` for a linear: ``dy [.., N]^T @ x [.., K] -> [N, K]``.
+
+    The surprising part is how little of the INT8 machinery shows up here.
+
+    The forward is *mathematically* the bf16 forward with the dequantized
+    weight: the ConvRot rotation is orthogonal, so it cancels in the
+    contraction, and the activation's quantization is exact for the same
+    reason.  So ``y = x @ dequant(w8, s)^T`` as an identity, and the weight
+    gradient of the INT8 model is the weight gradient of that bf16 model:
+
+        dL/dW = dy^T @ x
+
+    No scale, no rotation, and -- unlike :func:`linear_dx` -- no dequantized
+    weight at all: *the weight does not appear in its own gradient*.  The
+    weight's quantization still shows up in the gradient's **value**, because
+    the forward used the dequantized weight; that is the same 0.9 % the dx
+    path reports, and the convention is the straight-through one: the gradient
+    is the gradient of the model as it was computed, and the parameter is
+    updated as if the quantization were the identity.
+
+    ``x`` is the *unrotated* activation, which is what the caller has: the
+    residual stream, in bf16.  If the caller saved the *quantized* activation
+    instead, the gradient picks up the activation's quantization error and the
+    rotation has to be undone afterwards; that variant is not here.
+    """
+    if dy.shape[-2] != x.shape[-2]:
+        raise ValueError(
+            f"dy has {dy.shape[-2]} rows but x has {x.shape[-2]}: the batch "
+            f"dims must match for dy^T @ x")
+    return dy.reshape(-1, dy.shape[-1]).transpose(0, 1) @ \
+        x.reshape(-1, x.shape[-1])
+
+
+class _Int8LinearFn(torch.autograd.Function):
+    """The INT8 linear as an autograd op, so a training graph can use it.
+
+    Without this the gradient would *silently vanish*: the kernels are not
+    differentiable, so ``linear()`` returns a tensor with no ``grad_fn`` and a
+    model that drops an INT8 layer into a training graph trains nothing
+    through it.  (This is the failure the trainer's own ``Int8LinearFn``
+    exists to prevent.)
+
+    The backward is :func:`linear_dx` -- the weight is dequantized for it --
+    or :func:`linear_dx_int8`, which keeps the weight in int8 and quantizes
+    ``dy`` instead: no full-precision copy of the weight at all, at the price
+    of one quantizer's worth of gradient error (1.35 % against the bf16
+    gradient, against 0.93 % for the dequantized-weight path).
+
+    The weight gradient is not returned here: the INT8 weight is a frozen
+    int8 buffer, so its gradient is meaningless.  For a trainable weight the
+    parameter is bf16 and the forward quantizes it per step; the gradient of
+    *that* parameter is :func:`linear_dw`, and the caller computes it (it
+    needs the activation, which the caller has).
+    """
+
+    @staticmethod
+    def forward(ctx, x, w8, w_scale, bias, mode):
+        ctx.save_for_backward(w8, w_scale)
+        ctx.mode = mode
+        ctx.input_dtype = x.dtype
+        return linear(x, w8, w_scale, bias)
+
+    @staticmethod
+    def backward(ctx, dy):
+        w8, w_scale = ctx.saved_tensors
+        dy = dy.to(torch.bfloat16)
+        if ctx.mode == "int8":
+            dx = linear_dx_int8(dy, w8, w_scale)
+        elif ctx.mode == "dense":
+            # the weight is materialized here, once, and dropped again: the
+            # memory the quantization saved stays saved.  Inside a device-graph
+            # capture this raises (dequant_weight refuses), because a captured
+            # dequant would be replayed on every step.
+            dx = linear_dx(dy, dequant_weight(w8, w_scale))
+        else:
+            raise ValueError(f"unknown backward mode {ctx.mode!r}; "
+                             f"use 'dense' or 'int8'")
+        return dx.to(ctx.input_dtype), None, None, None, None
+
+
+def int8_linear(x, w8, w_scale, bias=None, *, mode="dense"):
+    """The INT8 linear, differentiable.
+
+    Same forward as :func:`linear`; the backward is the vjp of the INT8 model
+    (:func:`linear_dx` or :func:`linear_dx_int8`).
+
+    ``mode``:
+
+    * ``"dense"`` -- the weight is dequantized in the backward, so the
+      gradient is exact against the dequantized weight (0.93 % from the
+      unquantized one).  The full-precision copy exists only for the duration
+      of that one layer's backward.
+    * ``"int8"`` -- the weight stays int8: no copy at all, one byte per
+      parameter, and the gradient is 1.35 % from the unquantized model
+      because ``dy`` is quantized.  Needs the loss-curve A/B before it is a
+      default; ``docs/todo.md`` has it.
+
+    The weight gradient is not returned: the INT8 weight is a frozen int8
+    buffer, so its gradient is meaningless.  For a trainable weight, the
+    parameter is bf16 and the forward quantizes it per step; the gradient of
+    *that* parameter is :func:`linear_dw`, computed by the caller (it needs
+    the activation, which the caller has).
+    """
+    if mode not in ("dense", "int8"):
+        raise ValueError(f"unknown backward mode {mode!r}; use 'dense' or 'int8'")
+    return _Int8LinearFn.apply(x, w8, w_scale, bias, mode)
 
 
 def quantize_row_torch(x):
@@ -513,20 +633,35 @@ class Int8Linear(torch.nn.Module):
         model.some_linear = mod
     """
 
-    def __init__(self, w8, w_scale, bias=None):
+    def __init__(self, w8, w_scale, bias=None, *, backward="dense"):
         super().__init__()
         self.register_buffer("w8", w8.detach())
         self.register_buffer("w_scale", w_scale.detach().to(torch.float32))
         self.bias = None if bias is None else torch.nn.Parameter(
             bias.detach().to(torch.float32), requires_grad=False)
+        if backward not in ("dense", "int8"):
+            raise ValueError(f"unknown backward mode {backward!r}; "
+                             f"use 'dense' or 'int8'")
+        #: how the backward gets the weight: ``"dense"`` dequantizes it for
+        #: that one layer's backward (exact, no resident copy), ``"int8"``
+        #: keeps it in int8 and quantizes ``dy`` instead (one byte per
+        #: parameter, one quantizer's worth of gradient error).
+        self.backward = backward
 
     @classmethod
-    def from_linear(cls, mod):
+    def from_linear(cls, mod, *, backward="dense"):
         q, scale = prepare_weight(mod.weight.detach())
-        return cls(q, scale, getattr(mod, "bias", None))
+        return cls(q, scale, getattr(mod, "bias", None), backward=backward)
 
     def forward(self, x):
-        return linear(x, self.w8, self.w_scale, self.bias)
+        """Differentiable: the backward is the vjp of the INT8 model.
+
+        Without the autograd op the gradient would silently vanish (the
+        kernels are not differentiable), which is the one thing a training
+        graph must not do.
+        """
+        return int8_linear(x, self.w8, self.w_scale, self.bias,
+                           mode=self.backward)
 
     def dense_weight(self, refresh=False):
         """The unrotated bf16 weight, dequantized once and cached.

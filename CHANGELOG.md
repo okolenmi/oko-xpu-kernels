@@ -9,6 +9,23 @@ so the changes wait here until they are worth a number.
 
 ### Added
 
+* **The INT8 linear is an autograd op** (`int8.int8_linear`, and
+  `Int8Linear` now uses it). It was not: `linear()` returns a tensor with no
+  `grad_fn`, so an INT8 layer dropped into a training graph produced **no
+  gradient at all, silently** -- the one thing a training graph must not do.
+  The backward is `linear_dx` (the weight is dequantized for that one
+  layer's backward and dropped again, so the memory the quantization saved
+  stays saved) or `linear_dx_int8` (the weight stays int8: no copy at all,
+  one byte per parameter, 1.05 % from the bf16 gradient against 0.93 % for
+  the dense path). The dense mode refuses inside a device-graph capture,
+  because a captured dequant would be replayed on every step.
+* **The weight gradient, `linear_dw(dy, x)`** -- and the surprise is how
+  little there is to it. The INT8 forward is *mathematically* the bf16
+  forward with the dequantized weight (the rotation is orthogonal, so it
+  cancels in the contraction), so the weight gradient of the INT8 model is
+  the bf16 model's: `dy^T @ x`, with no scale, no rotation, and no
+  dequantized weight at all. Verified bit-identical to `torch.autograd` of
+  the dequantized weight (`debug/verify_linear_dw.py`, rel 0.00e+00).
 * **A fused row-quantizer** (`xpu_kernels.triton.quantize`): the per-row int8
   quantizer of the gradient path, as a Triton kernel. 4.17 ms -> 0.27 ms at
   3974x8192, and 9 kernel launches become 1 -- which is what moved the

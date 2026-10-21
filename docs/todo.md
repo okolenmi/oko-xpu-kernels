@@ -80,8 +80,40 @@ the loss curve, not the per-element relative error.
       `tests/test_quantize.py`. The row *scale* is exact. The gate found the
       whole thing on the kernel's first run ("73 of 721 984 values differ").
       `docs/performance.md` has the measurements.
-- [ ] `dW` (only if full fine-tuning is on the table): `dy^T @ x` with the
-      *activation* scale on the other index; same analysis, opposite side.
+- [x] `dW`: **`linear_dw(dy, x)` -- and the surprise is how little there is
+      to it.** The INT8 forward is *mathematically* the bf16 forward with the
+      dequantized weight: the ConvRot rotation is orthogonal, so it cancels in
+      the contraction, and the activation's quantization is exact for the same
+      reason. So the weight gradient of the INT8 model is the bf16 model's:
+
+          dL/dW = dy^T @ x
+
+      No scale, no rotation, and -- unlike `linear_dx` -- no dequantized weight
+      at all: the weight does not appear in its own gradient. Verified
+      bit-identical to `torch.autograd` of the dequantized weight
+      (`debug/verify_linear_dw.py`, rel 0.00e+00).
+      What the quantization *does* change is the gradient's value (the forward
+      used the dequantized weight), which is the straight-through convention
+      the dx path already uses: 0.9 % from the unquantized model.
+- [x] the INT8 linear is now **an autograd op** (`int8.int8_linear`,
+      `Int8Linear`), which it was not: `linear()` returns a tensor with no
+      `grad_fn`, so an INT8 layer dropped into a training graph produced **no
+      gradient at all, silently**. The op's backward is `linear_dx` (the
+      weight is dequantized for that one layer's backward and dropped again --
+      the memory the quantization saved stays saved) or `linear_dx_int8` (the
+      weight stays int8: no copy at all, one byte per parameter, 1.05 % from
+      the bf16 gradient against 0.93 % for the dense path). The dense mode
+      refuses inside a device-graph capture, because a captured dequant would
+      be replayed on every step.
+- [ ] for full fine-tuning the *parameter* is bf16 and the forward quantizes
+      it per step, and that is where the remaining cost is:
+      `prepare_weight` is a torch chain (3.0 ms per 25 M parameters, ~0.4 s
+      for a 3.7 B model, per step). The C kernel would do it in one pass, but
+      it is **not the same function**: it keeps the rotated values in fp32
+      instead of rounding them to bf16 first, so the scale and 5.7 % of the
+      values differ -- switching would change every model's weights (and the
+      recorded PNG hashes), so it needs its own decision and its own gate
+      rather than a quiet swap.
 
 ## 2. Device-graph capture of the step
 
@@ -319,6 +351,12 @@ Two notes for the next person:
       driver bump: `PROBE_REDUCE=1 ./debug/native/bin/probe_ffn_situ 3973 8192 device`.
       Revisit if the driver that "fixed" it gets a changelog or a filed issue
       (this is worth reporting: a compiler/runtime bug that silently vanished).
+      **The report is written**: `docs/report-reduce-over-group.md` has the
+      text ready for the tracker, with the reproducer's build and run commands
+      and the three questions worth asking (was it known, is the fix in the
+      current driver or just dormant, and can the runtime throw instead of
+      killing the process). It needs sending -- the tracker is on the user's
+      side of the wall.
       The activation quantizer has the same row max and was not measured.
 
 ## Dead ends, recorded so they are not retried

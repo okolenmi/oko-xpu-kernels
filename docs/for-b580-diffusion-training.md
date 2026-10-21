@@ -148,19 +148,38 @@ those numbers trustworthy, and it transfers as-is:
 
   **The memory arithmetic, because it decides whether an INT8 base fits at
   all.** The weight-only backward needs the weight in bf16, so an INT8 base
-  costs 1 + 2 = **3 bytes per parameter** (3.7 GB + 7.4 GB for a 3.7 B model) —
-  more than a bf16 base (2 bytes) and, on a 12.2 GB card, more than fits.
-  `linear_dx_int8` keeps the weight in int8, so the base costs **1 byte per
-  parameter** (3.7 GB). It was 3.4x slower than the bf16 path; with the
-  quantizer now fused (`xpu_kernels.triton.quantize`: 4.17 ms -> 0.27 ms, 9
-  launches -> 1) it is **1.33x** — 2.75 ms against 2.08 ms at M=4096, N=8192 —
-  and its accuracy is 1.35 % relative against the unquantized gradient (the
-  bf16 path: 0.93 %). Still not the default: it needs your loss-curve A/B
-  (same seed, same data order) before it becomes one, and the *quantizer* is
-  the one kernel in the package that is not bit-exact (9.1e-4 relative on the
-  gradient, fifteen times below the path's own error; `docs/performance.md`).
+  costs 1 + 2 = **3 bytes per parameter** (3.7 GB + 7.4 GB for a 3.7 B model)
+  — more than a bf16 base (2 bytes) and, on a 12.2 GB card, more than fits.
+  Two ways out, and your `Int8LinearFn` already takes the second one:
 
-  What is still missing: `dW` (full fine-tuning only).
+  * **rebuild and drop** (what your `ops.py` does): the dense weight is
+    rebuilt from int8 for that one layer's backward and dropped again, so the
+    base stays at **1 byte per parameter** and only one layer's copy exists at
+    a time. The cost is the dequant, per layer, per step — 2.6 ms per 25 M
+    parameters with the torch chain, i.e. ~0.4 s per step for a 3.7 B model.
+  * **never dequantize** (`int8_linear(..., mode="int8")`): the weight stays
+    int8 and `dy` is quantized instead. One byte per parameter, no copy at
+    all, and — with the quantizer now fused — 1.33x the bf16 backward path
+    (2.75 ms against 2.08 ms at M=4096, N=8192) instead of 3.4x. Its
+    accuracy is 1.05 % relative against the bf16 gradient (the bf16 path:
+    0.93 %). It needs your loss-curve A/B (same seed, same data order) before
+    it becomes a default.
+
+  The library now ships the autograd op itself (`int8.int8_linear`,
+  `Int8Linear`): without it, `linear()` returns a tensor with no `grad_fn`,
+  so an INT8 layer in a training graph produces **no gradient at all,
+  silently**. Your own `Int8LinearFn` is the better of the two (it rebuilds
+  and drops); the library's is the reference implementation, with the
+  capture-safety rules attached — the dense mode refuses to run inside a
+  device-graph capture, because a captured dequant would be replayed on every
+  step.
+
+  The weight gradient (`dL/dW`) is `dy^T @ x` and nothing else: the rotation
+  cancels in the contraction, so the INT8 model's weight gradient is the bf16
+  model's, bit for bit (`debug/verify_linear_dw.py`).
+
+  What is still missing: a trainable INT8 weight (the parameter would be bf16
+  and re-quantized per step — 0.4 s for a 3.7 B model, see `docs/todo.md`).
 
   **The one line to put in your init**, because a captured step that silently
   fell back to the eager chain is slower than an eager step and looks like a

@@ -183,6 +183,26 @@ scale on `dy`). Measured at M=4096: **it is 3.6x slower** than the bf16 path
 faster GEMM saves) and 40 % noisier, so treat it as a *memory* option
 (2x less weight memory), not a speed one.
 
+### The INT8 linear, differentiable
+
+`linear()` on its own returns a tensor with no `grad_fn` -- the kernels are not
+differentiable -- so an INT8 layer in a training graph produces **no gradient
+at all, silently**. `int8_linear` is the autograd op that prevents it:
+
+```python
+y = xpu_kernels.int8_linear(x, w8, w_scale, mode="dense")   # or mode="int8"
+```
+
+| mode | the backward | memory | gradient vs the bf16 model |
+|---|---|---|---|
+| `dense` | `dy @ dequant(w8, s)`, rebuilt for that one layer and dropped | 1 byte/param + one layer's copy | 0.93 % |
+| `int8` | `dy` quantized, the weight never leaves int8 | 1 byte/param, no copy | 1.05 % |
+
+The weight gradient is `linear_dw(dy, x)` and nothing else: the ConvRot
+rotation is orthogonal, so it cancels in the contraction, and the INT8 model's
+weight gradient is the bf16 model's -- bit for bit
+(`debug/verify_linear_dw.py`).
+
 ### Capturing a step
 
 A device graph replays whatever was inside it, every step, forever. Two things

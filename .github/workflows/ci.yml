@@ -1,0 +1,65 @@
+name: tests
+
+# The CPU job is the contract: every reference formula, every gate rule and the
+# backward gradchecks run on a machine with no XPU and no libxpuint8.so. That is
+# deliberate -- those are the parts that can be wrong in a way the GPU would
+# only report as "the image changed", and they must be checkable anywhere.
+#
+# The device job needs a self-hosted runner labelled "xpu" with oneAPI and a
+# built libxpuint8.so (see build.sh). It is skipped unless the repository
+# variable XPU_RUNNER is set to "yes", so a fork or a fresh clone does not sit
+# with a permanently queued job.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # CPU torch, from the CPU index: the default wheel pulls ~2 GB of CUDA
+      # libraries this project will never load.
+      - name: Install torch (CPU)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the package and pytest
+        run: pip install -e . --no-deps && pip install pytest
+
+      # No libxpuint8.so here: available() is False and the INT8 half reports
+      # itself unavailable, which must not break the import.
+      - name: Import without the native library
+        run: python -c "import xpu_kernels as k; assert not k.available(); print(k.__version__ if hasattr(k, '__version__') else 'ok')"
+
+      - name: Tests
+        run: python -m pytest -q
+
+  device:
+    if: vars.XPU_RUNNER == 'yes'
+    runs-on: [self-hosted, xpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build libxpuint8.so
+        run: ./build.sh
+
+      # The self-test is the whole point: it probes every gate against its
+      # reference on this machine, so an upgrade that moves a value fails here
+      # instead of changing a render.
+      - name: Self-test and gates
+        env:
+          LEVEL_ZERO_V1_SDK_PATH: ${{ vars.LEVEL_ZERO_V1_SDK_PATH }}
+        run: python -m xpu_kernels
+
+      - name: CPU-side tests on the XPU machine too
+        run: python -m pytest -q

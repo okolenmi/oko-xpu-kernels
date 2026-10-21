@@ -6,7 +6,8 @@ Kernel work for Intel Arc XPU tensors, in two halves:
   binding. Fused Kronecker-Hadamard rotation + INT8 quantization on the
   activation side, a fused dequant(+activation) epilogue on the output side,
   and accumulator paths that let a consumer walk an int32 GEMM result without a
-  bf16 round trip. Inference only.
+  bf16 round trip. Inference, plus the backward's `dL/dx` (weight-only dequant,
+  since the weight scale sits on the contraction index there).
 - **`xpu_kernels.triton`** — single-pass Triton kernels for the non-quantized
   path: `rms_norm + rope` and `rms_norm + adaLN modulation`, each bit-identical
   to the chain it replaces, each verified against a reference once per process
@@ -75,11 +76,16 @@ torch implementation (4-6x slower, same numbers within INT8 noise).
 
 ## Use from Python
 
-The binding is `python/xpu_kernels` and depends on `torch` only:
+Install it as a package -- that is what a consumer should do, and what ComfyUI
+does (`pip install -e`, no vendored copies):
 
 ```bash
-PYTHONPATH=python python -m xpu_kernels      # self-test on this machine
+pip install -e .            # depends on torch only; `-e` picks up edits in place
+python -m xpu_kernels       # self-test on this machine: library + every gate
 ```
+
+Or run it from the tree, which is what `PYTHONPATH=python python -m xpu_kernels`
+does for the self-test.
 
 ```python
 import torch, xpu_kernels

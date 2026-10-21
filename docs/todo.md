@@ -168,12 +168,26 @@ package does not have:
 
 ## 5. Packaging and CI
 
-- [ ] a GitHub Actions job that builds `build/libxpuint8.so` with oneAPI and runs
-      `pytest tests/` (the gate tests need no GPU) plus `python -m xpu_kernels`
-      on a self-hosted XPU runner when one exists.
-- [ ] PyPI: confirm `xpu-kernels` is free (the earlier check returned 503), then
-      `pip wheel` in CI.
-- [ ] `xpu-kernels bench` — one CLI over the probes in `debug/` (they all take
+- [x] `.github/workflows/ci.yml`: a CPU job (ubuntu-latest, python 3.10 and
+      3.12) that installs torch from the CPU index, `pip install -e . --no-deps`,
+      checks that the package imports **without** `libxpuint8.so`
+      (`available()` must be False, not an exception), and runs `pytest`. All 40
+      tests are CPU-only by design, so this job is the contract for the reference
+      formulas and the gate rules.
+      A second job runs `./build.sh` + `python -m xpu_kernels` on a self-hosted
+      `[self-hosted, xpu]` runner, gated by the repository variable
+      `XPU_RUNNER=yes` so a clone does not sit with a permanently queued job.
+      Needed on that runner: oneAPI 2025.3, `LEVEL_ZERO_V1_SDK_PATH`, and the
+      INT8 self-test tolerance (it is not bit-exact by nature).
+- [x] PyPI name: **`xpu-kernels` is free** (the earlier check returned 503; the
+      JSON API answers 404 now, which means no project by that name). The GitHub
+      repo is `okolenmi/oko-xpu-kernels`, so the dist name and the repo name
+      differ -- decide which one to publish under before the first upload.
+- [ ] `pip wheel` in CI and an sdist that carries `build/libxpuint8.so`. The
+      wheel is the thing that makes this installable without a DPC++ toolchain,
+      and it will only work for the oneAPI runtime it was built against (see
+      Build above), so it needs a versioned tag, not plain `latest`.
+- [ ] `xpu-kernels bench` -- one CLI over the probes in `debug/` (they all take
       their shape as a constant today). Low value until someone else needs to
       reproduce a number.
 

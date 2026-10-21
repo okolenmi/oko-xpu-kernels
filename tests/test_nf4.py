@@ -19,8 +19,9 @@ import torch
 from xpu_kernels.triton import nf4
 
 needs_a_device = pytest.mark.skipif(
-    not (torch.xpu.is_available() or torch.cuda.is_available()),
-    reason="the nf4 dequantizer is a Triton kernel: it needs a device")
+    not (torch.xpu.is_available() or torch.cuda.is_available())
+    or not nf4.enabled(),
+    reason="the nf4 dequantizer is a Triton kernel: it needs a device and Triton")
 
 
 def _packed(values):
@@ -99,6 +100,8 @@ def test_the_gate_is_active():
 
 
 def test_the_argument_checks():
+    # The argument checks come before the gate, so a caller's mistake is
+    # reported as such whether or not the kernel is verified on this machine.
     with pytest.raises(TypeError):
         nf4.dequant_nf4(torch.zeros(4, dtype=torch.int8),
                         torch.ones(1, dtype=torch.float32))
@@ -108,6 +111,8 @@ def test_the_argument_checks():
     with pytest.raises(ValueError):
         nf4.dequant_nf4(torch.zeros(4, dtype=torch.uint8),
                         torch.ones(1, dtype=torch.float32), blocksize=63)
+    # too few scales: 4 packed bytes are 8 elements, and at 4 per block that
+    # is two blocks
     with pytest.raises(ValueError):
         nf4.dequant_nf4(torch.zeros(4, dtype=torch.uint8),
-                        torch.ones(1, dtype=torch.float32))
+                        torch.ones(1, dtype=torch.float32), blocksize=4)

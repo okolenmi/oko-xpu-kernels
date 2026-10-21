@@ -27,8 +27,9 @@ from xpu_kernels import int8
 from xpu_kernels.triton import quantize as Q
 
 needs_a_device = pytest.mark.skipif(
-    not (torch.xpu.is_available() or torch.cuda.is_available()),
-    reason="the fused quantizer is a Triton kernel: it needs a device")
+    not (torch.xpu.is_available() or torch.cuda.is_available())
+    or not Q.enabled(),
+    reason="the fused quantizer is a Triton kernel: it needs a device and Triton")
 
 
 def _rows(M=8, K=64, seed=0, device="cpu"):

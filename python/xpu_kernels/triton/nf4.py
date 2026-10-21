@@ -155,7 +155,7 @@ def _launch(packed, absmax, codebook_, out, n, blocksize, dtype):
     The probe calls this, not :func:`dequant_nf4`: the public entry asks the
     gate, and the gate's own probe would then be asking the gate.
     """
-    _kernel[(triton.cdiv(n, TILE),)](
+    _kernel[(_triton.cdiv(n, TILE),)](
         packed, absmax, codebook_, out,
         n,
         BLOCK_SHIFT=blocksize.bit_length() - 1,
@@ -176,7 +176,9 @@ def dequant_nf4(packed, absmax, codebook_=None, *, dtype=torch.bfloat16,
     what this replaces: ~40 bytes of traffic and 16 bytes of scratch per
     parameter against 2.6 bytes and no scratch here.
     """
-    _GATE.require()
+    # The argument checks come *before* the gate: a caller's mistake is the
+    # caller's error, and it should be reported as such whether or not the
+    # kernel is verified on this machine.
     if packed.dtype != torch.uint8:
         raise TypeError(f"packed must be uint8, got {packed.dtype}")
     if absmax.dtype != torch.float32:
@@ -187,6 +189,7 @@ def dequant_nf4(packed, absmax, codebook_=None, *, dtype=torch.bfloat16,
     if absmax.numel() * blocksize < n:
         raise ValueError(f"absmax has {absmax.numel()} blocks but the weight "
                          f"needs {n // blocksize} at {blocksize} per block")
+    _GATE.require()
     if codebook_ is None:
         codebook_ = codebook(packed.device)
     if out is None:
@@ -213,6 +216,11 @@ def _probe(ref):
     Random nibbles (so every codebook entry is hit) and random scales, at the
     block size and the block counts a real weight has.
     """
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError from
+        # inside the launch (which is what the first CI run of this module
+        # reported).
+        raise RuntimeError("the triton nf4 dequantizer is not available here")
     device = probe_device()
     gen = torch.Generator(device=device).manual_seed(0)
     n_blocks = 4096

@@ -367,6 +367,11 @@ def _rows_bwd(dy, x, scale, shift, eps, need_mod=True):
 
 
 def _probe_forward(ref):
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError or a
+        # "NoneType is not subscriptable" from inside the launch.
+        raise RuntimeError("the triton adaln kernel is not available here")
+
     """One row-block, bf16, with a scale/shift that is not all ones."""
     device = probe_device()
     gen = torch.Generator(device=device).manual_seed(0)
@@ -383,6 +388,11 @@ def _default_reference():
 
 
 def _probe_backward(ref):
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError or a
+        # "NoneType is not subscriptable" from inside the launch.
+        raise RuntimeError("the triton adaln backward kernel is not available here")
+
     """Fused backward vs ``torch.autograd`` of the eager chain, in fp32.
 
     fp32 for the same reason as the rope backward: in bf16 the forward's cast

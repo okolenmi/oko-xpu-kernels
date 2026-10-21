@@ -448,6 +448,11 @@ def _rows_bwd(dy, x, freqs_cis, scale, epsilon, split_half=True, out=None):
 
 
 def _probe_forward(ref):
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError or a
+        # "NoneType is not subscriptable" from inside the launch.
+        raise RuntimeError("the triton rope kernel is not available here")
+
     """Synthetic strided q/k, the layout the model actually passes.
 
     Its own generator, so the sampler's noise stream is untouched.  Both q and k
@@ -477,6 +482,11 @@ def _default_reference():
 
 
 def _probe_dequant(ref):
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError or a
+        # "NoneType is not subscriptable" from inside the launch.
+        raise RuntimeError("the triton rope dequant kernel is not available here")
+
     """Does the fused dequant+rope match dequant -> rope, bit for bit?
 
     The reference dequant is the same fp32 expression in torch, which is what
@@ -527,6 +537,11 @@ _GATE_DQ = Gate(
 
 
 def _probe_backward(ref):
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError or a
+        # "NoneType is not subscriptable" from inside the launch.
+        raise RuntimeError("the triton rope backward kernel is not available here")
+
     """Fused backward vs ``torch.autograd`` of the eager chain, in fp32.
 
     ``ref`` is a differentiable *forward* chain, because the thing being

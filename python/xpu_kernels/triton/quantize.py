@@ -209,6 +209,11 @@ def usable(x) -> bool:
 
 
 def _probe(ref):
+    if _kernel is None:
+        # No Triton here: say so, rather than failing with a NameError or a
+        # "NoneType is not subscriptable" from inside the launch.
+        raise RuntimeError("the triton quantizer kernel is not available here")
+
     """The fused kernel against the torch chain, at a training-like shape.
 
     Two shapes, because the row length is a parameter of the kernel: 3072 (the

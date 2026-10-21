@@ -281,7 +281,7 @@ class Gate:
             f"{self.name}: the fused kernel is not verified on this machine "
             f"({why}). Use the fallback, or give the gate something to compare "
             f"against: xpu_kernels.triton.set_reference(module, your_fallback) "
-            f"-- the modules are 'rope', 'adaln' and 'quantize', and "
+            f"-- the modules are 'rope', 'adaln', 'quantize' and 'nf4', and "
             f"xpu_kernels.triton.status() says which kernel is closed and why.")
 
     def describe(self) -> str:

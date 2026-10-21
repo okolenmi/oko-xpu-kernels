@@ -85,10 +85,12 @@ torch implementation (4-6x slower, same numbers within INT8 noise).
 package, and tags the result `linux_x86_64` rather than `any` -- the payload is a
 real ELF. It is not manylinux: the `.so` links `libsycl.so.8` and does not bundle
 it, so a wheel only works in a process using the oneAPI runtime it was built
-against. Tag a published release with that toolchain (`0.2.0+oneapi2025.3`)
-rather than publishing one "latest" wheel that quietly stops loading when oneAPI
-moves. The sdist installs without a toolchain and reports the library as
-unavailable until you run `./build.sh`.
+against. PyPI forbids local version identifiers (PEP 440), so the version stays
+plain and the toolchain is recorded in the tag and the release notes instead
+(`v0.2.0-oneapi2025.3`) -- a wheel that says which runtime it wants is better
+than a "latest" that quietly stops loading when oneAPI moves. The sdist installs
+without a toolchain and reports the library as unavailable until you run
+`./build.sh` from an unpacked copy of it.
 
 ## Use from Python
 
@@ -96,8 +98,18 @@ Install it as a package -- that is what a consumer should do, and what ComfyUI
 does (`pip install -e`, no vendored copies):
 
 ```bash
-pip install -e .            # depends on torch only; `-e` picks up edits in place
+pip install xpu-kernels     # wheel: needs a matching oneAPI runtime, else see Build
+pip install -e .            # from a checkout: depends on torch only, picks up edits
 python -m xpu_kernels       # self-test on this machine: library + every gate
+```
+
+If the installed wheel reports the library unavailable (its `.so` was built
+against a different oneAPI), rebuild from the sdist:
+
+```bash
+pip download --no-binary :all: --no-deps xpu-kernels
+tar xf xpu_kernels-*.tar.gz && cd xpu_kernels-*/ && ./build.sh
+export XPU_KERNELS_LIB=$PWD/build/libxpuint8.so   # the loader's first choice
 ```
 
 Or run it from the tree, which is what `PYTHONPATH=python python -m xpu_kernels`

@@ -8,9 +8,10 @@
 # against the SYCL runtime it was built with (libsycl.so.8, oneAPI 2025.x -- see
 # build.sh).  It therefore has to be built where that toolchain is, and installed
 # into a process using the same runtime.  That is why this builds the .so first
-# rather than shipping a prebuilt one, and why a published release should be
-# tagged with its toolchain (0.2.0+oneapi2025.3) instead of a "latest" that
-# silently stops working when oneAPI moves.
+# rather than shipping a prebuilt one, and why a published release is tagged
+# with its toolchain (v0.2.0-oneapi2025.3) instead of a "latest" that silently
+# stops working when oneAPI moves.  The *version* stays plain: PyPI must not
+# accept local version identifiers such as 0.2.0+oneapi2025.3 (PEP 440).
 #
 # The .so is staged inside the package because that is where the loader looks
 # (python/xpu_kernels/int8/libxpuint8.so, see int8/_lib.py).  It is removed again

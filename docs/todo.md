@@ -235,10 +235,18 @@ Two notes for the next person:
       loader picks the bundled `.so` rather than the repo's. That check is now a CI step on the XPU runner
       (which also gets `pip install -e .` -- it was missing, so the device job
       could not have imported the package on a clean runner).
-- [ ] Publish a release, and with it the version tag: `0.2.0+oneapi2025.3`
-      (toolchain in the local segment), the repo name `okolenmi/oko-xpu-kernels`
-      versus the dist name `xpu-kernels`, and a README paragraph on which oneAPI
-      each wheel needs. Not done because there is no upload target yet.
+- [x] Publish path settled: PyPI **trusted publishing** (no token anywhere) from
+      `.github/workflows/release.yml`, environment `pypi`, dist name
+      `xpu-kernels` under repo `okolenmi/oko-xpu-kernels`. Both artifacts go to
+      PyPI -- the sdist alone would leave `pip install xpu-kernels` with nothing
+      to compute with -- and the same bytes are attached to the GitHub Release.
+      **The version stays plain** (`0.2.0`): PEP 440 says PyPI *must not* accept
+      local version identifiers, so the earlier `0.2.0+oneapi2025.3` plan is
+      impossible; the toolchain moved to the tag (`v0.2.0-oneapi2025.3`) and the
+      release notes. Checklist in `docs/publishing.md`; metadata gained PEP 639
+      `license`/`license-files`, `[project.urls]` and classifiers, and
+      `twine check` passes on both artifacts. Remaining: create the `pypi`
+      environment in repo settings, push the workflow, tag `v0.2.0`.
 - [ ] `xpu-kernels bench` -- one CLI over the probes in `debug/` (they all take
       their shape as a constant today). Low value until someone else needs to
       reproduce a number.

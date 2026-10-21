@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=64"]
+# 77 is where PEP 639 (the `license` expression and `license-files`) lands.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +9,32 @@ version = "0.2.0"
 description = "Fused kernels for Intel Arc (Xe2) XPU tensors: ConvRot INT8, fused rms_norm+rope/adaLN, and the instruments used to verify them"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["torch>=2.5"]
 
 [project.optional-dependencies]
 triton = ["triton>=3.0"]
 dev = ["numpy"]
 
-# [project.urls]  # add Homepage once the repository exists
+[project.urls]
+Homepage = "https://github.com/okolenmi/oko-xpu-kernels"
+Source = "https://github.com/okolenmi/oko-xpu-kernels"
+Issues = "https://github.com/okolenmi/oko-xpu-kernels/issues"
 
 [tool.setuptools]
 package-dir = {"" = "python"}

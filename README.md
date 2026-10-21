@@ -26,6 +26,7 @@ written up in `docs/` so they do not have to be rediscovered.
 | [`docs/experiments.md`](docs/experiments.md) | what was tried, including the dead ends, so they are not repeated |
 | [`python/xpu_kernels`](python/xpu_kernels/__init__.py) | the Python package: `xpu_kernels.int8` (ConvRot INT8) and `xpu_kernels.triton` (rope, adaLN) |
 | [`docs/adding-a-kernel.md`](docs/adding-a-kernel.md) | the structure every addition follows: gate, escape hatch, reference, evidence |
+| [`docs/todo.md`](docs/todo.md) | what is next, ranked, with the evidence that would close each item |
 | [`docs/for-b580-diffusion-training.md`](docs/for-b580-diffusion-training.md) | what a *training* project on the same card can reuse (and what it must not) |
 | [`debug/README.md`](debug/README.md) | the measurement instruments and how to re-run them |
 
@@ -111,8 +112,11 @@ activation paths are bit-identical to the unfused chain they replace
 activation rotation is baked into the weight layout, so a plain
 `w/amax*127` quantization is silently wrong.
 
-Not supported: backward passes. This is an inference library — the GEMM is
-`torch._int_mm`, the kernels are forward-only.
+**Backward passes are not here yet.** This half is inference-only: the GEMM is
+`torch._int_mm`, the kernels are forward-only. `docs/todo.md` has the design for
+`dL/dx = dL/dy @ W` (weight-only dequant first — the weight scale sits on the
+contraction index, so it cannot fold into a GEMM epilogue) and for making a step
+graph-capturable.
 
 For a worked example of wiring this into a real model — weight loading, the
 per-layer fallback when the device is offloaded or the library is missing, and
@@ -134,6 +138,7 @@ x = k.adaln.rms_adaln(x, scale, shift)
 
 print(k.status())   # rms_rope          : active: verified against the reference (1572864 values), num_warps=4
                     # rms_rope_dequant  : active: verified against the reference (1572864 values), num_warps=4
+                    # rms_rope_backward : active: verified within 0.0001 (worst relative error 7.1e-08, 786432 values), num_warps=4
                     # rms_adaln         : active: verified against the reference (786432 values), num_warps=4
 ```
 
@@ -147,6 +152,17 @@ The gate itself is shared and tested on CPU (`tests/test_gate.py`): it coalesces
 "verified once per process", "any mismatch disables the kernel for the rest of
 the process", and "never pass a probe that could not run". `docs/adding-a-kernel.md`
 is the checklist for a new kernel, including the backward-pass rules.
+
+`rms_rope_split_half` is differentiable: with a grad-requiring input it routes
+through an `autograd.Function` whose backward is a single fused kernel (the
+per-head `dot` product never leaves registers, so there is no scratch buffer and
+nothing extra to launch). Measured on this card at the production shape, one
+tensor: **~0.62 ms forward+backward vs ~8.9 ms** for the eager chain, 14.3×,
+and the gradient is *closer* to the float64 truth than `torch.autograd`'s
+(1.7e-3 vs 2.3e-3) because the fused path never rounds the gradient to bf16 at
+the forward's cast. `freqs_cis` and `scale` are treated as constants; a trainer
+that learns them needs a differentiable chain instead
+(`xpu_kernels.triton.reference.rms_rope_split_half`).
 
 Measured on this card, 42-block DiT at M≈3974: rope 2.34× (35.7 → 15.3 ms per
 forward), adaLN 1.56× (12.7 → 8 ms), both bit-exact. A different `num_warps`
@@ -189,8 +205,10 @@ C API and `docs/architecture.md` for the algorithm.
 | Fused dequant+situ+rotate+quantize | working, **bit-identical to the unfused chain**, 7 launches -> 1 |
 | Row-strided dequant epilogue | working, bit-identical; lets a q|k|v GEMM drop the q/k epilogue entirely |
 | Triton `rms_norm + rope` | working, **2.34×**, bit-identical to the shipped kernel (`num_warps=4` pinned) |
+| Triton rope **backward** | working, **14.3×** on fwd+bwd vs the eager chain, differentiable wrapper |
 | Triton `rms_norm + adaLN` | working, **1.56×**, bit-identical |
-| Training / backward | **not implemented, and not planned** |
+| INT8 training backward | **not implemented** — design and the scale-layout argument in [`docs/todo.md`](docs/todo.md) |
+| Device-graph capture | kernels allocate/sync nothing given an `out=` buffer; the autograd path does not yet take one |
 
 ## Layout
 
@@ -199,14 +217,14 @@ include/xpu_kernels/convrot.h   public C API (callable on torch XPU data_ptr())
 src/xpuint8.cpp                 both SYCL kernels + C API
 build.sh                        builds build/libxpuint8.so with icpx (version-pinned)
 python/xpu_kernels/int8/        torch-only binding: _lib.py loader, ops.py, selftest.py
-python/xpu_kernels/triton/      rope.py, adaln.py: single-pass kernels + _gate.py
+python/xpu_kernels/triton/      kernels + _gate.py; reference.py: eager chain and analytic backward
 pyproject.toml                  `pip install .` for another project
 benchmarks/bench_pipeline.py    end-to-end: eager vs fused vs BF16
 benchmarks/bench_int8.py        torch _int_mm vs BF16 microbenchmark
 reference/convrot_linear.py     portable PyTorch ConvRot reference
 kernels/                        standalone experiments (DPAS probes, GEMM, per-kernel tests)
 debug/                          measurement instruments and the verification harnesses
-docs/                           architecture, performance, experiments, findings, how to add a kernel
+docs/                           architecture, performance, experiments, findings, how to add a kernel, todo
 tests/                          CPU-only unit tests (the gate's contract)
 ```
 
@@ -219,6 +237,11 @@ PYTHONPATH=python python -m pytest tests/ -q # CPU-only: the gate's contract
 python benchmarks/bench_pipeline.py
 python debug/bench_bf16_fair.py   # the honest INT8-vs-BF16 number
 ```
+
+Triton's XPU backend compiles the kernels against the Level Zero headers on
+first use. If they are not on the default include path, point
+`LEVEL_ZERO_V1_SDK_PATH` at the SDK that came with the driver install — that is
+a first-run cost only, the compiled kernels are cached.
 
 Per-kernel tests:
 

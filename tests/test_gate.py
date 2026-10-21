@@ -114,3 +114,38 @@ def test_num_warps_is_reported():
     gate = Gate("t", lambda ref: _pair(torch.ones(1)), num_warps=4,
                 default_reference=lambda: object())
     assert "num_warps=4" in gate.describe()
+
+
+def test_tolerance_mode_passes_small_perturbations():
+    want = torch.randn(64, dtype=torch.float32)
+    got = want + 1e-5 * torch.randn(64)
+    gate = Gate("t", lambda ref: _pair(got, want), default_reference=lambda: object(),
+                rel=1e-3)
+    assert gate.ok() is True
+    assert "within 0.001" in gate.describe()
+
+
+def test_tolerance_mode_fails_a_systematic_error():
+    want = torch.ones(64, dtype=torch.float32)
+    gate = Gate("t", lambda ref: _pair(want * 1.01, want),
+                default_reference=lambda: object(), rel=1e-3)
+    assert gate.ok() is False
+    assert "relative error" in gate.describe()
+
+
+def test_set_reference_can_switch_a_bit_exact_gate_to_tolerance():
+    want = torch.ones(8, dtype=torch.bfloat16)
+    gate = Gate("t", lambda ref: _pair(want * 1.01, want),   # 1.3 bf16 ULP
+                default_reference=lambda: object())          # bit-exact by default
+    assert gate.ok() is False
+    gate.set_reference(lambda *a, **k: want, rel=1e-2)
+    assert gate.ok() is True
+
+
+def test_tolerance_gate_still_refuses_the_wrong_shape():
+    want = torch.ones(8, dtype=torch.float32)
+    gate = Gate("t", lambda ref: _pair(torch.ones(7), want),
+                default_reference=lambda: object(), rel=1e-1)
+    # the shape complaint happens inside the probe and must not be swallowed
+    assert gate.ok() is False
+    assert "probe failed" in gate.describe()

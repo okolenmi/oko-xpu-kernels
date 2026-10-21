@@ -55,7 +55,7 @@ one-line escape hatch:
 | file | fused | measured here | note for training |
 |---|---|---|---|
 | `xpu_kernels/triton/adaln.py` | RMSNorm + adaLN scale/shift in one pass over the row | 25 → 16 ms/step (**1.56×**), bit-exact | forward only. Autograd wrapper needed: run the kernel under `no_grad` in forward, recompute the norm in backward (or write a Triton backward) |
-| `xpu_kernels/triton/rope.py` | RMSNorm + rope in one pass; also reads the INT8 GEMM accumulator directly | rope alone **2.34×** (35.7 → 15.3 ms/forward), bit-exact | forward only; the backward is the same rotation with negated frequencies |
+| `xpu_kernels/triton/rope.py` | RMSNorm + rope in one pass; also reads the INT8 GEMM accumulator directly | rope alone **2.34×** (35.7 → 15.3 ms/forward), bit-exact | **differentiable now**: fused backward, fwd+bwd **14.3×** vs the eager chain (0.62 vs 8.88 ms per tensor), gradient closer to float64 than autograd's |
 | `src/xpuint8.cpp` `situ_reg` | situ with `expm1` tanh | −0.41 ms/call, −34.7 ms/step | see §3 — this one is a *finding*, not just code |
 
 Two design rules in those files worth copying even if the kernels are rewritten:
@@ -125,7 +125,10 @@ those numbers trustworthy, and it transfers as-is:
 
 ## 6. What does not transfer
 
-- INT8 in the training graph (no backward, §1).
+- INT8 in the training graph: no backward kernel yet — see `docs/todo.md` for
+  the design (`dL/dx = dL/dy @ W`, weight-only dequant first, because the weight
+  scale is on the contraction index and cannot fold into a GEMM epilogue) and for
+  the graph-capture requirements.
 - The graph-capture and `addcmul_` findings — MossImage-specific.
 - Prompt/text encoding: closed here as "fast enough", no result worth porting.
 - The ComfyUI memory-accounting patch: their code is already correct.
@@ -133,11 +136,12 @@ those numbers trustworthy, and it transfers as-is:
 ## 7. If you want one thing ported first
 
 The Anima DiT is the same family as the model these kernels were tuned on, so
-the highest-value action is to port `xpu_kernels/triton/adaln.py` and
-`xpu_kernels/triton/rope.py` **with autograd wrappers** the moment `next/families/anima`
-gets a denoiser. Expected: roughly 1.5–2× on the norm/rope portion of the step
-(here 96 → 60 ms/step of a ~1050 ms step), bit-exact forward, and a template
-for the FFN fusion later. Everything needed to do it — the kernels, the
+the highest-value action is to port `xpu_kernels/triton/rope.py` — it is already
+differentiable, so it needs no wrapper work — and `adaln.py` **with** an autograd
+wrapper (its backward is `docs/todo.md` item 3). Expected: roughly 1.5–2× on the
+norm/rope portion of the forward, and 14× on the rope forward+backward
+(0.62 vs 8.88 ms per tensor here), bit-exact forward, and a template for the FFN
+fusion later. Everything needed to do it — the kernels, the
 self-test gate, the escape hatch, and the verification harness pattern in
 `debug/verify_*.py` — is in this repo.
 

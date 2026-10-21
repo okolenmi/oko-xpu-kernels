@@ -37,7 +37,10 @@ import torch
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ACCELERATORS", "Gate", "bit_equal_count", "probe_device"]
+__all__ = ["ACCELERATORS", "Gate", "bit_equal_count", "probe_device",
+           "relative_error"]
+
+_UNSET = object()
 
 # Devices these kernels are willing to run on.  The Triton kernels are not
 # XPU-specific code -- they are schedule changes over the same arithmetic --
@@ -95,6 +98,24 @@ def bit_equal_count(got: torch.Tensor, want: torch.Tensor) -> tuple[int, int]:
     return int((a != b).sum()), int(a.numel())
 
 
+def relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
+    """L2 relative error ``||got - want|| / ||want||``, in float64.
+
+    The criterion for a reference that is the same arithmetic with a different
+    reduction order (a torch implementation of a Triton kernel, or
+    ``torch.autograd`` of the eager chain): bitwise equality is not attainable,
+    so the gate needs a budget.  It is deliberately *relative to the whole
+    tensor*, not per element: a per-element tolerance has to be loose enough for
+    the values near zero, which makes it blind to a systematic error elsewhere.
+    """
+    if got.shape != want.shape:
+        raise ValueError(f"gate: shape {tuple(got.shape)} vs {tuple(want.shape)}")
+    a, b = got.double(), want.double()
+    norm = float(b.norm())
+    diff = float((a - b).norm())
+    return diff / norm if norm > 0 else diff
+
+
 class Gate:
     """One fused kernel's permission slip.
 
@@ -108,6 +129,15 @@ class Gate:
     which is what the kernel was tuned against.  Outside that environment the
     caller supplies one with :meth:`set_reference`; without any reference the
     gate stays closed and :meth:`describe` says so.
+
+    The gate is bit-exact by default.  When the reference is the same arithmetic
+    with a *different reduction order* -- a torch implementation of a Triton
+    kernel, or ``torch.autograd`` of the eager chain for a backward -- pass
+    ``rel=<budget>`` (to the constructor or to :meth:`set_reference`) and the gate
+    compares the L2 relative error instead.  That is a transcription check, not a
+    proof: the formula itself is pinned in float64 by the tests, and the budget
+    must be small enough that a wrong formula (which is off by ~1e-1, not 1e-3)
+    cannot hide inside it.
     """
 
     def __init__(
@@ -119,11 +149,13 @@ class Gate:
         env: str | None = None,
         legacy_env: str | None = None,
         num_warps: int | None = None,
+        rel: float | None = None,
     ):
         self.name = name
         self.probe = probe
         self.default_reference = default_reference
         self.num_warps = num_warps
+        self.rel = rel
         self.reference: Callable | None = None
         self._ok: bool | None = None
         self._why: str | None = None
@@ -135,13 +167,20 @@ class Gate:
 
     # -- reference ---------------------------------------------------------
 
-    def set_reference(self, fn: Callable | None) -> None:
+    def set_reference(self, fn: Callable | None, rel: float | None = _UNSET) -> None:
         """Inject the implementation this kernel must match, and re-arm the gate.
 
         The reference must be what the caller falls back to, with the same
-        signature as the fused kernel -- otherwise a pass says nothing.
+        signature as the fused kernel -- otherwise a pass says nothing.  Pass
+        ``rel`` when the reference computes the same arithmetic with a different
+        reduction order (a torch implementation, ``torch.autograd`` of the eager
+        chain): bitwise equality is then not attainable and the gate compares
+        with that relative budget instead.  Leaving it out keeps the gate
+        bit-exact, which is the default and the stronger claim.
         """
         self.reference, self._ok, self._why = fn, None, None
+        if rel is not _UNSET:
+            self.rel = rel
 
     # -- verdict -----------------------------------------------------------
 
@@ -162,24 +201,41 @@ class Gate:
             self._why = "unverified: no reference implementation (call set_reference)"
             log.warning("%s: %s", self.name, self._why)
             return False
+        # The comparison lives inside the same guard as the probe: a probe that
+        # returns the wrong shape or dtype has not run, and that is a failure,
+        # not an exception the caller has to know how to handle.
         try:
             pairs = self.probe(ref)
+            bad = total = 0
+            worst = 0.0
+            for got, want in pairs.values():
+                if self.rel is None:
+                    differing, n = bit_equal_count(got, want)
+                    bad += differing
+                    total += n
+                else:
+                    worst = max(worst, relative_error(got, want))
+                    total += got.numel()
         except Exception as exc:  # noqa: BLE001 - a broken probe is not a pass
             self._why = f"probe failed: {exc}"
             log.warning("%s: self-test failed (%s)", self.name, exc)
             return False
-        bad = total = 0
-        for got, want in pairs.values():
-            differing, n = bit_equal_count(got, want)
-            bad += differing
-            total += n
         if bad:
             self._why = f"mismatch: {bad}/{total} values differ"
             log.warning("%s: self-test found %d differing values, falling back",
                         self.name, bad)
             return False
+        if self.rel is not None and worst > self.rel:
+            self._why = (f"mismatch: worst relative error {worst:.2e} "
+                         f"> tolerance {self.rel:g}")
+            log.warning("%s: %s, falling back", self.name, self._why)
+            return False
         self._ok = True
-        self._why = f"verified against the reference ({total} values)"
+        if self.rel is None:
+            self._why = f"verified against the reference ({total} values)"
+        else:
+            self._why = (f"verified within {self.rel:g} "
+                         f"(worst relative error {worst:.1e}, {total} values)")
         log.info("%s: %s", self.name, self._why)
         return True
 

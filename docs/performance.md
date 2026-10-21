@@ -117,6 +117,69 @@ buffers, so **0.27 ms is the honest number**.
 
 ---
 
+## rope and adaLN: the Triton kernels
+
+Upstream's kernel is one program per (batch, head, seq): it loads the head row to
+compute the sum of squares, loads it again to rotate, and re-loads the fp32
+`freqs_cis` table once per head. At S=3973, H=24, D=128 that is 95 352 programs
+per tensor, each touching 256 B of a 6 KB-strided row.
+
+This package's version keeps the arithmetic identical and changes the schedule:
+one program per (batch, seq), heads looped inside. Measured with
+`debug/probe_rope_variants.py` and `debug/probe_adaln_variants.py`, bit-exact
+against the shipped kernels (0/12.2M and 0/12.2M values differ):
+
+| kernel | upstream | fused | ratio |
+|---|---|---|---|
+| rope (q + k) | 0.587 ms | 0.251 ms | 2.34× |
+| adaLN (per call) | 0.206 ms | 0.132 ms | 1.56× |
+
+In the model these are 44 ms and 16 ms per forward (42 blocks), from a marginal
+step budget of ~1094 ms.
+
+## rope backward (the differentiable wrapper)
+
+`debug/probe_rope_backward.py`, one tensor of the production shape (S=3973,
+H=24, D=128, bf16 = 24.4 MB), device-time medians, interleaved:
+
+| | time | traffic | effective |
+|---|---|---|---|
+| eager chain forward | 3.4-3.6 ms | | |
+| fused forward | 0.25-0.44 ms | 73 MB | 170-290 GB/s |
+| fused backward | 0.22-0.34 ms | 73 MB | 215-340 GB/s |
+| eager forward + backward | 8.9-9.3 ms | | |
+| fused forward + backward | 0.62-0.64 ms | | **14.3-14.6×** |
+
+Ranges, not single numbers: these were taken with the desktop in use, and the
+absolute times move by ~1.7x between runs on this card (the ratio is the stable
+quantity — that is the whole reason the repo measures things as pairs). The
+bottom of each range is an idle desktop.
+
+The first version of the backward was two kernels and a scratch buffer (a
+per-row `dot` pass, then a write pass): 1.13 ms. Both passes are unnecessary —
+`dot` is per *head row*, and one program already holds all the heads of one
+(batch, seq), so the whole backward fits in one program with nothing spilled.
+The 2-D head tile (instead of a loop over 24 heads) and the single pass brought
+it to ~0.22 ms, which is at the bandwidth floor for this card: ~340 GB/s for a
+read-read-write stream of this size, the same rate the forward reaches at 290
+GB/s with its extra `pe` loads. There is nothing left to win in this kernel.
+
+**Accuracy.** Against a float64 evaluation of the same gradient (same probe):
+
+| | relative L2 error |
+|---|---|
+| `torch.autograd` of the bf16 eager chain | 2.34e-3 |
+| fused backward (bf16 output) | 1.66e-3 |
+
+The fused gradient is *closer* to the truth, because PyTorch rounds the gradient
+to bf16 at the forward's `.to(bfloat16)` boundary and the fused kernel keeps
+fp32 throughout. The two differ from each other by 2.8e-3, which is why the
+device gate probes the arithmetic in fp32 (worst relative error 7e-8) and the
+formula is pinned separately by `tests/test_rope_backward.py` in float64 against
+`torch.autograd.gradcheck`.
+
+---
+
 ## rotate + quantize: where the time is
 
 `debug/native/probe_rotate_ablation.cpp`. Each mode removes exactly one piece.

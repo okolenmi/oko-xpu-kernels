@@ -158,13 +158,40 @@ package does not have:
 | `convrot_int8_acc` | the GEMM without an epilogue |
 | `dequant_epilogue_slice` | bf16 dequant of a column slice of a wider accumulator (the v third of fused qkv) |
 
-- [ ] **move those four into `xpu_kernels.int8`**, plus the timing/stat
-      scaffolding (`STATS`, `timing_stats`, `reset_caches`) if it is wanted
-      outside ComfyUI. Only then can `comfy/xpu_int8.py` become a shim. They are
-      the reusable API — a trainer swapping in an INT8 linear wants
-      `convrot_int8_linear`'s signature, not `linear` plus five decisions. This
-      is a real refactor, not a re-export: the C ABI is already shared, so it is
-      only wrapper code that is duplicated today.
+- [ ] **move those four into `xpu_kernels.int8`**, then `comfy/xpu_int8.py`
+      becomes a shim like the other two. Sized before starting, because it is not
+      a re-export:
+
+      | entry point | size | what it actually is |
+      |---|---|---|
+      | `dequant_epilogue_slice` | 24 lines | **already done**: it is `dequant_slice` (same C kernel, same strided walk). Only the failure convention differs -- it returns None, the package raises |
+      | `convrot_int8_acc` | 22 lines | `linear_acc` that takes the raw weight + scale and hands back `(acc, x_scale, w_scale)`. Portable as is |
+      | `convrot_int8_linear` | 131 lines | the primitives plus `_check` validation, the `residual + residual_scale * out` epilogue, `input_act` (gelu_tanh / swiglu / situ), `return_acc`, a `_kernels()` capability probe (`use_stream`, `q_act_stream`), `_SCALE_CACHE`/`_scale_ptr` memoisation, and `XPU_INT8_TIMING` stats |
+      | `convrot_ffn_situ` | 111 lines | up-projection accumulator -> fused situ + rotate + quantize -> down-projection accumulator, i.e. the whole FFN in two GEMMs |
+
+      Two of the four are glue. The other two raise **API questions that a
+      library has to answer differently from a ComfyUI module**, and they are
+      the reason this is not just a move:
+
+      * `None` on unsupported vs raise. `None` suits ComfyUI (the caller falls
+        back per layer). For a library, either is defensible, but it has to be
+        documented once and consistently -- a caller cannot tell "your card
+        cannot do this" from "you passed the wrong dtype" if both are `None`.
+      * `_SCALE_CACHE` memoises a scale-pointer conversion keyed by prompt
+        state. A library should not cache across calls without an explicit
+        handle; the package's `_fp32` already avoids the allocation when the
+        scale is already fp32 and contiguous, which may remove the need.
+      * `XPU_INT8_TIMING`/`STATS` are measurement scaffolding. Keep them out of
+        the library and let the probes measure from outside, or the library
+        grows a debug mode nobody asked for.
+      * naming: `convrot_*` says the weight layout, `int8_*` says the numeric
+        format, and the package currently uses neither for these (`linear`,
+        `linear_acc`). Pick one before someone imports it.
+
+      Value is *reusability*, not speed: the C ABI is already shared, so only
+      wrapper code is duplicated today. The training project would use
+      `convrot_ffn_situ` and `convrot_int8_linear` long before it writes those
+      compositions itself, which is the argument for doing it.
 
 ## 5. Packaging and CI
 

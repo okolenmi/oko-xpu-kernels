@@ -9,6 +9,16 @@ so the changes wait here until they are worth a number.
 
 ### Added
 
+* **A fused row-quantizer** (`xpu_kernels.triton.quantize`): the per-row int8
+  quantizer of the gradient path, as a Triton kernel. 4.17 ms -> 0.27 ms at
+  3974x8192, and 9 kernel launches become 1 -- which is what moved the
+  quantized-gradient backward from 3.4x the bf16 path to 1.33x, while keeping
+  the weight in int8 (1 byte per parameter instead of 3).
+* **The INT8 forward and both backward variants are capture-safe**, verified on
+  the card (`debug/verify_int8_capture.py`): captured, replayed on new data,
+  bit-identically to eager. A graph that did not contain the C kernels would
+  have replayed the *first* input's answer -- the script checks for that
+  explicitly.
 * **Capture readiness** (`xpu_kernels.capture`): `prepare_for_capture(model,
   need=...)` materializes each `Int8Linear`'s dense weight and latches the
   fused kernels' verdicts *outside* a device-graph capture;
@@ -43,6 +53,17 @@ so the changes wait here until they are worth a number.
   `comfy_kitchen`, so in an environment without it (CI, and the training
   project) the gate is closed and the fused kernels refuse to run until a
   reference is injected -- `xpu_kernels.triton.set_reference("rope", yours)`.
+* **The row-quantizer is the one kernel that is not bit-exact**, and the
+  reason is hardware, not sloppiness: on this backend torch's tensor÷tensor
+  division is correctly rounded but its tensor÷scalar division is a
+  reciprocal multiply, the two disagree on 13 % of values, and Triton's
+  correctly rounded division costs 18x more than the fast one -- so a
+  bit-exact fused quantizer would be *slower* than the torch chain it
+  replaces. The kernel moves 2-3e-4 of the quantized values by one unit
+  (9.1e-4 relative on the gradient, fifteen times below the int8 path's own
+  1.35 % error); the row scale is exact, and the gate compares with a
+  relative budget while the formula is pinned in float64 by the tests.
+  `XPU_KERNELS_NO_QUANTIZE=1` switches it off.
 
 ### Packaging
 

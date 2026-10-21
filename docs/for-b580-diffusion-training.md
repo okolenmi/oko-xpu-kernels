@@ -143,10 +143,24 @@ those numbers trustworthy, and it transfers as-is:
   `dequant_weight(w8, w_scale)` once, then `linear_dx(dy, w)` (or
   `Int8Linear.dx(dy)`). It is exact against autograd of the same GEMM and 0.9 %
   from the unquantized weight, which is the INT8 weight, not the backward. It
-  is also **capturable**: `debug/verify_capture_guards.py` captures
-  `Int8Linear.dx` and replays it bit-identically to eager. What is left is
-  `dW` (full fine-tuning only) and the faster int8-GEMM variant that keeps the
-  weight quantized; `docs/todo.md` has both.
+  is also **capturable**: `debug/verify_int8_capture.py` captures the INT8
+  forward and both backward variants and replays them bit-identically to eager.
+
+  **The memory arithmetic, because it decides whether an INT8 base fits at
+  all.** The weight-only backward needs the weight in bf16, so an INT8 base
+  costs 1 + 2 = **3 bytes per parameter** (3.7 GB + 7.4 GB for a 3.7 B model) —
+  more than a bf16 base (2 bytes) and, on a 12.2 GB card, more than fits.
+  `linear_dx_int8` keeps the weight in int8, so the base costs **1 byte per
+  parameter** (3.7 GB). It was 3.4x slower than the bf16 path; with the
+  quantizer now fused (`xpu_kernels.triton.quantize`: 4.17 ms -> 0.27 ms, 9
+  launches -> 1) it is **1.33x** — 2.75 ms against 2.08 ms at M=4096, N=8192 —
+  and its accuracy is 1.35 % relative against the unquantized gradient (the
+  bf16 path: 0.93 %). Still not the default: it needs your loss-curve A/B
+  (same seed, same data order) before it becomes one, and the *quantizer* is
+  the one kernel in the package that is not bit-exact (9.1e-4 relative on the
+  gradient, fifteen times below the path's own error; `docs/performance.md`).
+
+  What is still missing: `dW` (full fine-tuning only).
 
   **The one line to put in your init**, because a captured step that silently
   fell back to the eager chain is slower than an eager step and looks like a

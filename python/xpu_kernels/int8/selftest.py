@@ -23,6 +23,8 @@ from .ops import (
     linear_dx,
     prepare_weight,
     quantize_act,
+    quantize_row,
+    quantize_row_torch,
 )
 
 def selftest(verbose: bool = True) -> bool:
@@ -92,10 +94,22 @@ def selftest(verbose: bool = True) -> bool:
     dx_q = linear_dx_int8(dy, w8, ws)
     dx_q_rel = ((dx_q.float() - grad.float()).norm() / grad.float().norm()).item()
 
+    # the fused row-quantizer: the same numbers as the chain to within a unit,
+    # and the same scale exactly.  It is the difference between the int8
+    # backward costing 3.4x the bf16 one and costing about the same, which is
+    # what makes the "keep the weight in int8" option affordable.
+    q_fused, s_fused = quantize_row(dy)
+    q_chain, s_chain = quantize_row_torch(dy)
+    quant_diff = int((q_fused.view(torch.int16) != q_chain.view(torch.int16)).sum())
+    quant_rel = float((q_fused.float() - q_chain.float()).norm()
+                       / q_chain.float().norm())
+    scale_same = bool(s_fused.view(torch.int32).equal(s_chain.view(torch.int32)))
+
     ok = (same and slice_same and rel < 0.02 and q2.dtype == torch.int8
           and code_diff <= 1 and scale_rel < 0.05
           and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03
-          and dx_q_rel < 0.04)
+          and dx_q_rel < 0.04
+          and quant_rel < 2e-3 and scale_same)
     if verbose:
         print(f"device            : {device_name()}")
         print(f"INT8 vs bf16      : relative error {rel:.4f} (expect < 0.02)")
@@ -107,5 +121,7 @@ def selftest(verbose: bool = True) -> bool:
         print(f"dequant_weight    : rel {w_rel:.4f} (the INT8 weight itself)")
         print(f"backward dx, INT8 : rel {dx_int8_rel:.4f}")
         print(f"backward dx, int8 GEMM (weight stays quantized): rel {dx_q_rel:.4f}")
+        print(f"fused quantizer vs chain: {quant_diff} of {q_fused.numel()} values "
+              f"differ, rel {quant_rel:.2e}, scales exact: {scale_same}")
         print("PASS" if ok else "FAIL")
     return ok

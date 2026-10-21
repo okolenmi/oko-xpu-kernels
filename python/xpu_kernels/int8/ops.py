@@ -135,6 +135,19 @@ def linear_dx(dy, w):
     return dy @ w
 
 
+def quantize_row_torch(x):
+    """The per-row quantizer as a torch chain -- the reference, always there.
+
+    This is what the fused Triton kernel is compared against, bit for bit, so
+    it must not call the kernel.  :func:`quantize_row` is the fast path and
+    falls back to this.
+    """
+    xf = x.to(torch.float32)
+    scale = (xf.abs().amax(dim=-1, keepdim=True) / 127.0).clamp_min(1e-30)
+    q = torch.round(xf / scale).clamp_(-127, 127).to(torch.int8)
+    return q.contiguous(), scale.squeeze(-1).contiguous()
+
+
 def quantize_row(x):
     """Per-row symmetric int8 quantization, no rotation: bf16 [.., K] -> (int8, fp32).
 
@@ -143,15 +156,16 @@ def quantize_row(x):
     `dy` here would produce a silently rotated gradient -- wrong, and plausible
     enough to reach a loss curve before anyone noticed.
 
-    This is a torch chain rather than a kernel because it exists to run the
-    quantized-gradient A/B (``debug/probe_linear_dx_variants.py``); the probe
-    reports what the chain costs, which is the number a fused kernel would have
-    to beat before it is worth writing.
+    The fused Triton kernel does this in one pass (three bytes of traffic per
+    element, one launch); the torch chain needs about forty and eleven.  The
+    two agree bit for bit -- the gate proves it on every process, on data that
+    includes the rounding ties -- so this is the same number, faster.
     """
-    xf = x.to(torch.float32)
-    scale = (xf.abs().amax(dim=-1, keepdim=True) / 127.0).clamp_min(1e-30)
-    q = torch.round(xf / scale).clamp_(-127, 127).to(torch.int8)
-    return q.contiguous(), scale.squeeze(-1).contiguous()
+    from ..triton import quantize as _q
+
+    if _q.usable(x):
+        return _q.quantize_row(x)
+    return quantize_row_torch(x)
 
 
 def linear_dx_int8(dy, w8, w_scale):

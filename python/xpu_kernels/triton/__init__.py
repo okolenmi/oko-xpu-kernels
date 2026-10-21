@@ -29,12 +29,13 @@ unverified kernel -- and the backward falls back to the torch gradient, which
 
 from __future__ import annotations
 
-from . import adaln, rope
+from . import adaln, quantize, rope
 from ._gate import Gate
 
-__all__ = ["Gate", "adaln", "rope", "gates", "set_reference", "status"]
+__all__ = ["Gate", "adaln", "gates", "quantize", "rope", "set_reference",
+           "status"]
 
-_MODULES = (rope, adaln)
+_MODULES = (rope, adaln, quantize)
 
 
 def gates():
@@ -48,12 +49,12 @@ def gates():
 def set_reference(module, fn=None):
     """Set (or clear) the reference implementation for one kernel module.
 
-    ``module`` is ``rope``, ``adaln``, or their name as a string; ``fn`` is the
-    implementation that module falls back to, so the gate compares like with
-    like.  Without a reference the kernels stay inactive.
+    ``module`` is ``rope``, ``adaln``, ``quantize``, or their name as a string;
+    ``fn`` is the implementation that module falls back to, so the gate compares
+    like with like.  Without a reference the kernels stay inactive.
     """
     if isinstance(module, str):
-        module = {"rope": rope, "adaln": adaln}[module]
+        module = {"rope": rope, "adaln": adaln, "quantize": quantize}[module]
     module.set_reference(fn)
 
 

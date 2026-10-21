@@ -57,6 +57,10 @@ _BITS = {
     torch.int32: torch.int32,
     torch.float64: torch.int64,
     torch.int64: torch.int64,
+    # an integer viewed as itself: the comparison is exact, and an int8
+    # quantizer's output is worth comparing bit for bit
+    torch.int8: torch.int8,
+    torch.uint8: torch.uint8,
 }
 
 
@@ -277,7 +281,7 @@ class Gate:
             f"{self.name}: the fused kernel is not verified on this machine "
             f"({why}). Use the fallback, or give the gate something to compare "
             f"against: xpu_kernels.triton.set_reference(module, your_fallback) "
-            f"-- the modules are 'rope' and 'adaln', and "
+            f"-- the modules are 'rope', 'adaln' and 'quantize', and "
             f"xpu_kernels.triton.status() says which kernel is closed and why.")
 
     def describe(self) -> str:

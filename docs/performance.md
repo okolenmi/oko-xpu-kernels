@@ -307,24 +307,63 @@ bf16 GEMM, as it should. But the path as a whole does not:
 
 | `debug/probe_linear_dx_variants.py`, M=4096, N=8192, K=3072, interleaved | time | rel vs unquantized | cosine |
 |---|---|---|---|
-| bf16 dequant (`linear_dx`) | **1.92 ms** | 0.97 % | 0.999953 |
-| int8 GEMM (`linear_dx_int8`) | 6.94 ms | 1.37 % | 0.999906 |
-| — quantize `dy` (torch chain, 4 ops) | 4.57 ms | | |
-| — `_int_mm` | 1.04 ms | | |
+| bf16 dequant (`linear_dx`) | **2.08 ms** | 0.93 % | 0.999957 |
+| int8 GEMM (`linear_dx_int8`) | 2.75 ms | 1.35 % | 0.999910 |
+| — quantize `dy` (fused Triton kernel) | 0.27 ms | | |
+| — `_int_mm` | 1.05 ms | | |
 | — dequant epilogue | 0.26 ms | | |
-| — final rotation | 0.54 ms | | |
+| — final rotation | 0.55 ms | | |
 
 The GEMM is 1.85x faster (not 3-4x: at M=4096 this GEMM is bandwidth-bound on the
-weight, the same story as the headline INT8-vs-BF16 result). The quantizer is a
-torch chain, so it costs 4.5 ms -- but even a perfectly fused one (a read of bf16
-and a write of int8, ~0.45 ms) lands the path at ~2.1 ms against 1.92 ms. The
-dequant epilogue and the final rotation eat the GEMM's win.
+weight, the same story as the headline INT8-vs-BF16 result). The quantizer used
+to be a torch chain and cost 4.5 ms; it is now a fused Triton kernel at 0.27 ms
+(**16x faster, and 9 kernel launches become 1**), which is what moved the path
+from 6.63 ms -- 3.4x the bf16 path -- to 2.75 ms, or 1.33x.
 
 So the honest framing: **keep the weight int8 for the 2x memory saving, not for
-speed**, and know that it costs ~10 % more time and ~40 % more gradient error
-(0.0137 vs 0.0097 relative; both cosines are 0.9999+). The only way this becomes
+speed**, and know that it costs ~30 % more time and ~45 % more gradient error
+(0.0135 vs 0.0093 relative; both cosines are 0.9999+). The only way this becomes
 a speed win is to not rotate back -- i.e. keep the residual stream in the rotated
 basis, which is a whole-model decision, not a kernel one.
+
+### Why the fused quantizer is not bit-exact, and what it costs to be
+
+The fused quantizer (`xpu_kernels.triton.quantize`) is the one kernel in this
+package that is *not* bit-exact against its reference, and the reason is worth
+recording because it is a property of the hardware, not of the kernel.
+
+The reference is a torch chain that divides `x` by the row scale in fp32. On
+this backend, torch's two division forms are **not** the same function:
+
+| form | correctly rounded? | measured |
+|---|---|---|
+| `x / s` (tensor ÷ tensor) | yes | matches an fp64 division 1 048 576/1 048 576 |
+| `x / s` (tensor ÷ python scalar) | no -- a reciprocal multiply | matches an fp64 division 907 674/1 048 576 |
+
+and Triton's own options are different again: `libdevice.div_rn` is correctly
+rounded but costs **6.3 ms** for a 3974x8192 tensor (a software division, 15
+GB/s), against 0.35 ms for the fast form. So a *bit-exact* fused quantizer
+would be **slower than the torch chain it replaces** (6.3 ms vs 4.6 ms), and
+the fusion would buy nothing.
+
+The fast form is 16x faster and moves 2-3e-4 of the quantized values by one
+unit: **9.1e-4 relative on the gradient**, against the int8 path's own 1.35 %
+error -- fifteen times smaller. The row *scale* is exact (it is a division by a
+constant, which the fast path does correctly), so the quantization's accuracy
+is unchanged: 0.0135 relative against the unquantized gradient, before and
+after.
+
+The gate therefore compares with a relative budget (2e-3, the measured
+deviation is 3.3e-4) rather than bitwise -- the same mechanism the backward
+kernels use -- and the formula itself is pinned in float64 by
+`tests/test_quantize.py`. A wrong formula (a missing clamp, the wrong scale, a
+rotation that should not be there) is off by ~1e-1 and cannot hide inside that
+budget. `XPU_KERNELS_NO_QUANTIZE=1` switches the kernel off, and the chain
+returns.
+
+The gate caught the whole story by itself: it first reported "73 of 721 984
+values differ" on the very first run of the kernel, which is what led to the
+division measurements above.
 
 ---
 

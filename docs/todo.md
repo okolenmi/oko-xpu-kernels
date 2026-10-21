@@ -54,22 +54,32 @@ the loss curve, not the per-element relative error.
 
 - [x] `dequant_weight` + `linear_dx`, verified and measured (above).
 - [x] the int8-GEMM variant, measured: **a memory option, not a speed one.**
-      `debug/probe_linear_dx_variants.py`, M=4096, N=8192, K=3072: 6.94 ms vs
-      1.92 ms for the bf16 path. The GEMM is 1.85x faster; the torch quantizer
-      costs 4.57 ms on top, and even a perfectly fused one (~0.45 ms) leaves the
-      path at ~2.1 ms because the dequant epilogue and the final rotation eat the
-      rest. Accuracy: 1.37 % vs 0.97 % relative, cosine 0.999906 vs 0.999953.
-      Keep it for the 2x weight-memory saving only.
+      `debug/probe_linear_dx_variants.py`, M=4096, N=8192, K=3072: the path
+      went from 6.63 ms (3.4x the bf16 path) to **2.75 ms (1.33x)** once the
+      quantizer became a fused Triton kernel (`xpu_kernels.triton.quantize`:
+      4.17 ms -> 0.27 ms, and 9 kernel launches become 1). The accuracy is
+      unchanged: 1.35 % vs 0.93 % relative, cosine 0.999910 vs 0.999957.
+      Keep it for the 2x weight-memory saving.
       Two things learned the hard way, both pinned by the selftest now:
       `quantize()` must not be reused (it rotates -- the rotation is already in
       the weight, so reusing it would silently rotate the gradient), and
       `dequant`'s `w_scale` is indexed by the *accumulator's columns* (K here,
       not N); passing the longer of the two only works because it reads the
       buffer's first K entries.
-- [ ] if the memory saving is wanted, do not bother fusing the quantizer for
-      speed; only a design that avoids rotating `dx` back can make int8 faster
-      (i.e. keep the residual stream in the rotated basis -- a whole-model
-      decision).
+- [x] the quantizer is fused now, and the finding is worth keeping: **a
+      bit-exact fused quantizer is not attainable at a useful speed on this
+      card.** The reference chain divides in fp32, and on this backend torch's
+      tensor÷tensor division is correctly rounded while its tensor÷scalar
+      division is a reciprocal multiply -- the two disagree on 13 % of values.
+      Triton's correctly rounded division (`libdevice.div_rn`) is 18x slower
+      (6.3 ms vs 0.35 ms for 3974x8192), i.e. slower than the chain it would
+      replace. So the kernel uses the fast division, which moves 2-3e-4 of the
+      quantized values by one unit -- **9.1e-4 relative on the gradient**,
+      against the path's own 1.35 % error -- and the gate compares with a
+      relative budget (2e-3) while the formula is pinned in float64 by
+      `tests/test_quantize.py`. The row *scale* is exact. The gate found the
+      whole thing on the kernel's first run ("73 of 721 984 values differ").
+      `docs/performance.md` has the measurements.
 - [ ] `dW` (only if full fine-tuning is on the table): `dy^T @ x` with the
       *activation* scale on the other index; same analysis, opposite side.
 

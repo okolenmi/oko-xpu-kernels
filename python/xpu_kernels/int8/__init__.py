@@ -79,6 +79,7 @@ from .ops import (
     quantize,
     quantize_act,
     quantize_row,
+    quantize_row_torch,
     rotate,
     unsupported_reason,
 )
@@ -88,6 +89,7 @@ __all__ = [
     "Int8Linear", "available", "dequant", "dequant_act_quantize",
     "dequant_slice", "dequant_weight", "device_name", "expand_scale",
     "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
-    "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate",
+    "prepare_weight", "quantize", "quantize_act", "quantize_row",
+    "quantize_row_torch", "rotate",
     "selftest", "unsupported_reason",
 ]

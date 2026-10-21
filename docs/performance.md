@@ -180,6 +180,41 @@ formula is pinned separately by `tests/test_rope_backward.py` in float64 against
 
 ---
 
+## Graph capture: verified, and it is a host-time win
+
+`debug/verify_graph_capture.py` captures the fused rope forward **and** its
+backward for q and k in one `torch.xpu.XPUGraph`, replays it on new data, and
+compares against the eager path. Result: all four tensors (q/k outputs, q/k
+gradients) are bit-identical on replay.
+
+Two things this settles:
+
+- **No workspace plumbing is needed for capture.** Allocations made inside a
+  capture are carved from the graph's private pool and replayed at the same
+  addresses, so `torch.empty` inside the kernel launchers is not a problem. The
+  requirement is that nothing inside the captured region *waits on the device*
+  or moves data to the host -- and nothing does.
+- **The first call must be outside the capture.** The gate probes the kernel
+  against the reference on first use, which synchronises and reads values back.
+  `status()` (or one warmup iteration) must run before capture. That is now a
+  rule in `docs/adding-a-kernel.md`.
+
+Device time is unchanged by the graph (four kernels either way; at the
+production shape 1.15 ms eager vs 1.15 ms of graph work plus the static-input
+copies). The win is host time, which is what a launch-bound step pays:
+
+| at S=256, where the host is the limit | host per step |
+|---|---|
+| eager: autograd engine + the torch chain | 648-694 µs |
+| graph replay | 73-81 µs |
+
+**~9x less host time per rope stage** (the range is run-to-run variance, and the
+device time in those runs was 0.33-0.68 ms, so the measurement is not
+device-limited). For the 42-block model that is ~24 ms/step of host budget back,
+which matters because the trainer's step is ~22 300 launches at ~48 µs each.
+
+---
+
 ## INT8 backward: `dL/dx = dy @ W`
 
 There is no kernel here, and that is the finding. `linear_dx` is one bf16 GEMM,

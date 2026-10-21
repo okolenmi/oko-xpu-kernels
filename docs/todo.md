@@ -67,21 +67,33 @@ the loss curve, not the per-element relative error.
 The trainer needs the whole step capturable: no host sync, no fresh allocations
 during the step, no shapes that depend on values.
 
-What the Triton kernels need:
+**Verified for the rope stage** (`debug/verify_graph_capture.py`): forward and
+backward for q and k captured in one `torch.xpu.XPUGraph`, replayed on new data,
+bit-identical to eager in all four tensors. Host time per stage 648-694 us ->
+73-81 us (~9x).
 
-- [x] `rope._rows_bwd_kernel(..., out=)` allocates nothing when `out` is given.
-- [ ] thread a preallocated `dx` (and eventually `out`) through
-      `_RmsRope.apply`, so the autograd path allocates nothing either. An
-      `autograd.Function` can take a non-differentiable workspace tensor and
-      return `None` for its grad; the wrapper then keeps one buffer per shape.
-- [ ] make the *fallback* explicit: `reference.rms_rope_backward` allocates
-      ~10 tensors. If the gate is closed, the step cannot be captured — decide
-      before capture, and fail loudly rather than mid-capture.
-- [ ] audit for hidden syncs: no `.item()`, no `.cpu()`, no `.tolist()` in any
-      launcher (the Python gates do not sync, but they do compile on first use —
-      run `status()` before capture).
-- [ ] the same audit for the INT8 entry points: they enqueue on the caller's
-      stream and never read back today; keep it that way.
+What that changed in the plan:
+
+- **Workspace threading is not needed.** Allocations inside a capture come from
+  the graph's private pool and replay at the same addresses, so `torch.empty` in
+  a launcher is fine as long as nothing inside the region waits on the device.
+  `out=` remains useful for a *non-captured* step that wants stable addresses,
+  not for capture.
+- **The first call must be outside the capture**, because the gate probes on
+  first use (it syncs and reads values back). Warm up or call `status()` first.
+  Now a rule in `docs/adding-a-kernel.md`.
+
+Still open:
+
+- [ ] the same capture verification for `adaln` (forward; backward once item 3
+      lands) and for the INT8 `linear_dx` GEMM.
+- [ ] decide the fallback policy: `reference.rms_rope_backward` allocates ~10
+      tensors and is not what anyone wants inside a capture. The gate is latched
+      per process, so the practical answer is "check `status()` at startup, fail
+      loudly if a kernel you intend to capture is inactive" -- a one-line check
+      the trainer can put in its init.
+- [ ] a captured *whole step* is the trainer's integration work, not this
+      library's; the library's part is the per-kernel guarantee above.
 
 ## 3. Backward for `adaln.rms_adaln`
 

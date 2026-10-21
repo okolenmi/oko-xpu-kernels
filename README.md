@@ -230,7 +230,7 @@ C API and `docs/architecture.md` for the algorithm.
 | Triton `rms_norm + adaLN` | working, **1.56×**, bit-identical |
 | INT8 `dL/dx` (weight-only) | working, **exact** vs the same GEMM in autograd, 0.9 % from the unquantized weight (that is the INT8 weight); dequant is one-time |
 | INT8 `dW`, quantized-`dy` gradient | **not implemented** — design and the scale-layout argument in [`docs/todo.md`](docs/todo.md) |
-| Device-graph capture | kernels allocate/sync nothing given an `out=` buffer; the autograd path does not yet take one |
+| Device-graph capture | rope fwd+bwd captured in one `XPUGraph`, replay bit-identical, **host time 694 → 81 µs** per stage |
 
 ## Layout
 

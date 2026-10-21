@@ -78,6 +78,27 @@ A backward is a kernel like any other, with two extra rules:
   algebraic identity is involved, add a float64 gradcheck as well — it catches
   errors that a bit-exact match against a wrong formula would hide.
 
+## Device graphs
+
+A training step wants to be captured, so a kernel must not do any of these
+*inside* the captured region:
+
+* synchronise (`.item()`, `.cpu()`, `.tolist()`, an explicit `synchronize()`),
+* read a device value to decide control flow,
+* depend on a shape that comes from data.
+
+Allocating is fine: allocations made during a capture are carved from the graph's
+private pool and replayed at the same addresses (`torch.empty` in a launcher is
+not a problem — `debug/verify_graph_capture.py` captures the rope forward and
+backward and replays bit-identically).
+
+The one thing that must happen **before** capture is the first call, because the
+gate probes on first use: it runs the kernel against the reference, synchronises
+and reads values back. Run `status()` (or one warmup iteration) first. A capture
+that starts with an unprobed gate fails, and a gate that closes mid-capture
+cannot fall back — so a trainer that captures should assert
+`describe("name").startswith("active")` at startup rather than discover it later.
+
 ## What not to add
 
 * A fused attention or GEMM. On this card every SDPA backend is one oneDNN

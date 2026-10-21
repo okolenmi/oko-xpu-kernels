@@ -138,6 +138,27 @@ python -c 'import xpu_kernels; print(xpu_kernels.available(), xpu_kernels.device
 # then the PNG gate, which must still produce the recorded md5
 ```
 
+The gate can also be pointed at the published `.so` without installing
+anything, because the loader reads `XPU_KERNELS_LIB` first:
+
+```bash
+unzip -o -q xpu_kernels-0.2.0-py3-none-manylinux_2_35_x86_64.whl -d /tmp/pub
+XPU_KERNELS_LIB=/tmp/pub/xpu_kernels/int8/libxpuint8.so bash debug/server.sh --deterministic
+# check what was loaded:  grep libxpuint8 /proc/$(pgrep -f 'ComfyUI/[m]ain.py')/maps
+```
+
+**Done for 0.2.0.** The published `.so` is *not* byte-identical to the local
+build (md5 `b4427b80…` against `7867d110…`): the CI build was compiled on
+ubuntu-22.04 with GCC 12.3.0, the local one with the system's GCC 16.2.1. The
+requirements are the same -- glibc at most `GLIBC_2.32`, libstdc++ at most
+`GLIBCXX_3.4.21` -- and the PNG gate against the published `.so` produced
+`a2aacfda45409493a490b0402b61f850`, the same md5 as every earlier gate run.
+
+A note on PyPI's caches: the JSON API can answer for a few minutes with the
+file list from before an upload, so `pip download` may pick the sdist even
+though the wheel is there. `--no-cache-dir` (or a minute of waiting) shows the
+wheel.
+
 If the published wheel disagrees, the local build is the reference and the
 release is wrong -- rebuild locally and upload that file by hand with a
 project-scoped token (`twine upload dist/*.whl`); PyPI accepts another file

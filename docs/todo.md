@@ -245,8 +245,19 @@ Two notes for the next person:
       impossible; the toolchain moved to the tag (`v0.2.0-oneapi2025.3`) and the
       release notes. Checklist in `docs/publishing.md`; metadata gained PEP 639
       `license`/`license-files`, `[project.urls]` and classifiers, and
-      `twine check` passes on both artifacts. Remaining: create the `pypi`
-      environment in repo settings, push the workflow, tag `v0.2.0`.
+      `twine check` passes on both artifacts.
+      The wheel is built **in CI on a GitHub-hosted runner**, not on a
+      self-hosted one: the `.so` needs a DPC++ compiler, oneAPI 2025.3.2 is an
+      apt package, and no runner is registered (the job would have queued
+      forever). The compiler version is *pinned* by an apt preference and
+      asserted, because the `.so` links `libsvml`/`libirng`/`libimf` and a
+      consumer with a different oneAPI patch release may lack the symbols --
+      fail closed rather than publish something that cannot load. Rehearse with
+      `workflow_dispatch` (builds, publishes nothing), then tag.
+      Remaining: create the `pypi` environment in repo settings (optional --
+      GitHub creates it implicitly), push the workflow, tag `v0.2.0`, and
+      re-run the PNG gate against the *published* wheel, not only the local
+      build.
 - [ ] `xpu-kernels bench` -- one CLI over the probes in `debug/` (they all take
       their shape as a constant today). Low value until someone else needs to
       reproduce a number.

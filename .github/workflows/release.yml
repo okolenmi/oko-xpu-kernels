@@ -15,22 +15,37 @@ name: release
 #   environment pypi                 <- the `environment:` key below
 #
 # Two artifacts, one version:
-#   * sdist on ubuntu-latest      -- installs with no toolchain; kernels missing
-#   * wheel on the self-hosted     -- carries libxpuint8.so, needs oneAPI 2025.x
-#     "xpu" runner
+#   * sdist -- installs anywhere with no toolchain; the kernels are missing
+#   * wheel -- carries libxpuint8.so; needs a oneAPI 2025.x runtime to load
 #
 # The wheel is what makes `pip install xpu-kernels` actually compute, so it goes
 # to PyPI as well as to the GitHub Release. It is tagged linux_x86_64, so other
 # platforms simply fall back to the sdist. The version stays plain `0.2.0`
 # because PyPI must not accept local versions (PEP 440) -- the toolchain lives
 # in the tag and the release notes instead.
+#
+# The wheel is built here, on a GitHub-hosted runner, and not on a self-hosted
+# one: the .so needs a DPC++ compiler, and that compiler is a downloadable apt
+# package, so the alternative was a runner daemon sitting on the maintainer's
+# desktop (and a job that would otherwise queue forever -- there is no such
+# runner registered). The toolchain version is pinned to the one this
+# repository was verified with (2025.3.2), because the .so links libsvml and
+# friends: a consumer with a different oneAPI patch release may not have the
+# symbols. The pin is asserted below, so a toolchain that drifts fails the
+# release instead of publishing a .so that cannot load.
 
 on:
   push:
     tags: ["v*"]
+  # A rehearsal: builds both artifacts, publishes nothing. The publish jobs are
+  # gated on `github.ref_type == 'tag'`, so a manual run cannot upload.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  ONEAPI_VERSION: 2025.3.2-832
 
 jobs:
   sdist:
@@ -52,31 +67,91 @@ jobs:
           ./wheel.sh --sdist
           python -m twine check dist/*
 
+      # A tag that disagrees with pyproject.toml would publish one version and
+      # label it another. This runs before anything is uploaded.
+      - name: The tag is the version
+        if: github.ref_type == 'tag'
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag.startswith("v"):
+              tag = tag[1:]
+          assert tag == version, f"tag {tag} != pyproject version {version}"
+          print("version", version)
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-sdist
           path: dist/*
 
   wheel:
-    runs-on: [self-hosted, xpu]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The compiler is several GB installed; the runner ships a few GB of
+      # toolchains this project will never use.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Install the pinned oneAPI compiler
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          # apt would otherwise pick the newest 2025.3.x, and the .so links
+          # libsvml/libirng/libimf: a consumer with a different patch release may
+          # not have the symbols. This pin is the reason the release fails
+          # loudly rather than shipping a .so that cannot load.
+          printf 'Package: intel-oneapi-*\nPin: version 2025.3.2-*\nPin-Priority: 1001\n' \
+            | sudo tee /etc/apt/preferences.d/oneapi-pin
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            intel-oneapi-compiler-dpcpp-cpp=${{ env.ONEAPI_VERSION }} \
+            intel-oneapi-compiler-dpcpp-cpp-runtime=${{ env.ONEAPI_VERSION }}
+          # Find the compiler the way build.sh does, and refuse anything that is
+          # not the pinned patch release.
+          compiler=""
+          for c in /opt/intel/oneapi/compiler/*/bin/icpx; do
+            if "$c" --version 2>/dev/null | grep -q '2025\.3\.2'; then compiler="$c"; break; fi
+          done
+          test -n "$compiler" || { echo "no 2025.3.2 icpx after the install"; exit 1; }
+          "$compiler" --version
+          echo "SYCL_ROOT=$(dirname "$(dirname "$compiler")")" >> "$GITHUB_ENV"
 
       - name: Build the wheel
         env:
           PYTHON: python
         run: ./wheel.sh
 
-      # Same check as the test workflow: a wheel that cannot load its own .so
-      # is worse than no wheel at all.
-      - name: Install the wheel into a scratch prefix
+      # There is no GPU on this runner, so the library cannot be initialised
+      # here (xpuint8_init enumerates devices). What can be checked is that the
+      # payload is where the loader looks for it, that it links the SYCL
+      # runtime the consumer's torch provides, and that the package imports and
+      # reports "unavailable" instead of crashing.
+      - name: The wheel carries a .so that links libsycl.so.8
         run: |
+          set -euo pipefail
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install --no-deps --target "$RUNNER_TEMP/whl" dist/*.whl
+          so="$RUNNER_TEMP/whl/xpu_kernels/int8/libxpuint8.so"
+          test -f "$so" || { echo "the wheel does not carry the .so where the loader looks"; exit 1; }
+          readelf -d "$so" | grep -q 'libsycl\.so\.8' || { echo "the .so does not link libsycl.so.8"; exit 1; }
           cd "$RUNNER_TEMP"
           PYTHONPATH="$RUNNER_TEMP/whl" python - <<'PY'
           import xpu_kernels
-          assert xpu_kernels.available(), "the wheel does not load its own .so"
-          print(xpu_kernels.__file__, xpu_kernels.device_name())
+          print(xpu_kernels.__version__, "available:", xpu_kernels.available())
           PY
 
       - uses: actions/upload-artifact@v4
@@ -84,53 +159,77 @@ jobs:
           name: dist-wheel
           path: dist/*
 
-  publish:
-    needs: [sdist, wheel]
+  publish-sdist:
+    needs: [sdist]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write       # what trusted publishing exchanges for an upload
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
-          merge-multiple: true
+          name: dist-sdist
           path: dist
-
-      # A tag that disagrees with pyproject.toml would publish one version and
-      # label it another. Nothing after this point can be undone.
-      - name: The tag is the version
-        run: |
-          python - <<'PY'
-          import os, tomllib
-          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
-          tag = os.environ["GITHUB_REF_NAME"]
-          assert tag == f"v{version}", f"tag {tag} != pyproject version {version}"
-          print("publishing", version)
-          PY
 
       - name: Upload to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          # A re-run after a partial failure must not choke on the file that
+          # already went up.
+          skip-existing: true
+
+  publish-wheel:
+    needs: [sdist, wheel]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-wheel
+          path: dist
+
+      - name: Upload to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
 
   github-release:
-    needs: [publish]
+    needs: [publish-sdist]
+    if: github.ref_type == 'tag' && needs.publish-sdist.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
-          merge-multiple: true
-          path: dist
+          name: dist-sdist
+          path: dist/sdist
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true      # a failed wheel job must not lose the sdist
+        with:
+          name: dist-wheel
+          path: dist/wheel
 
       # The same bytes PyPI just took, attached to the tag, so a consumer can
       # pin one file by URL without an index in between.
       - name: Attach the artifacts to the tag
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+        run: |
+          set -euo pipefail
+          files=(dist/sdist/*)
+          if compgen -G "dist/wheel/*" > /dev/null; then
+            files+=(dist/wheel/*)
+          fi
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" --generate-notes
+          fi

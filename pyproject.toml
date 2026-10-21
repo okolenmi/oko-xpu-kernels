@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xpu-kernels"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fused kernels for Intel Arc (Xe2) XPU tensors: ConvRot INT8, fused rms_norm+rope/adaLN, and the instruments used to verify them"
 readme = "README.md"
 requires-python = ">=3.10"

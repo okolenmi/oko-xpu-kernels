@@ -203,11 +203,16 @@ So the library's INT8 path works on the 45 %, and **the convolutions — 22 %
 of the step, and 334.8 M of the UNet's parameters — are the largest piece it
 cannot reach** (item 4).
 
-### The host direction is finished; the recompute is what is left
+### The host direction: finished inside the capture, not outside it
 
-Once the capture is on, the host cost is gone (6 609 launches become one
-replay) and the step *is* the device time. The next lever is the
-checkpointing's recompute, which under the capture is a device cost:
+Once the capture is on, the host cost *of the captured region* is gone (6 609
+launches become one replay) and that region becomes the device time. The rest
+of a training step — the data, the conditioning, the optimizer's update, the
+residency accounting — is outside the capture and keeps its host cost, so
+"the capture removes the host cost" is only true of the region it captures.
+
+The next lever inside that region is the checkpointing's recompute, which
+under the capture is a device cost:
 
 | | eager step | **captured step** | host time | aten calls | peak |
 |---|---|---|---|---|---|

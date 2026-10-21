@@ -203,6 +203,25 @@ So the library's INT8 path works on the 45 %, and **the convolutions — 22 %
 of the step, and 334.8 M of the UNet's parameters — are the largest piece it
 cannot reach** (item 4).
 
+### The host direction is finished; the recompute is what is left
+
+Once the capture is on, the host cost is gone (6 609 launches become one
+replay) and the step *is* the device time. The next lever is the
+checkpointing's recompute, which under the capture is a device cost:
+
+| | eager step | **captured step** | host time | aten calls | peak |
+|---|---|---|---|---|---|
+| with the checkpointing (the trainer's default) | 366.9 ms | **190.0 ms** | 970 ms | 44 277 | 5.04 GB |
+| without it | 242.6 ms | **141.7 ms** | 684 ms | 27 239 | 6.19 GB |
+
+The checkpointing costs **a third of the captured step** and buys 1.15 GB of
+the peak at 512×512 batch 1. At 1024×1024 it is not a choice.
+
+The consequence for the trainer: the measured placement (930 vs 1010 ms) was
+measured *eagerly*, where the host dominates and a recompute costs mostly
+launches. Under the capture the same absolute saving is a bigger share, so
+**the placement should be re-measured with the capture on**.
+
 ## 6. What to measure next
 
 1. The int8 convolution epilogue, if item 4 is ever taken up: whether a

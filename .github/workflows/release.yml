@@ -132,15 +132,19 @@ jobs:
             | sudo tee /etc/apt/preferences.d/oneapi-pin
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            intel-oneapi-compiler-dpcpp-cpp=${{ env.ONEAPI_VERSION }} \
-            intel-oneapi-compiler-dpcpp-cpp-runtime=${{ env.ONEAPI_VERSION }}
+            intel-oneapi-compiler-dpcpp-cpp-2025.3=${{ env.ONEAPI_VERSION }} \
+            intel-oneapi-compiler-dpcpp-cpp-runtime-2025.3=${{ env.ONEAPI_VERSION }}
           # Find the compiler the way build.sh does, and refuse anything that is
           # not the pinned patch release.
           compiler=""
           for c in /opt/intel/oneapi/compiler/*/bin/icpx; do
             if "$c" --version 2>/dev/null | grep -q '2025\.3\.2'; then compiler="$c"; break; fi
           done
-          test -n "$compiler" || { echo "no 2025.3.2 icpx after the install"; exit 1; }
+          test -n "$compiler" || {
+            echo "no 2025.3.2 icpx after the install; what is there:"
+            for c in /opt/intel/oneapi/compiler/*/bin/icpx; do "$c" --version | head -1; done
+            exit 1
+          }
           "$compiler" --version
           echo "SYCL_ROOT=$(dirname "$(dirname "$compiler")")" >> "$GITHUB_ENV"
 

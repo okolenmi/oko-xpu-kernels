@@ -17,6 +17,7 @@ from .ops import (
     dequant_act_quantize,
     dequant_slice,
     dequant_weight,
+    linear_dx_int8,
     linear,
     linear_acc,
     linear_dx,
@@ -87,10 +88,14 @@ def selftest(verbose: bool = True) -> bool:
     w_rel = ((w_deq.float() - w.float()).norm() / w.float().norm()).item()
     dx_int8 = linear_dx(dy, w_deq)
     dx_int8_rel = ((dx_int8.float() - grad.float()).norm() / grad.float().norm()).item()
+    # the quantized-gradient variant: the weight stays int8, `dy` is quantized
+    dx_q = linear_dx_int8(dy, w8, ws)
+    dx_q_rel = ((dx_q.float() - grad.float()).norm() / grad.float().norm()).item()
 
     ok = (same and slice_same and rel < 0.02 and q2.dtype == torch.int8
           and code_diff <= 1 and scale_rel < 0.05
-          and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03)
+          and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03
+          and dx_q_rel < 0.04)
     if verbose:
         print(f"device            : {device_name()}")
         print(f"INT8 vs bf16      : relative error {rel:.4f} (expect < 0.02)")
@@ -101,5 +106,6 @@ def selftest(verbose: bool = True) -> bool:
         print(f"backward dx vs autograd: rel {dx_rel:.2e} (expect 0)")
         print(f"dequant_weight    : rel {w_rel:.4f} (the INT8 weight itself)")
         print(f"backward dx, INT8 : rel {dx_int8_rel:.4f}")
+        print(f"backward dx, int8 GEMM (weight stays quantized): rel {dx_q_rel:.4f}")
         print("PASS" if ok else "FAIL")
     return ok

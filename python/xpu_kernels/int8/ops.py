@@ -131,6 +131,52 @@ def linear_dx(dy, w):
     return dy @ w
 
 
+def quantize_row(x):
+    """Per-row symmetric int8 quantization, no rotation: bf16 [.., K] -> (int8, fp32).
+
+    The ConvRot quantizer (:func:`quantize`) must not be used for a gradient: it
+    rotates, and the rotation is already baked into the INT8 weight.  Rotating a
+    `dy` here would produce a silently rotated gradient -- wrong, and plausible
+    enough to reach a loss curve before anyone noticed.
+
+    This is a torch chain rather than a kernel because it exists to run the
+    quantized-gradient A/B (``debug/probe_linear_dx_variants.py``); the probe
+    reports what the chain costs, which is the number a fused kernel would have
+    to beat before it is worth writing.
+    """
+    xf = x.to(torch.float32)
+    scale = (xf.abs().amax(dim=-1, keepdim=True) / 127.0).clamp_min(1e-30)
+    q = torch.round(xf / scale).clamp_(-127, 127).to(torch.int8)
+    return q.contiguous(), scale.squeeze(-1).contiguous()
+
+
+def linear_dx_int8(dy, w8, w_scale):
+    """``dL/dx`` against the weight *still in int8* -- the quantized-gradient path.
+
+    Exact in the weight: since ``W[n, k] = W8[n, k] * s[n]`` and ``s[n]`` is the
+    contraction index of ``dx = dy @ W``, it is a *column* scale on ``dy``:
+
+        dx = dy @ diag(s) @ W8 = (dy * s) @ W8      (then undo the ConvRot rotation)
+
+    so the weight never leaves int8 (no dequant, half the memory of the bf16
+    copy) and the only new error is quantizing ``dy``.  That is a training
+    decision, not a kernel one: A/B it against :func:`linear_dx` on a loss curve
+    before making it a default (`docs/todo.md`).
+    """
+    d = dy.to(torch.bfloat16) * w_scale.to(torch.device(dy.device), torch.bfloat16)
+    d2 = d.reshape(-1, d.shape[-1])
+    q, a = quantize_row(d2)
+    # dy [M, N] @ W8 [N, K]: the weight enters as stored (no transpose -- that is
+    # the forward's convention, where x [M, K] meets w8 [N, K].t())
+    acc = torch._int_mm(q, w8)
+    # the epilogue's column scales are indexed by the accumulator's *columns*,
+    # which here are K, not N -- a longer buffer is read only in part, a shorter
+    # one reads past the end
+    dx = dequant(acc, a, torch.ones(acc.shape[1], device=acc.device,
+                                    dtype=torch.float32))
+    return rotate(dx).reshape(*dy.shape[:-1], w8.shape[1])
+
+
 def dequant(acc, x_scale, w_scale, bias=None):
     """bf16 dequant of an int32 [M, N] accumulator with per-row and per-column scales."""
     lib = _lib()

@@ -239,10 +239,35 @@ is in the forward — 1.27 % there for this synthetic matrix. The gradient error
 not an extra layer of noise on top of the forward's, it *is* the forward's.
 
 `prepare_weight` costs 3.0 ms for the same matrix, so quantizing a 3.7 B model is
-~0.4 s each way. That is a one-time startup cost, not a step cost; it is the
-argument for the int8-GEMM variant (weight stays int8, no dequant, 2x less
-memory) if someone needs the weight back in int8 — at the price of quantizing
-`dy`, which is the thing to A/B.
+~0.4 s each way. That is a one-time startup cost, not a step cost.
+
+### The quantized-`dy` variant: a memory option, not a speed one
+
+`linear_dx_int8` keeps the weight in int8 and quantizes `dy` instead, which is
+exact in the weight: `s[n]` is a row scale on `W`, hence a *column* scale on `dy`,
+so `dx = (dy * s) @ W8` and then the rotation is undone. `_int_mm` beats the
+bf16 GEMM, as it should. But the path as a whole does not:
+
+| `debug/probe_linear_dx_variants.py`, M=4096, N=8192, K=3072, interleaved | time | rel vs unquantized | cosine |
+|---|---|---|---|
+| bf16 dequant (`linear_dx`) | **1.92 ms** | 0.97 % | 0.999953 |
+| int8 GEMM (`linear_dx_int8`) | 6.94 ms | 1.37 % | 0.999906 |
+| — quantize `dy` (torch chain, 4 ops) | 4.57 ms | | |
+| — `_int_mm` | 1.04 ms | | |
+| — dequant epilogue | 0.26 ms | | |
+| — final rotation | 0.54 ms | | |
+
+The GEMM is 1.85x faster (not 3-4x: at M=4096 this GEMM is bandwidth-bound on the
+weight, the same story as the headline INT8-vs-BF16 result). The quantizer is a
+torch chain, so it costs 4.5 ms -- but even a perfectly fused one (a read of bf16
+and a write of int8, ~0.45 ms) lands the path at ~2.1 ms against 1.92 ms. The
+dequant epilogue and the final rotation eat the GEMM's win.
+
+So the honest framing: **keep the weight int8 for the 2x memory saving, not for
+speed**, and know that it costs ~10 % more time and ~40 % more gradient error
+(0.0137 vs 0.0097 relative; both cosines are 0.9999+). The only way this becomes
+a speed win is to not rotate back -- i.e. keep the residual stream in the rotated
+basis, which is a whole-model decision, not a kernel one.
 
 ---
 

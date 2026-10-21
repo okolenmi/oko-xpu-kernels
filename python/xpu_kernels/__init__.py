@@ -34,10 +34,12 @@ from .int8 import (
     linear,
     linear_acc,
     linear_dx,
+    linear_dx_int8,
     load,
     prepare_weight,
     quantize,
     quantize_act,
+    quantize_row,
     rotate,
     selftest,
 )
@@ -48,7 +50,7 @@ __version__ = "0.2.0"
 __all__ = [
     "Int8Linear", "available", "dequant", "dequant_act_quantize",
     "dequant_slice", "dequant_weight", "device_name", "linear", "linear_acc",
-    "linear_dx", "load", "prepare_weight", "quantize", "quantize_act", "rotate",
+    "linear_dx", "linear_dx_int8", "load", "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate",
     "selftest",
     "int8", "triton",
 ]

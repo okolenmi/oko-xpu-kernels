@@ -135,9 +135,15 @@ oneDNN bf16 GEMM, so `linear_dx(dy, W)` == the autograd gradient bit for bit).
 Against the *unquantized* weight the gradient is 0.9 % off, which is the INT8
 weight itself (0.90 % quantization + 0.17 % for storing the dequantized weight
 in bf16); `python -m xpu_kernels` and `debug/verify_linear_dx.py` both print it.
-Not here yet: `dW = dy^T @ x` (only needed for full fine-tuning) and a
-quantized-`dy` version — see [`docs/todo.md`](docs/todo.md), which also has the
-graph-capture checklist.
+There is also `linear_dx_int8(dy, w8, w_scale)`, which keeps the weight in int8
+and quantizes `dy` instead (exact in the weight, since `s[n]` becomes a column
+scale on `dy`). Measured at M=4096: **it is 3.6x slower** than the bf16 path
+(6.9 vs 1.9 ms -- the quantizer, epilogue and final rotation cost more than the
+faster GEMM saves) and 40 % noisier, so treat it as a *memory* option
+(2x less weight memory), not a speed one.
+
+Not here yet: `dW = dy^T @ x` (only needed for full fine-tuning) -- see
+[`docs/todo.md`](docs/todo.md), which also has the graph-capture checklist.
 
 For a worked example of wiring this into a real model — weight loading, the
 per-layer fallback when the device is offloaded or the library is missing, and

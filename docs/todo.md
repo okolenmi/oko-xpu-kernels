@@ -53,12 +53,23 @@ and decisive over ten thousand, and the error that matters is the divergence of
 the loss curve, not the per-element relative error.
 
 - [x] `dequant_weight` + `linear_dx`, verified and measured (above).
-- [ ] the int8-GEMM variant. **Missing piece: a plain quantizer.** `quantize()`
-      is rotate+quantize (ConvRot), which is wrong here — `dy * s` must not be
-      rotated, because the rotation is already accounted for in `W8`. So this
-      needs a per-row abs-max + round kernel with no rotation; a small kernel,
-      but do not reuse the ConvRot one by accident (it would produce a silently
-      rotated gradient).
+- [x] the int8-GEMM variant, measured: **a memory option, not a speed one.**
+      `debug/probe_linear_dx_variants.py`, M=4096, N=8192, K=3072: 6.94 ms vs
+      1.92 ms for the bf16 path. The GEMM is 1.85x faster; the torch quantizer
+      costs 4.57 ms on top, and even a perfectly fused one (~0.45 ms) leaves the
+      path at ~2.1 ms because the dequant epilogue and the final rotation eat the
+      rest. Accuracy: 1.37 % vs 0.97 % relative, cosine 0.999906 vs 0.999953.
+      Keep it for the 2x weight-memory saving only.
+      Two things learned the hard way, both pinned by the selftest now:
+      `quantize()` must not be reused (it rotates -- the rotation is already in
+      the weight, so reusing it would silently rotate the gradient), and
+      `dequant`'s `w_scale` is indexed by the *accumulator's columns* (K here,
+      not N); passing the longer of the two only works because it reads the
+      buffer's first K entries.
+- [ ] if the memory saving is wanted, do not bother fusing the quantizer for
+      speed; only a design that avoids rotating `dx` back can make int8 faster
+      (i.e. keep the residual stream in the rotated basis -- a whole-model
+      decision).
 - [ ] `dW` (only if full fine-tuning is on the table): `dy^T @ x` with the
       *activation* scale on the other index; same analysis, opposite side.
 

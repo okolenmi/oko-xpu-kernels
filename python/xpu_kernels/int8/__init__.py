@@ -64,9 +64,11 @@ from .ops import (
     linear,
     linear_acc,
     linear_dx,
+    linear_dx_int8,
     prepare_weight,
     quantize,
     quantize_act,
+    quantize_row,
     rotate,
 )
 from .selftest import selftest
@@ -74,6 +76,6 @@ from .selftest import selftest
 __all__ = [
     "Int8Linear", "available", "dequant", "dequant_act_quantize",
     "dequant_slice", "dequant_weight", "device_name", "linear",
-    "linear_acc", "linear_dx", "load",
-    "prepare_weight", "quantize", "quantize_act", "rotate", "selftest",
+    "linear_acc", "linear_dx", "linear_dx_int8", "load",
+    "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate", "selftest",
 ]

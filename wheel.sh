@@ -24,24 +24,25 @@ STAGED="$ROOT/python/xpu_kernels/int8/libxpuint8.so"
 
 cd "$ROOT"
 
-# torch is not needed to build the archive, but setuptools>=64 is, and pip
-# resolves the backend in-process with --no-build-isolation so this works on a
-# machine with no network.  `python -m build` is not used because this repo has
-# a build/ directory, which shadows the module when the cwd is the repo root.
-if [[ -z "${PYTHON:-}" ]]; then
-    for cand in python3 python; do
-        if command -v "$cand" >/dev/null 2>&1 \
-           && "$cand" -c 'import setuptools, sys; sys.exit(setuptools.__version__ < "64")' 2>/dev/null; then
-            PYTHON="$cand"; break
-        fi
-    done
-fi
-if [[ -z "${PYTHON:-}" ]]; then
-    echo "error: no python with setuptools>=64 (set PYTHON=/path/to/python)" >&2
-    exit 1
-fi
+# The wheel build runs pip with --no-build-isolation, so the interpreter that
+# runs it must already have the build backend importable itself.  A fresh 3.12
+# venv does not: ensurepip stopped shipping setuptools, and that is exactly how
+# a CI job ends in "Cannot import 'setuptools.build_meta'".  The sdist path
+# does not care -- `python -m build` resolves the backend in an isolated env.
+has_setuptools() {
+    "$1" -c 'import setuptools, sys; sys.exit(0 if int(setuptools.__version__.split(".")[0]) >= 77 else 1)' 2>/dev/null
+}
 
 if [[ "${1:-}" == "--sdist" ]]; then
+    if [[ -z "${PYTHON:-}" ]]; then
+        for cand in python3 python; do
+            if command -v "$cand" >/dev/null 2>&1; then PYTHON="$cand"; break; fi
+        done
+    fi
+    if [[ -z "${PYTHON:-}" ]]; then
+        echo "error: no python found (set PYTHON=/path/to/python)" >&2
+        exit 1
+    fi
     # the same cwd caveat as below applies to this probe
     if (cd /tmp && "$PYTHON" -c 'import build' 2>/dev/null); then
         # from a neutral cwd: this repo's own build/ directory would shadow the
@@ -56,6 +57,28 @@ if [[ "${1:-}" == "--sdist" ]]; then
     echo "sdist built without libxpuint8.so: the consumer runs ./build.sh or"
     echo "sets XPU_KERNELS_LIB.  int8/_lib.py has the search order."
     exit 0
+fi
+
+# The wheel path.  setuptools>=77 is what PEP 639 metadata (the `license`
+# expression in pyproject.toml) needs.
+if [[ -z "${PYTHON:-}" ]]; then
+    for cand in python3 python; do
+        if command -v "$cand" >/dev/null 2>&1 && has_setuptools "$cand"; then
+            PYTHON="$cand"; break
+        fi
+    done
+fi
+if [[ -z "${PYTHON:-}" ]]; then
+    echo "error: no python with setuptools>=77 (set PYTHON=/path/to/python)" >&2
+    echo "       a 3.12 venv has no setuptools by default: python -m pip install 'setuptools>=77'" >&2
+    exit 1
+fi
+if ! has_setuptools "$PYTHON"; then
+    echo "error: $PYTHON has no setuptools>=77" >&2
+    echo "       install it: $PYTHON -m pip install 'setuptools>=77'" >&2
+    echo "       (the wheel is built with --no-build-isolation, so the backend" >&2
+    echo "        has to be importable in the interpreter itself)" >&2
+    exit 1
 fi
 
 if [[ -e "$STAGED" ]]; then

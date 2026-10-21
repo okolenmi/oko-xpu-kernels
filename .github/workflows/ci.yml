@@ -22,9 +22,9 @@ jobs:
       matrix:
         python: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -48,7 +48,7 @@ jobs:
     if: vars.XPU_RUNNER == 'yes'
     runs-on: [self-hosted, xpu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build libxpuint8.so
         run: ./build.sh
@@ -57,6 +57,11 @@ jobs:
       # in python/), and the wheel build below needs the same metadata.
       - name: Install the package
         run: pip install -e . --no-deps && pip install pytest
+
+      # The wheel below is built with --no-build-isolation, so the build
+      # backend has to be importable in the interpreter that runs pip.
+      - name: Install the build backend
+        run: pip install "setuptools>=77"
 
       # The self-test is the whole point: it probes every gate against its
       # reference on this machine, so an upgrade that moves a value fails here
@@ -88,7 +93,7 @@ jobs:
           print(xpu_kernels.__file__, xpu_kernels.device_name())
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: xpu-kernels-wheel
           path: dist/*.whl

@@ -24,6 +24,12 @@ name: release
 # because PyPI must not accept local versions (PEP 440) -- the toolchain lives
 # in the tag and the release notes instead.
 #
+# The jobs run on ubuntu-24.04 rather than ubuntu-latest, and that is not a
+# detail: the wheel carries an ELF, and a wheel built against a newer glibc
+# does not load on an older one.  ubuntu-latest migrates to Ubuntu 26.04
+# (glibc 2.4x) as of 2026-10-19, and the machines that have oneAPI 2025.3 --
+# the ones this wheel is for -- are not all on the newest libc.
+#
 # The wheel is built here, on a GitHub-hosted runner, and not on a self-hosted
 # one: the .so needs a DPC++ compiler, and that compiler is a downloadable apt
 # package, so the alternative was a runner daemon sitting on the maintainer's
@@ -49,11 +55,11 @@ env:
 
 jobs:
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -82,19 +88,27 @@ jobs:
           print("version", version)
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist-sdist
           path: dist/*
 
   wheel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # The wheel is built with --no-build-isolation, so the build backend has
+      # to be importable in this interpreter.  A 3.12 venv from the runner
+      # image has no setuptools (ensurepip stopped shipping it), which is
+      # exactly how the first run of this workflow died with
+      # "Cannot import 'setuptools.build_meta'".
+      - name: Install the build backend
+        run: pip install "setuptools>=77"
 
       # The compiler is several GB installed; the runner ships a few GB of
       # toolchains this project will never use.
@@ -154,7 +168,7 @@ jobs:
           print(xpu_kernels.__version__, "available:", xpu_kernels.available())
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist-wheel
           path: dist/*
@@ -162,12 +176,12 @@ jobs:
   publish-sdist:
     needs: [sdist]
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write       # what trusted publishing exchanges for an upload
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist-sdist
           path: dist
@@ -183,12 +197,12 @@ jobs:
   publish-wheel:
     needs: [sdist, wheel]
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist-wheel
           path: dist
@@ -202,16 +216,16 @@ jobs:
   github-release:
     needs: [publish-sdist]
     if: github.ref_type == 'tag' && needs.publish-sdist.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist-sdist
           path: dist/sdist
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         continue-on-error: true      # a failed wheel job must not lose the sdist
         with:
           name: dist-wheel

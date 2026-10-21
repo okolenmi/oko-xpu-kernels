@@ -52,6 +52,19 @@ The alternative -- a self-hosted runner on the maintainer's desktop -- was
 rejected: there is no runner registered, a runner daemon would sit on the
 machine that does the timing measurements, and the job would queue forever.
 
+Two smaller things the runner pins, both learned the hard way:
+
+* **`ubuntu-24.04`, not `ubuntu-latest`.** The wheel carries an ELF, and a
+  wheel built against a newer glibc does not load on an older one.
+  `ubuntu-latest` migrates to Ubuntu 26.04 (glibc 2.4x) as of 2026-10-19, and
+  the machines that have oneAPI 2025.3 are not all on the newest libc.
+* **setuptools in the interpreter.** The wheel is built with
+  `--no-build-isolation`, so the build backend has to be importable where pip
+  runs. A 3.12 venv from the runner image has none (ensurepip stopped
+  shipping it), and the first run of this workflow died with
+  `Cannot import 'setuptools.build_meta'`. `wheel.sh` now says so in one line
+  instead of letting pip say it in a stack trace.
+
 The `device` job in `ci.yml` is a different thing and stays as it is: it needs
 a real GPU, so it is skipped unless the repository variable `XPU_RUNNER` is
 set to `yes`.

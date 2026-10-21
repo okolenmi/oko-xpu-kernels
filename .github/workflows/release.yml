@@ -291,7 +291,10 @@ jobs:
             exit 1
           fi
           upload_url=$(python3 -c 'import json;print(json.load(open("/tmp/release.json"))["upload_url"])')
-          upload_url="${upload_url%\?*}"
+          # The template ends in "{?name,label}"; the asset goes to the bare
+          # URL with ?name=... appended.  Leaving the template in place makes a
+          # URL that curl refuses with "URL malformed" (exit 3).
+          upload_url="${upload_url%%\{*}"
 
           for f in dist/sdist/* dist/wheel/*; do
             [[ -f "$f" ]] || continue

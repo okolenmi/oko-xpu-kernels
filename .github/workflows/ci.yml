@@ -16,7 +16,11 @@ on:
 
 jobs:
   cpu:
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: the label migrates to Ubuntu 26.04
+    # (2026-10-19), and a moving image makes a green run mean something
+    # different every month.  This job produces no binary, so the image choice
+    # only has to be stable.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

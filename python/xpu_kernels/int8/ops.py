@@ -118,6 +118,37 @@ def dequant_weight(w8, w_scale):
     """
     if w8.dtype != torch.int8:
         raise TypeError(f"w8 must be int8, got {w8.dtype}")
+    # The fused kernel: the int8 in, the bf16 out, with the rotation undone in
+    # the same pass.  The torch chain moves about 15 bytes per parameter (an
+    # fp32 copy of the whole weight, then a bf16 copy, then the rotated one);
+    # this moves 3.  For the 2.17 B quantized parameters of an SDXL base that
+    # is ~220 ms per call against ~20 -- and the trainer rebuilds the dense
+    # weight for every layer of every backward, so it is the difference
+    # between a step that can afford the dequant and one that cannot.
+    if w8.dim() == 2 and w8.shape[1] % 256 == 0 and w_scale.numel() == w8.shape[0]:
+        lib = _lib()
+        scale = w_scale.detach().to(torch.float32).contiguous()
+        out = torch.empty(w8.shape, dtype=torch.bfloat16, device=w8.device)
+        rc = lib.xpuint8_dequant_weight_stream(
+            _stream(w8.device), ctypes.c_void_p(w8.data_ptr()),
+            ctypes.c_void_p(scale.data_ptr()), ctypes.c_void_p(out.data_ptr()),
+            w8.shape[0], w8.shape[1])
+        if rc == 0:
+            return out
+        # an unsupported shape or a kernel error: the chain is the fallback
+    return dequant_weight_torch(w8, w_scale)
+
+
+def dequant_weight_torch(w8, w_scale):
+    """The weight dequantization as a torch chain -- the reference.
+
+    This is what :func:`dequant_weight` computes, and what the fused kernel is
+    compared against: the fp32 multiply by the row's scale, the bf16 rounding,
+    and then the rotation undone.  It is kept because it is the definition, and
+    because it is the fallback when the kernel does not apply.
+    """
+    if w8.dtype != torch.int8:
+        raise TypeError(f"w8 must be int8, got {w8.dtype}")
     if is_capturing():
         # A full-precision copy of the weight, inside a device-graph capture,
         # would be captured and re-computed on every replay -- ~0.4 s per step
@@ -212,6 +243,10 @@ class _Int8LinearFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         w8, w_scale = ctx.saved_tensors
+        # The bias's gradient, if the caller made the bias trainable.  Dropping
+        # it would be the same class of bug as dropping the whole gradient: a
+        # parameter that quietly never learns.
+        dbias = dy.sum(dim=0) if ctx.needs_input_grad[3] else None
         dy = dy.to(torch.bfloat16)
         if ctx.mode == "int8":
             dx = linear_dx_int8(dy, w8, w_scale)
@@ -224,7 +259,7 @@ class _Int8LinearFn(torch.autograd.Function):
         else:
             raise ValueError(f"unknown backward mode {ctx.mode!r}; "
                              f"use 'dense' or 'int8'")
-        return dx.to(ctx.input_dtype), None, None, None, None
+        return dx.to(ctx.input_dtype), None, None, dbias, None
 
 
 def int8_linear(x, w8, w_scale, bias=None, *, mode="dense"):

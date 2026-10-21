@@ -25,6 +25,7 @@ from .ops import (
     linear_dx,
     prepare_weight,
     quantize_act,
+    dequant_weight_torch,
     quantize_row,
     quantize_row_torch,
 )
@@ -89,6 +90,9 @@ def selftest(verbose: bool = True) -> bool:
     dx_bf16 = linear_dx(dy, w)
     dx_rel = ((dx_bf16.float() - grad.float()).norm() / grad.float().norm()).item()
     w_deq = dequant_weight(w8, ws)
+    # the fused dequant must be bit-identical to the chain it replaces
+    w_deq_chain = dequant_weight_torch(w8, ws)
+    dequant_same = bool(w_deq.view(torch.int16).eq(w_deq_chain.view(torch.int16)).all())
     w_rel = ((w_deq.float() - w.float()).norm() / w.float().norm()).item()
     dx_int8 = linear_dx(dy, w_deq)
     dx_int8_rel = ((dx_int8.float() - grad.float()).norm() / grad.float().norm()).item()
@@ -125,7 +129,7 @@ def selftest(verbose: bool = True) -> bool:
           and code_diff <= 1 and scale_rel < 0.05
           and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03
           and dx_q_rel < 0.04
-          and quant_rel < 2e-3 and scale_same
+          and quant_rel < 2e-3 and scale_same and dequant_same
           and dx_gemm_rel < 1e-6 and dw_rel < 1e-6)
     if verbose:
         print(f"device            : {device_name()}")
@@ -140,6 +144,7 @@ def selftest(verbose: bool = True) -> bool:
         print(f"backward dx, int8 GEMM (weight stays quantized): rel {dx_q_rel:.4f}")
         print(f"fused quantizer vs chain: {quant_diff} of {q_fused.numel()} values "
               f"differ, rel {quant_rel:.2e}, scales exact: {scale_same}")
+        print(f"fused dequant vs the chain: bit-identical {dequant_same}")
         print(f"autograd op: dx vs the same GEMM rel {dx_gemm_rel:.2e}, "
               f"dW vs autograd rel {dw_rel:.2e}")
         print("PASS" if ok else "FAIL")

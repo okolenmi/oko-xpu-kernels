@@ -192,7 +192,9 @@ def quantize_row(x, out=None, scale=None):
     if not x2.is_contiguous():
         x2 = x2.contiguous()
     q, s = _rows(x2, out, scale)
-    return q.reshape(x.shape), s
+    # the same shapes the torch chain returns: the values like x, the scales
+    # per row of x (so a 3-D input gives [B, S] scales, not [B*S])
+    return q.reshape(x.shape), s.reshape(x.shape[:-1])
 
 
 def usable(x) -> bool:

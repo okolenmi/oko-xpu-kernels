@@ -162,3 +162,18 @@ def test_status_inside_a_capture_does_not_probe():
         assert any("unverified" in p for p in problems)
     finally:
         gate.ok()
+
+
+def test_the_dense_weight_is_only_demanded_where_it_is_needed():
+    # "int8" mode never leaves the weight in int8 -> never needs a dense copy,
+    # and materializing one would spend the memory the mode exists to save
+    model = torch.nn.Module()
+    model.dense = int8.Int8Linear(torch.zeros(4, 256, dtype=torch.int8),
+                                  torch.ones(4, dtype=torch.float32),
+                                  backward="dense")
+    model.cheap = int8.Int8Linear(torch.zeros(4, 256, dtype=torch.int8),
+                                  torch.ones(4, dtype=torch.float32),
+                                  backward="int8")
+    problems = capture.capture_status(need=(), model=model)
+    assert any("dense" in p for p in problems)
+    assert not any("cheap" in p for p in problems)

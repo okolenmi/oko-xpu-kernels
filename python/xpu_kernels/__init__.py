@@ -30,6 +30,7 @@ from .int8 import (
     dequant_act_quantize,
     dequant_slice,
     dequant_weight,
+    dequant_weight_torch,
     device_name,
     expand_scale,
     ffn_situ,
@@ -60,7 +61,8 @@ __version__ = "0.2.0"
 
 __all__ = [
     "Int8Linear", "available", "capture_status", "dequant",
-    "dequant_act_quantize", "dequant_slice", "dequant_weight", "device_name",
+    "dequant_act_quantize", "dequant_slice", "dequant_weight",
+    "dequant_weight_torch", "device_name",
     "expand_scale", "ffn_situ", "int8_linear", "is_capturing", "linear",
     "linear_acc", "linear_dw", "linear_dx", "linear_dx_int8", "load",
     "prepare_for_capture",

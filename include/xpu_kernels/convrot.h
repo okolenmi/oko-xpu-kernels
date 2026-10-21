@@ -58,6 +58,13 @@ int xpuint8_convrot_quantize_act_stream(const void *sycl_queue, const void *x, i
                                         int32_t activation);
 
 // Rotate only, bf16 -> bf16. x and xr are bfloat16 [M,K].
+//   xpuint8_dequant_weight  int8 [N,K] + fp32 [N] -> bf16 [N,K]
+//     the inverse of prepare_weight: dequantize and undo the rotation
+int xpuint8_dequant_weight(const void *w8, const float *w_scale, void *out, int64_t N,
+                            int64_t K);
+int xpuint8_dequant_weight_stream(const void *sycl_queue, const void *w8,
+                                  const float *w_scale, void *out, int64_t N, int64_t K);
+
 int xpuint8_convrot_rotate_bf16(const void *x, void *xr, int64_t M, int64_t K);
 int xpuint8_convrot_rotate_bf16_stream(const void *sycl_queue, const void *x, void *xr,
                                       int64_t M, int64_t K);

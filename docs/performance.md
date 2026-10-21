@@ -489,6 +489,34 @@ rusticl/Mesa) give identical performance, so JIT choice is not a factor.
 
 ---
 
+## The weight dequantizer
+
+`int8.dequant_weight` -- the backward's weight-only path -- was a torch chain:
+`w8.to(float32) * scale` (a full fp32 copy of the weight), then
+`.to(bfloat16)` (another copy), then the rotation (a third). Fifteen bytes of
+traffic per parameter, and for the 2.17 B quantized parameters of an SDXL base
+that is **215 ms per call** -- which is the number the training project says
+decides whether an INT8 base is trainable at all, because it rebuilds the
+dense weight for every layer of every backward.
+
+The fused kernel reads the int8 and writes the bf16, undoing the rotation in
+the same pass: **3 bytes per parameter**, and the arithmetic is the chain's,
+in the chain's order (the fp32 multiply, the bf16 rounding, *then* the
+rotation -- the rounding has to happen before the butterfly, which is what
+makes it bit-identical).
+
+| 100 M parameters, B580 | time | vs the chain |
+|---|---|---|
+| torch chain | 9.92 ms | -- |
+| **fused kernel** | **2.93 ms** | **3.4x**, bit-identical |
+
+For the training project's 2.17 B parameters: **215 ms -> 63 ms** per backward.
+That is still 4 % of a 1.5 s step, and the int8 backward (`mode="int8"`) needs
+no dequant at all -- but the *exact* backward is now affordable, where before
+it was not. The fused kernel runs at 103 GB/s against a 14 ms bandwidth floor,
+so there is headroom left in it (the int8 unpack is a scalar loop); the shape
+of that work is the same as the rotate's, and the rotate's is closed.
+
 ## The NF4 dequantizer
 
 `xpu_kernels.triton.nf4.dequant_nf4` -- the frozen-base storage format

@@ -114,6 +114,12 @@ def capture_status(need: Iterable[str] | None = None,
             problems.append(f"{name}: {gate.describe()}")
 
     for name, module in _int8_modules(model):
+        # Only the "dense" backward needs the materialized weight.  In "int8"
+        # mode the weight never leaves int8, so demanding a dense copy there
+        # would report a problem that does not exist -- and preparing one
+        # would spend exactly the memory the mode exists to save.
+        if getattr(module, "backward", "dense") != "dense":
+            continue
         if getattr(module, "_dense", None) is None:
             problems.append(
                 f"{name}: the dense weight is not materialized -- the dequant "
@@ -165,6 +171,10 @@ def prepare_for_capture(model=None, need: Iterable[str] | None = None) -> dict:
 
     materialized = 0
     for _name, module in _int8_modules(model):
+        # "int8" mode never needs the dense weight -- materializing it would
+        # spend the memory the mode exists to save.
+        if getattr(module, "backward", "dense") != "dense":
+            continue
         module.dense_weight()
         materialized += 1
 

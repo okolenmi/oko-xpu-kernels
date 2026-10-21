@@ -94,6 +94,23 @@ U16 even_mask() {
 // was implemented and measured. A paired A/B over 7 interleaved rounds gives
 // 0.995x -- indistinguishable -- with bit-identical output, so the simpler
 // 32-byte form is kept. See debug/probe_load_ab.py.
+// Load 16 int8 weights and dequantize them: the fp32 multiply by the row's
+// scale and then the bf16 rounding -- in that order, because the chain rounds
+// to bf16 *before* the rotation (dequant_weight does
+// `rotate(w.to(bfloat16))`, and the rotation's own rounding happens at its
+// store).  Rounding here and not at the store is what makes this bit-exact
+// with the chain.
+F16 load_dequant_reg(const int8_t *p, float scale) {
+    const vec<uint32_t, 4> u = reinterpret_cast<const vec<uint32_t, 4> *>(p)[0];
+    F16 v;
+    for (int t = 0; t < 16; t++) {
+        const uint32_t byte = (u[t >> 2] >> (8 * (t & 3))) & 0xFFu;
+        const int32_t s = static_cast<int32_t>(static_cast<int8_t>(byte));
+        v[t] = static_cast<float>(BF(static_cast<float>(s) * scale));
+    }
+    return v;
+}
+
 F16 load_reg(const uint16_t *p) {
     const vec<uint32_t, 8> u = reinterpret_cast<const vec<uint32_t, 8> *>(p)[0];
     U16 w;
@@ -562,6 +579,61 @@ void launch_rotate_bf16(queue &q, const uint16_t *x, BF *xr, size_t M, size_t K,
     if (wait) event.wait();
 }
 
+// The inverse of prepare_weight: int8 weights plus a per-row scale back to
+// bf16, with the rotation undone.
+//
+// This is the backward's weight-only path (dequant_weight), and the torch
+// chain it replaces moves about 15 bytes per parameter -- an fp32 copy of the
+// whole weight, then a bf16 copy, then the rotated one.  This moves 3: the
+// int8 in, the bf16 out.  For a 2.17 B parameter model that is ~220 ms per
+// call reduced to ~20, which is the difference between a training step that
+// can afford the dequant and one that cannot.
+template <int G>
+void launch_dequant_weight(queue &q, const int8_t *w8, const float *w_scale, BF *out,
+                            size_t N, size_t K, bool wait) {
+    const size_t n_groups = K / GS;
+    const F16 c0 = h4_col(0, false), c1 = h4_col(1, false), c2 = h4_col(2, false),
+              c3 = h4_col(3, false);
+    const F16 d0 = h4_col(0, true), d1 = h4_col(1, true), d2 = h4_col(2, true),
+              d3 = h4_col(3, true);
+
+    auto event = q.submit([&](handler &h) {
+        h.parallel_for(nd_range<1>(range<1>(N * SUBG), range<1>(SUBG)),
+                       [=](nd_item<1> it) {
+                           const size_t row = it.get_global_id(0) >> 4;
+                           const size_t lane = it.get_local_id(0) & 15;
+                           const int8_t *src = w8 + row * K;
+                           BF *dst = out + row * K;
+                           const float scale = w_scale[row];
+
+                           for (int g = 0; g < G; ++g) {
+                               const size_t grp = static_cast<size_t>(g) * SUBG + lane;
+                               if (grp >= n_groups) continue;
+                               const int8_t *p = src + grp * GS;
+
+                               F16 W[NREG];
+                               for (int b = 0; b < NREG; b += 4) {
+                                   for (int j = 0; j < 4; j++)
+                                       W[b + j] = load_dequant_reg(p + (b + j) * 16, scale);
+                                   for (int j = 0; j < 4; j++)
+                                       W[b + j] = inreg(W[b + j], c0, c1, c2, c3, d0, d1, d2, d3);
+                                   bfly4(W[b], W[b + 1], W[b + 2], W[b + 3]);
+                               }
+                               for (int c = 0; c < 4; c++)
+                                   bfly4(W[c], W[c + 4], W[c + 8], W[c + 12]);
+                               BF *d = dst + grp * GS;
+                               for (int w = 0; w < NREG; w++) {
+                                   BF16 r;
+                                   for (int t = 0; t < 16; t++) r[t] = BF(W[w][t]);
+                                   reinterpret_cast<BF16 *>(d + w * 16)[0] = r;
+                               }
+                           }
+                       });
+    });
+    if (wait) event.wait();
+}
+
+
 // ---------------------------------------------------------------------------
 // Kernel 3: fused dequant epilogue.  out = acc * x_scale[m] * w_scale[n] + bias[n]
 // ---------------------------------------------------------------------------
@@ -785,6 +857,84 @@ int convrot_rotate_bf16(queue &q, const void *x, void *xr, int64_t M, int64_t K,
         }
     } catch (const exception &e) {
         set_error(std::string("convrot_rotate_bf16: ") + e.what());
+        return 5;
+    }
+    return 0;
+}
+
+int xpuint8_dequant_weight(const void *w8, const float *w_scale, void *out, int64_t N,
+                            int64_t K) {
+    if (!ensure_queue()) return 1;
+    if (N <= 0 || K <= 0) {
+        set_error("N and K must be positive");
+        return 2;
+    }
+    if (K % GS != 0) {
+        set_error("K must be divisible by the ConvRot group size (256)");
+        return 3;
+    }
+    const size_t gpl = (static_cast<size_t>(K) / GS + SUBG - 1) / SUBG;
+    try {
+        switch (gpl) {
+        case 1: launch_dequant_weight<1>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, true); break;
+        case 2: launch_dequant_weight<2>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, true); break;
+        case 3: launch_dequant_weight<3>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, true); break;
+        case 4: launch_dequant_weight<4>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, true); break;
+        case 6: launch_dequant_weight<6>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, true); break;
+        case 12: launch_dequant_weight<12>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                                           static_cast<BF *>(out), N, K, true); break;
+        default:
+            set_error("unsupported group count per sub-group");
+            return 4;
+        }
+    } catch (const exception &e) {
+        set_error(std::string("dequant_weight: ") + e.what());
+        return 5;
+    }
+    return 0;
+}
+
+int xpuint8_dequant_weight_stream(const void *sycl_queue, const void *w8,
+                                  const float *w_scale, void *out, int64_t N, int64_t K) {
+    if (!sycl_queue) {
+        set_error("SYCL queue pointer must not be null");
+        return 6;
+    }
+    if (N <= 0 || K <= 0) {
+        set_error("N and K must be positive");
+        return 2;
+    }
+    if (K % GS != 0) {
+        set_error("K must be divisible by the ConvRot group size (256)");
+        return 3;
+    }
+    const size_t gpl = (static_cast<size_t>(K) / GS + SUBG - 1) / SUBG;
+    try {
+        auto &q = *static_cast<queue *>(const_cast<void *>(sycl_queue));
+        switch (gpl) {
+        case 1: launch_dequant_weight<1>(q, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, false); break;
+        case 2: launch_dequant_weight<2>(q, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, false); break;
+        case 3: launch_dequant_weight<3>(q, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, false); break;
+        case 4: launch_dequant_weight<4>(q, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, false); break;
+        case 6: launch_dequant_weight<6>(q, static_cast<const int8_t *>(w8), w_scale,
+                                         static_cast<BF *>(out), N, K, false); break;
+        case 12: launch_dequant_weight<12>(q, static_cast<const int8_t *>(w8), w_scale,
+                                           static_cast<BF *>(out), N, K, false); break;
+        default:
+            set_error("unsupported group count per sub-group");
+            return 4;
+        }
+    } catch (const exception &e) {
+        set_error(std::string("dequant_weight: ") + e.what());
         return 5;
     }
     return 0;

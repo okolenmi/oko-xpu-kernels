@@ -170,7 +170,9 @@ def dequant_nf4(packed, absmax, codebook_=None, *, dtype=torch.bfloat16,
 
     ``packed`` is uint8 with two 4-bit indices per byte (the even index in the
     low nibble), ``absmax`` is fp32 with one scale per ``blocksize`` elements of
-    the *flattened* weight, and the result has the weight's shape.
+    the *flattened* weight, and the result is **flat** -- one element per weight
+    element, in the order they were packed.  The caller reshapes it (the
+    weight's shape is the caller's business, and a reshape is a view).
 
     The result is bit-identical to the torch chain, and the chain's cost is
     what this replaces: ~40 bytes of traffic and 16 bytes of scratch per

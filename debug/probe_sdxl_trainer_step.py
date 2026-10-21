@@ -6,9 +6,8 @@ UNet, its own GEGLU: `x, gate = proj(x).chunk(2, -1); x * F.gelu(gate)`).  This
 script borrows that model -- read-only, no change to its tree -- and measures:
 
   * the phase split: the forward, the loss, the backward;
-  * the host cost and the call count (torch's CPU-side profiler: the XPU
-    activity is not implemented on this driver, PTI_ERROR_NOT_IMPLEMENTED,
-    and asking for it takes the process down);
+  * the host cost, the call count and the per-kernel device time (torch's
+    profiler with the XPU activity -- it works; see the note below);
   * the eager step against the captured step (the trainer's own capture
     pattern: forward, loss and backward inside one device graph);
   * the same with the library's INT8 path:
@@ -158,20 +157,35 @@ def timeit(fn, n=3, warmup=1):
     return best
 
 
-def host_profile(model, x, ctx, y, ts):
-    """The host cost and the call count of one step.
+def host_profile(model, x, ctx, y, ts, device_table=False):
+    """The host cost, the call count and (optionally) the device-time table
+    of one step.
 
-    The XPU activity of the profiler is not implemented on this driver
-    (PTI_ERROR_NOT_IMPLEMENTED, and it takes the process down), so this is the
-    CPU side only: the time the host spends and the number of aten calls, each
-    of which is at least one kernel launch.
+    The XPU activity of the profiler works on this card: it registers PTI
+    callbacks with the Level Zero loader, prints a registration warning, and
+    still produces a complete device-time table.  What is *not* survivable is
+    an out-of-memory during the profiled step: the device is lost
+    (UR_RESULT_ERROR_DEVICE_LOST), the profiler's cleanup then fails with
+    PTI_ERROR_NOT_IMPLEMENTED, and that exception escapes a destructor -- so
+    the process dies instead of raising.  The profiler is the victim, not the
+    cause: keep the step inside the memory budget.
     """
-    with profile(activities=[ProfilerActivity.CPU]) as prof:
+    acts = [ProfilerActivity.CPU, ProfilerActivity.XPU] if device_table else [ProfilerActivity.CPU]
+    with profile(activities=acts, acc_events=True) as prof:
         model(x, ts, ctx, y).float().pow(2).mean().backward()
         torch.xpu.synchronize()
     table = prof.key_averages()
     calls = sum(e.count for e in table if e.key.startswith("aten::"))
     host_us = sum(e.self_cpu_time_total for e in table)
+    if device_table:
+        dev = sorted((e for e in table if e.self_device_time_total > 0),
+                     key=lambda e: -e.self_device_time_total)
+        total = sum(e.self_device_time_total for e in dev)
+        print(f"    the device-time table: {total / 1e6:.3f} s over "
+              f"{sum(e.count for e in dev)} kernel calls")
+        for e in dev[:12]:
+            print(f"      {e.self_device_time_total / 1e3:8.2f} ms  x{e.count:<6d} "
+                  f"{e.key[:64]}")
     return calls, host_us / 1000.0
 
 
@@ -245,7 +259,7 @@ def main():
 
         # the two profilers last: they allocate, and the capture's pool needed
         # the room
-        calls, host = host_profile(model, x, ctx, y, ts)
+        calls, host = host_profile(model, x, ctx, y, ts, device_table=arm.startswith("A"))
         torch.xpu.empty_cache()
         blocks = block_profile(model, step)
         total = sum(b[0] for b in blocks)

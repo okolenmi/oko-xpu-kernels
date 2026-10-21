@@ -86,6 +86,19 @@
   peak**. The fused GEGLU, 1.2-1.5× on the FFN in isolation, is invisible in
   the whole step.
 
+  The device-time table for one step (torch's profiler with the XPU activity:
+  0.263 s over 12 171 kernel calls) says where the work is: **the GEMMs are
+  45 %, the convolutions 22 %, the attention 5 %**. The convolutions are the
+  largest piece of an SDXL model the library cannot quantize.
+
+  A correction, for the record: the XPU profiler **works**. It registers PTI
+  callbacks with the Level Zero loader, prints a registration warning, and
+  produces a complete device-time table. What is not survivable is an
+  out-of-memory during the profiled step: the device is lost, the profiler's
+  cleanup then fails, and the exception escapes a destructor, so the process
+  dies and the table is lost with it. It looks like the profiler crashing; it
+  is the device being gone.
+
 * The PNG gate is unchanged (`a2aacfda45409493a490b0402b61f850`) with the
   rebuilt library, and `python -m xpu_kernels` now checks the fused GEGLU
   against the unfused chain as part of the self-test.

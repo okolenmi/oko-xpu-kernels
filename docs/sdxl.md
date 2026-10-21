@@ -189,6 +189,20 @@ Three things fall out of it:
   invisible in the step, because the FFN is a small part of it. It is free
   and bit-identical, but it is not a lever on the step.
 
+And where the step's device time actually goes (torch's profiler with the XPU
+activity, one 512×512 step: **0.263 s over 12 171 kernel calls**):
+
+| | calls | device time | share |
+|---|---|---|---|
+| the GEMMs (`gemm_kernel`, `mm`, `addmm`) | 4 398 | 118.8 ms | **45 %** |
+| the convolutions (forward, backward, `conv_reorder`) | 555 | 57.2 ms | **22 %** |
+| the attention (the flash backward) | 280 | 14.2 ms | 5 % |
+| the elementwise, norm, cat and the rest | ~6 900 | 65 ms | 25 % |
+
+So the library's INT8 path works on the 45 %, and **the convolutions — 22 %
+of the step, and 334.8 M of the UNet's parameters — are the largest piece it
+cannot reach** (item 4).
+
 ## 6. What to measure next
 
 1. The int8 convolution epilogue, if item 4 is ever taken up: whether a

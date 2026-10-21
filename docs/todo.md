@@ -71,8 +71,13 @@ SDXL's 3×3 convs are 334.8 M of the UNet's 2567 M (13 %), and the VAE adds
 81.6 M more. The ConvRot does not reach them: the contraction is spatial, so
 the activation's scale is per *channel*, and the product of that with the
 weight's per-output-channel scale cannot fold into a single epilogue scale. It
-needs a new epilogue, not a new kernel. Only worth it if the memory saving
-becomes the binding constraint.
+needs a new epilogue, not a new kernel.
+
+The number that decides it is in the trainer's step: **the convolutions are
+22 % of the SDXL step's device time** (the GEMMs are 45 %, the attention 5 %)
+-- `docs/sdxl.md`. So this is the largest remaining piece of an SDXL model
+that the library cannot quantize, and the largest single lever it does not
+have.
 
 ## 6. SDXL: the fused FFN with an erf-GELU — done
 

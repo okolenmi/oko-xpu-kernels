@@ -219,11 +219,15 @@ minimum over the steps of one shape:
   pure device time, and the eager step's wall is 1134 ms. The host is not the
   bottleneck here — that was the old tree, where the step had enough host
   work for the graph to be worth 2×.
-* **The graph costs 17 % of the device time** — a replay is *slower* than the
-  same work executed eagerly. The graph's private pool holds ~2 GB more than
-  the eager run, and the pool's memory layout costs the device time. The
-  int8 base reduces that penalty (its 2 GB of headroom is why its graph
-  penalty is 6 %), which is the same effect from the other side.
+* **The graph costs 14 % of the step, and the reason is the attention.** The
+  capture forces `sdpa_kernel(EFFICIENT_ATTENTION)` (the flash kernel cannot
+  be captured — it uses the work-group scratch memory, which the SYCL Graph
+  extension does not support), and on XPU that backend is **not supported**:
+  it falls back to the math attention, while the eager path runs the flash
+  one. Measured on this trainer's UNet, the math attention costs **+36 % of
+  the step's device time** (558 ms against 403 ms for forward+backward). The
+  capture saves the host time and pays 36 % of the device time for it — which
+  is why the graph is slower than the eager path here.
 * **The int8 base is a memory trade that needs the graph to be cheap:**
   +37 % eagerly (it launches about twice the kernels), +10 % replayed, and
   2.06 GB of live memory freed (5546 → 3489 MB).

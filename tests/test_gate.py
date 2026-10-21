@@ -57,6 +57,45 @@ def test_no_reference_fails_closed():
     assert "inactive" in why and "comfy_kitchen" in why
 
 
+def test_require_raises_when_the_gate_is_closed():
+    gate = Gate("t", lambda ref: _pair(torch.zeros(2)),
+                default_reference=lambda: object())
+    gate.disabled_by = "test"                    # as if the env flag was set
+    with pytest.raises(RuntimeError) as exc:
+        gate.require()
+    assert "not verified" in str(exc.value)
+    assert "test" in str(exc.value)              # the reason is in the message
+
+
+def test_require_passes_when_the_gate_is_open():
+    gate = Gate("t", lambda ref: _pair(torch.ones(2)),
+                default_reference=lambda: object())
+    gate.require()                               # must not raise
+
+
+def test_the_fused_entry_points_refuse_an_unverified_kernel():
+    # the caller is expected to ask `usable()` first, but a caller that skips
+    # the question must not get an unverified kernel: the entry point asks the
+    # gate itself
+    from xpu_kernels.triton import adaln, rope
+
+    q = torch.zeros(1, 2, 2, 4, dtype=torch.bfloat16)
+    pe = torch.zeros(1, 2, 1, 2, 2, 2, dtype=torch.bfloat16)
+    scale = torch.zeros(2, 4, dtype=torch.bfloat16)
+    for gate in (rope.gates()["rms_rope"], adaln.gates()["rms_adaln"]):
+        saved = gate.disabled_by
+        gate.disabled_by = "test"
+        try:
+            with pytest.raises(RuntimeError) as exc:
+                if gate.name == "rms_rope":
+                    rope.rms_rope_split_half(q, q, pe, scale)
+                else:
+                    adaln.rms_adaln(q, scale, scale)
+            assert "not verified" in str(exc.value)
+        finally:
+            gate.disabled_by = saved
+
+
 def test_injected_reference_rearms_after_failure():
     good = torch.ones(2, dtype=torch.bfloat16)
     gate = Gate("t", lambda ref: _pair(good, torch.zeros(2, dtype=torch.bfloat16)),

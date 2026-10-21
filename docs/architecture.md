@@ -261,7 +261,8 @@ as a list. The contract is verified on CPU (`tests/test_capture.py`) and on the
 card (`debug/verify_capture_guards.py`), which also captures `Int8Linear.dx`
 and replays it bit-identically to eager.
 
-One hole is left open, and it is recorded in `docs/todo.md`: the fused entry
-points do not consult their own gate. `usable()` is where the gate is asked,
-and the *caller* is expected to ask it -- a caller that skips the question gets
-an unverified kernel, silently.
+One thing was changed by this, and it is worth stating plainly: the fused
+entry points consult their own gate (`Gate.require()`), so a caller that
+forgets to ask `usable()` gets an exception rather than an unverified kernel.
+It raises rather than falling back because the fallback belongs to the caller
+and the package's reference is not bit-identical to ComfyUI's.

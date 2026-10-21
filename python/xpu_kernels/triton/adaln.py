@@ -505,7 +505,11 @@ def rms_adaln(x, scale, shift, eps=1e-6):
     :class:`_RmsAdaLN`, whose backward is a single fused kernel (or the torch
     gradient in `reference` if the backward gate is closed).  Under
     ``torch.no_grad`` it is the plain forward, unchanged and bit-exact.
+
+    The gate is consulted here and not only in :func:`usable`: a caller that
+    skips the question would otherwise get an *unverified* kernel, silently.
     """
+    _GATE.require()
     if torch.is_grad_enabled() and (x.requires_grad or scale.requires_grad
                                    or shift.requires_grad):
         return _RmsAdaLN.apply(x, scale, shift, eps)

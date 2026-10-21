@@ -121,20 +121,21 @@ Still open:
       about the gate rather than a synchronisation error from deep inside a
       capture. All of it is in `xpu_kernels/capture.py`, CPU-tested
       (`tests/test_capture.py`) and verified on the card.
-- [ ] **the fused entry points do not consult their own gate.** `usable()` is
+- [x] **the fused entry points now consult their own gate.** `usable()` is
       where the gate is asked, and the caller is expected to call it; a caller
-      that skips the question gets an *unverified* kernel, silently, with no
+      that skipped the question got an *unverified* kernel, silently, with no
       error at all (found while verifying the guards:
-      `debug/verify_capture_guards.py`). It is a hole in the package's central
-      promise -- "a fused kernel only runs if it has been proved" -- and it is
-      not closed yet because closing it means the fused functions must fall
-      back to the in-package reference when the gate is closed, and that
-      reference is not necessarily bit-identical to the caller's own fallback
-      (ComfyUI's `comfy_kitchen`): it would change ComfyUI's numbers in the
-      one case where the gate is closed, which is exactly the case ComfyUI
-      handles by not calling the kernel at all. The safe form is a separate
-      entry point that *is* the verified path, plus a deprecation of the
-      unguarded one.
+      `debug/verify_capture_guards.py`). The entry points now ask the gate
+      themselves (`Gate.require()`), so the promise holds whatever the caller
+      does. It *raises* rather than falling back, and that is the deliberate
+      choice: the fallback belongs to the caller, and the package's own
+      reference is not necessarily bit-identical to it (ComfyUI's is
+      `comfy_kitchen`'s, and the two differ in 173 of 12.2 M values), so
+      quietly substituting it would change ComfyUI's numbers in exactly the
+      case where the gate is closed. The backward keeps failing soft (the
+      torch gradient *is* the eager chain's gradient), so a closed backward
+      gate costs speed and not correctness. Pinned in `tests/test_gate.py`;
+      the PNG gate is unchanged (`a2aacfda45409493a490b0402b61f850`).
 - [ ] a captured *whole step* is the trainer's integration work, not this
       library's; the library's part is the per-kernel guarantee above.
 

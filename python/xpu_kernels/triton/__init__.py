@@ -14,8 +14,12 @@ are meant to be *bit-identical* to it, not merely close:
 
 The rule every kernel here follows, and the reason they are safe to drop into a
 model: each one verifies itself once per process against a reference
-implementation and then either engages or falls back, permanently, for that
-process.  See :class:`xpu_kernels.triton._gate.Gate` for the contract, and
+implementation, and the verdict is latched.  A kernel whose gate is closed is
+refused at the entry point -- the fused functions ask their own gate, so a
+caller that forgets to call :func:`usable` gets an exception rather than an
+unverified kernel -- and the backward falls back to the torch gradient, which
+*is* the eager chain's gradient.  See
+:class:`xpu_kernels.triton._gate.Gate` for the contract, and
 ``set_reference`` below for supplying the reference.
 
     import xpu_kernels.triton as k

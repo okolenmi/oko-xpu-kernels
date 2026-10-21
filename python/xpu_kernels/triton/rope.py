@@ -632,6 +632,7 @@ def rms_rope_split_half_dequant(q_acc, k_acc, freqs_cis, q_w, k_w, x_scale,
         k_scale = q_scale
     if k_w is None:
         k_w = q_w
+    _GATE_DQ.require()
     return (_rows_dq(q_acc, freqs_cis, q_scale, epsilon, x_scale, q_w, split_half),
             _rows_dq(k_acc, freqs_cis, k_scale, epsilon, x_scale, k_w, split_half))
 
@@ -682,9 +683,13 @@ def rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6, ro
     :class:`_RmsRope`, whose backward is the fused pair of kernels (or the torch
     gradient if the backward gate is closed).  Under ``torch.no_grad`` it is the
     plain forward, unchanged and bit-exact.
+
+    The gate is consulted here and not only in :func:`usable`: a caller that
+    skips the question would otherwise get an *unverified* kernel, silently.
     """
     if k_scale is None:
         k_scale = q_scale
+    _GATE.require()
     if q.requires_grad or k.requires_grad:
         return (_RmsRope.apply(q, freqs_cis, q_scale, epsilon, True),
                 _RmsRope.apply(k, freqs_cis, k_scale, epsilon, True))

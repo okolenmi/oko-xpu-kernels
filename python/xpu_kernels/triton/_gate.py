@@ -253,6 +253,32 @@ class Gate:
         log.info("%s: %s", self.name, self._why)
         return True
 
+    def require(self) -> None:
+        """Refuse to run an unverified kernel.
+
+        The gate is consulted *here*, at the entry point, and not only in
+        ``usable()``: a caller that forgets to ask gets an unverified kernel
+        silently, and that is the one failure mode this package exists to
+        prevent.  ``usable()`` stays the caller's *question* ("may I use the
+        kernel for this input?"); this is the kernel's own *answer*.
+
+        A closed gate raises rather than falling back, because the fallback
+        belongs to the caller: the package's own reference is not necessarily
+        bit-identical to the caller's (ComfyUI's is ``comfy_kitchen``'s, and
+        the two differ in 173 of 12.2 M values), so quietly substituting it
+        would change the caller's numbers.  The message says what to do.
+        """
+        if self.ok():
+            return
+        why = self._why or "no reason recorded"
+        if self.disabled_by:
+            why = f"disabled: {self.disabled_by}"
+        raise RuntimeError(
+            f"{self.name}: the fused kernel is not verified on this machine "
+            f"({why}). Use the fallback, or give the gate a reference to "
+            f"compare against: xpu_kernels.triton.set_reference({self.name!r}, "
+            f"your_fallback) -- and check xpu_kernels.triton.status() for why.")
+
     def describe(self) -> str:
         """One line for a status report; runs the verification if needed."""
         self.ok()

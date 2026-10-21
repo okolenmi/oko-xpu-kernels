@@ -12,6 +12,13 @@ name: tests
 
 on:
   push:
+    # A documentation-only push changes nothing that the tests can check, and
+    # a run per paragraph is noise that hides a real failure.  The pull
+    # request trigger stays unconditional: a branch that is not the default
+    # one still gets its tests when someone proposes it.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
   pull_request:
 
 jobs:

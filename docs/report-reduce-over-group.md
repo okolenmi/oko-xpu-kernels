@@ -85,6 +85,27 @@ epilogue.
 
 ## Notes for us, not for the tracker
 
+* **Where it goes.** Not to a repository of ours: this is an Intel defect, and
+  the two plausible destinations are
+  * the **Intel® oneAPI DPC++/C++ Compiler** board --
+    <https://community.intel.com/t5/Intel-oneAPI-DPC-C-Compiler/bd-p/oneapi-data-parallel-c>
+    -- which has a thread made for exactly this, *"Intel DCP++ Crash report -
+    priority support"* --
+    <https://community.intel.com/t5/Intel-oneAPI-DPC-C-Compiler/Intel-DCP-Crash-report-priority-support/td-p/1590087>;
+  * the **Intel GPU Community Issue Tracker** on GitHub --
+    <https://github.com/IGCIT/Intel-GPU-Community-Issue-Tracker-IGCIT> --
+    which is the public tracker for the GPU driver, and is where a *driver*
+    fault belongs.
+
+  Which one is right depends on where their triage says the fault is. The
+  crash kills the *host* process, so the fault is in host-side code: the
+  oneAPI runtime (`libsycl.so`, closed source), the Level Zero loader
+  (`libze_loader.so`, open source --
+  <https://github.com/oneapi-src/level-zero>), or the GPU driver itself
+  (closed source). Start with the compiler board, mention the driver tracker,
+  and let Intel route it. If they ask for a GitHub issue, the IGCIT tracker is
+  the public one.
+
 * The reproducer is built by `debug/native/build.sh` (it is the last target
   there) and lives in the public repository, so the tracker can fetch it
   directly: <https://github.com/okolenmi/oko-xpu-kernels>.

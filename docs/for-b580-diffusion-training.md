@@ -57,6 +57,7 @@ one-line escape hatch:
 | `xpu_kernels/triton/adaln.py` | RMSNorm + adaLN scale/shift in one pass over the row | 25 → 16 ms/step (**1.56×**), bit-exact | forward only. Autograd wrapper needed: run the kernel under `no_grad` in forward, recompute the norm in backward (or write a Triton backward) |
 | `xpu_kernels/triton/rope.py` | RMSNorm + rope in one pass; also reads the INT8 GEMM accumulator directly | rope alone **2.34×** (35.7 → 15.3 ms/forward), bit-exact | **differentiable now**: fused backward, fwd+bwd **14.3×** vs the eager chain (0.62 vs 8.88 ms per tensor), gradient closer to float64 than autograd's |
 | `src/xpuint8.cpp` `situ_reg` | situ with `expm1` tanh | −0.41 ms/call, −34.7 ms/step | see §3 — this one is a *finding*, not just code |
+| `xpu_kernels/int8/ops.py` | INT8 weight → the backward's `dx = dy @ W` | exact vs the same GEMM in autograd, 0.9% from the unquantized weight (that *is* the INT8 weight), dequant is one-time (~0.4 s for 3.7B) | `dequant_weight` + `linear_dx`, or `Int8Linear.dx(dy)`. `dW` and a quantized-`dy` variant are still open — `docs/todo.md` |
 
 Two design rules in those files worth copying even if the kernels are rewritten:
 
@@ -125,10 +126,13 @@ those numbers trustworthy, and it transfers as-is:
 
 ## 6. What does not transfer
 
-- INT8 in the training graph: no backward kernel yet — see `docs/todo.md` for
-  the design (`dL/dx = dL/dy @ W`, weight-only dequant first, because the weight
-  scale is on the contraction index and cannot fold into a GEMM epilogue) and for
-  the graph-capture requirements.
+- INT8 in the training graph: `dL/dx` **is** available now —
+  `dequant_weight(w8, w_scale)` once, then `linear_dx(dy, w)` (or
+  `Int8Linear.dx(dy)`). It is exact against autograd of the same GEMM and 0.9 %
+  from the unquantized weight, which is the INT8 weight, not the backward. Still
+  missing: `dW` (full fine-tuning only) and the faster int8-GEMM variant that
+  keeps the weight quantized; `docs/todo.md` has both plus the graph-capture
+  checklist.
 - The graph-capture and `addcmul_` findings — MossImage-specific.
 - Prompt/text encoding: closed here as "fast enough", no result worth porting.
 - The ComfyUI memory-accounting patch: their code is already correct.

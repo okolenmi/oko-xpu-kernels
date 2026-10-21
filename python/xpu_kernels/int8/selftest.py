@@ -16,8 +16,10 @@ from .ops import (
     dequant,
     dequant_act_quantize,
     dequant_slice,
+    dequant_weight,
     linear,
     linear_acc,
+    linear_dx,
     prepare_weight,
     quantize_act,
 )
@@ -72,8 +74,23 @@ def selftest(verbose: bool = True) -> bool:
     q2_ref, s2_ref = quantize_act(d, "situ")
     code_diff = (q2.to(torch.int16) - q2_ref.to(torch.int16)).abs().max().item()
     scale_rel = ((s2 - s2_ref).abs() / s2_ref.clamp_min(1e-20)).max().item()
+    # the backward's activation gradient: the convention must be exact (same
+    # GEMM as autograd's, so anything else means a transpose is missing), and
+    # the INT8-weight gradient must be as close as the weight itself is
+    dy = (torch.randn(M, N, generator=g, device=dev) * 0.5).to(torch.bfloat16)
+    xr = x.detach().clone().requires_grad_(True)
+    torch.nn.functional.linear(xr, w).backward(dy)
+    grad = xr.grad
+    dx_bf16 = linear_dx(dy, w)
+    dx_rel = ((dx_bf16.float() - grad.float()).norm() / grad.float().norm()).item()
+    w_deq = dequant_weight(w8, ws)
+    w_rel = ((w_deq.float() - w.float()).norm() / w.float().norm()).item()
+    dx_int8 = linear_dx(dy, w_deq)
+    dx_int8_rel = ((dx_int8.float() - grad.float()).norm() / grad.float().norm()).item()
+
     ok = (same and slice_same and rel < 0.02 and q2.dtype == torch.int8
-          and code_diff <= 1 and scale_rel < 0.05)
+          and code_diff <= 1 and scale_rel < 0.05
+          and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03)
     if verbose:
         print(f"device            : {device_name()}")
         print(f"INT8 vs bf16      : relative error {rel:.4f} (expect < 0.02)")
@@ -81,5 +98,8 @@ def selftest(verbose: bool = True) -> bool:
         print(f"strided slice     : {slice_same}")
         print(f"fused situ vs chain: max code diff {code_diff}, "
               f"max scale rel {scale_rel:.4f}")
+        print(f"backward dx vs autograd: rel {dx_rel:.2e} (expect 0)")
+        print(f"dequant_weight    : rel {w_rel:.4f} (the INT8 weight itself)")
+        print(f"backward dx, INT8 : rel {dx_int8_rel:.4f}")
         print("PASS" if ok else "FAIL")
     return ok

@@ -5,38 +5,62 @@ it; "done" means measured, not implemented.
 
 ## 1. INT8 backward for training (`dL/dx = dL/dy @ W`)
 
-The library is inference-only today: `linear` computes `y = x @ W^T` with an int8
+The library was inference-only: `linear` computes `y = x @ W^T` with an int8
 weight and an int8 activation. Training needs the vjp, `dx = dy @ W`, and the
 weight gradient (`dW = dy^T @ x`) if the weights are not frozen.
 
-**dx first, weight-only dequant.** The reason is the scale layout, and it is not
-a detail: `W[n, k] = W8[n, k] * s[n]`, so
+**dx: done, weight-only dequant.** The reason it is not an INT8 GEMM is the
+scale layout: `W[n, k] = W8[n, k] * s[n]`, so
 
     dx[m, k] = sum_n dy[m, n] * W8[n, k] * s[n]
 
-and `s[n]` sits on the *contraction* index. Unlike the forward (where the
-weight scale is per output column and folds into the epilogue), it cannot be
-applied after the GEMM. So the first version dequantizes the weight
-(`dequant(w8, w_scale)`, already in the library) and runs a bf16/oneDNN GEMM;
-a quantized-`dy` version is a *second* step, and only if it is A/B-able against
-this one.
+and `s[n]` sits on the *contraction* index. Unlike the forward, where the weight
+scale is per output column and folds into the epilogue, it cannot be applied
+after the GEMM.
 
-Why this is affordable in a LoRA trainer: `W` is frozen, so the dequantized copy
-is paid once, not per step, and the LoRA path `dy @ (W0 + B A)` adds one small
-GEMM. For full fine-tuning the bf16 copy is the memory question, not the kernel.
+What shipped: `dequant_weight(w8, w_scale)` — dequantize, then undo the ConvRot
+rotation, which works because the rotation is its own inverse (that is what makes
+`(x R) @ (W R)^T == x @ W^T` true in the forward) — and
+`linear_dx(dy, w)` = `dy @ w`. `Int8Linear.dense_weight()` caches it,
+`Int8Linear.dx(dy)` uses it.
 
-**Then, optionally, quantized gradients.** Quantizing `dL/dy` adds noise the
-optimizer sees directly. Do not ship it as a default; A/B it on a real loss
-curve (same seed, same data order) against the weight-only version, and report
-the divergence — a per-step gradient error of 1% is invisible in one step and
-decisive over ten thousand.
+Evidence (`debug/verify_linear_dx.py`, N=8192, K=3072, M=4096, bf16):
 
-- [ ] `dequant` a weight once, keep it, `dx = dy @ w_bf16` — correctness against
-      autograd of the bf16 linear (float64 gradcheck), device time vs bf16
-      `matmul`.
-- [ ] the same with `dy` quantized per row; A/B the training curve.
-- [ ] `dW` (only if full fine-tuning is on the table): `dy^T @ x` in int8 needs
-      the *activation* scale on the other index; same analysis, opposite side.
+| | |
+|---|---|
+| `linear_dx(dy, W)` vs autograd of `F.linear`, same `W` | **0** (same oneDNN GEMM) |
+| `dequant_weight` vs the bf16 weight | 0.94 % (int8 0.90 %, bf16 cast 0.17 %) |
+| `dx` with the dequantized weight vs the unquantized model | 0.97 % |
+| one-time dequant | 2.6 ms / 25 M params → ~0.4 s for a 3.7 B model |
+
+So the gradient a trainer gets is the gradient of the INT8 model it is training,
+within bf16 storage of the weight. Nothing accumulates: adapters, gradients and
+optimizer state stay fp32.
+
+**Quantized gradients: not shipped, and they need a decision.** The fast variant
+is exact in the weight. Since `s[n]` is a *row* scale on `W`, it is a *column*
+scale on `dy`:
+
+    dx = dy @ diag(s) @ W8 = (dy * s) @ W8
+
+so `dy * s` can be quantized per row (`a[m]`), the GEMM is int8×int8 against the
+weight as stored, and `dx = a[m] * (dy8 @ W8)`, rotated at the end. That keeps
+the weight int8 (no 0.4 s dequant, 2x less memory than the bf16 copy) and adds
+one quantizer's worth of noise to the gradient — exactly the tradeoff to A/B on
+a real loss curve, same seed and data order, against the weight-only path. Do
+not make it the default: a 1 % per-step gradient error is invisible in one step
+and decisive over ten thousand, and the error that matters is the divergence of
+the loss curve, not the per-element relative error.
+
+- [x] `dequant_weight` + `linear_dx`, verified and measured (above).
+- [ ] the int8-GEMM variant. **Missing piece: a plain quantizer.** `quantize()`
+      is rotate+quantize (ConvRot), which is wrong here — `dy * s` must not be
+      rotated, because the rotation is already accounted for in `W8`. So this
+      needs a per-row abs-max + round kernel with no rotation; a small kernel,
+      but do not reuse the ConvRot one by accident (it would produce a silently
+      rotated gradient).
+- [ ] `dW` (only if full fine-tuning is on the table): `dy^T @ x` with the
+      *activation* scale on the other index; same analysis, opposite side.
 
 ## 2. Device-graph capture of the step
 

@@ -93,6 +93,44 @@ def prepare_weight(w, group: int = 256):
     return q, scale.contiguous()
 
 
+def dequant_weight(w8, w_scale):
+    """The unrotated bf16 weight behind an INT8 ConvRot weight.
+
+    ``prepare_weight`` stores ``rotate(W) / s`` rounded to int8, so
+    ``W = rotate(w8 * s)`` -- the rotation is its own inverse (``rotate(rotate(x))
+    == x`` up to bf16 rounding), which is what makes the forward's
+    ``(x R) @ (W R)^T == x @ W^T`` work in the first place.  One ``rotate`` call
+    therefore undoes it.
+
+    This is the weight-only path for a backward pass: dequantize once and keep
+    the result, then ``dx = linear_dx(dy, w)`` is a plain bf16 GEMM.  It is
+    called once per weight, not per step -- see ``docs/todo.md``.
+
+    The result is bf16 because that is what the GEMM consumes.  Storing the
+    dequantized weight costs one extra ULP per element on top of the int8
+    quantization the forward already applies; ``debug/verify_linear_dx.py``
+    measures the effect on a gradient (~0.4% relative, the same order as the
+    weight quantization itself).
+    """
+    if w8.dtype != torch.int8:
+        raise TypeError(f"w8 must be int8, got {w8.dtype}")
+    w = w8.to(torch.float32) * w_scale.to(torch.float32).reshape(-1, 1)
+    return rotate(w.to(torch.bfloat16))
+
+
+def linear_dx(dy, w):
+    """``dL/dx`` for a linear with weight ``w``: ``dy [.., N] @ w [N, K] -> [.., K]``.
+
+    ``w`` is the *unrotated* ``[N, K]`` weight -- ``dequant_weight(...)`` of an
+    INT8 weight, or the bf16 weight itself.  No transpose and no bias: a bias
+    does not depend on ``x``, and ``torch.nn.functional.linear(x, w)`` is
+    ``x @ w.T``, so its vjp is ``dy @ w``.
+    """
+    if dy.shape[-1] != w.shape[0]:
+        raise ValueError(f"dy has {dy.shape[-1]} columns but w has {w.shape[0]} rows")
+    return dy @ w
+
+
 def dequant(acc, x_scale, w_scale, bias=None):
     """bf16 dequant of an int32 [M, N] accumulator with per-row and per-column scales."""
     lib = _lib()
@@ -217,6 +255,24 @@ class Int8Linear(torch.nn.Module):
 
     def forward(self, x):
         return linear(x, self.w8, self.w_scale, self.bias)
+
+    def dense_weight(self, refresh=False):
+        """The unrotated bf16 weight, dequantized once and cached.
+
+        Not a registered buffer: it is derived state, it doubles this module's
+        memory, and a training loop only needs it when it takes a backward.  So
+        ``.to()`` does not move it either -- call with ``refresh=True`` after
+        re-quantizing ``w8``/``w_scale`` or moving the module.
+        """
+        cached = getattr(self, "_dense", None)
+        if cached is None or refresh:
+            cached = dequant_weight(self.w8, self.w_scale)
+            self._dense = cached
+        return cached
+
+    def dx(self, dy):
+        """``dL/dx`` given ``dL/dy`` -- the backward's activation gradient."""
+        return linear_dx(dy, self.dense_weight())
 
     def extra_repr(self):
         n, k = self.w8.shape

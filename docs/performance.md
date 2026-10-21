@@ -180,6 +180,37 @@ formula is pinned separately by `tests/test_rope_backward.py` in float64 against
 
 ---
 
+## INT8 backward: `dL/dx = dy @ W`
+
+There is no kernel here, and that is the finding. `linear_dx` is one bf16 GEMM,
+so the only new costs are the one-time weight dequant and the fact that the
+weight geometry no longer matches the forward's.
+
+The weight scale is on the contraction index for the backward (see
+`docs/todo.md`), so `W` is materialized (`dequant_weight`: dequantize, then undo
+the ConvRot rotation — the rotation is its own inverse) and the GEMM is
+`torch.matmul`. `debug/verify_linear_dx.py`, N=8192, K=3072, M=4096:
+
+| | |
+|---|---|
+| `linear_dx(dy, W)` vs autograd of `F.linear`, same `W` | **0** — the same oneDNN GEMM |
+| `dequant_weight` vs the bf16 weight | 0.94 % (int8 0.90 %, bf16 cast 0.17 %) |
+| `dx` with the quantized weight vs the unquantized model | 0.97 % |
+| dequant, 25.2 M params | 2.6 ms (~15 GB/s effective: cast, scale, cast, rotate) |
+
+0.9 % for per-row symmetric int8 is what the arithmetic gives on Gaussian data
+(`absmax ~ 3.5 sigma`, so `scale/2/sqrt(3) / sigma ~ 0.008`), and the same 0.9 %
+is in the forward — 1.27 % there for this synthetic matrix. The gradient error is
+not an extra layer of noise on top of the forward's, it *is* the forward's.
+
+`prepare_weight` costs 3.0 ms for the same matrix, so quantizing a 3.7 B model is
+~0.4 s each way. That is a one-time startup cost, not a step cost; it is the
+argument for the int8-GEMM variant (weight stays int8, no dequant, 2x less
+memory) if someone needs the weight back in int8 — at the price of quantizing
+`dy`, which is the thing to A/B.
+
+---
+
 ## rotate + quantize: where the time is
 
 `debug/native/probe_rotate_ablation.cpp`. Each mode removes exactly one piece.

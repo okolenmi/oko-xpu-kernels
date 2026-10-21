@@ -112,11 +112,32 @@ activation paths are bit-identical to the unfused chain they replace
 activation rotation is baked into the weight layout, so a plain
 `w/amax*127` quantization is silently wrong.
 
-**Backward passes are not here yet.** This half is inference-only: the GEMM is
-`torch._int_mm`, the kernels are forward-only. `docs/todo.md` has the design for
-`dL/dx = dL/dy @ W` (weight-only dequant first — the weight scale sits on the
-contraction index, so it cannot fold into a GEMM epilogue) and for making a step
-graph-capturable.
+### The backward: `dL/dx`, weight-only
+
+For `y = x @ W^T`, the vjp is `dx = dy @ W` — no transpose, no bias. With an
+INT8 weight, recover `W` once and keep it:
+
+```python
+w = xpu_kernels.dequant_weight(w8, w_scale)       # bf16 [N,K], once per weight
+dx = xpu_kernels.linear_dx(dy, w)                 # bf16 [M,K]
+```
+
+or on a module, which caches it: `mod.dense_weight()`, `mod.dx(dy)`.
+
+Why dequantize instead of an INT8 GEMM: `W[n,k] = W8[n,k] * s[n]`, so `s[n]` sits
+on the *contraction* index of `dx = dy @ W` and cannot fold into an epilogue
+(the forward gets away with it because its weight scale is per output column).
+Dequantizing reads 1.5 bytes per parameter and writes bf16 — 2.6 ms per 25 M
+parameters here, ~0.4 s once for a 3.7 B-parameter model.
+
+Against the same GEMM in autograd the result is **exact** (it is the same
+oneDNN bf16 GEMM, so `linear_dx(dy, W)` == the autograd gradient bit for bit).
+Against the *unquantized* weight the gradient is 0.9 % off, which is the INT8
+weight itself (0.90 % quantization + 0.17 % for storing the dequantized weight
+in bf16); `python -m xpu_kernels` and `debug/verify_linear_dx.py` both print it.
+Not here yet: `dW = dy^T @ x` (only needed for full fine-tuning) and a
+quantized-`dy` version — see [`docs/todo.md`](docs/todo.md), which also has the
+graph-capture checklist.
 
 For a worked example of wiring this into a real model — weight loading, the
 per-layer fallback when the device is offloaded or the library is missing, and
@@ -207,7 +228,8 @@ C API and `docs/architecture.md` for the algorithm.
 | Triton `rms_norm + rope` | working, **2.34×**, bit-identical to the shipped kernel (`num_warps=4` pinned) |
 | Triton rope **backward** | working, **14.3×** on fwd+bwd vs the eager chain, differentiable wrapper |
 | Triton `rms_norm + adaLN` | working, **1.56×**, bit-identical |
-| INT8 training backward | **not implemented** — design and the scale-layout argument in [`docs/todo.md`](docs/todo.md) |
+| INT8 `dL/dx` (weight-only) | working, **exact** vs the same GEMM in autograd, 0.9 % from the unquantized weight (that is the INT8 weight); dequant is one-time |
+| INT8 `dW`, quantized-`dy` gradient | **not implemented** — design and the scale-layout argument in [`docs/todo.md`](docs/todo.md) |
 | Device-graph capture | kernels allocate/sync nothing given an `out=` buffer; the autograd path does not yet take one |
 
 ## Layout

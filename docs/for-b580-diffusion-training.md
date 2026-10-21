@@ -59,8 +59,20 @@ Without the autograd op an INT8 layer in a training graph produces **no
 gradient at all, silently**: `linear()` returns a tensor with no `grad_fn`.
 The library now ships the op itself (`int8.int8_linear`, `Int8Linear`).
 
-## 2. Forkable: two Triton kernels that are exactly what a Cosmos DiT needs
+### Three pieces the SDXL path can use now
 
+The trainer's SDXL path is a GEGLU (`nodes/model/attention.py:146`:
+`x * F.gelu(gate)`), and three things in the library were built for it:
+
+| what | why it matters there |
+|---|---|
+| `int8.ffn(..., act="geglu_erf")` | the whole GEGLU FFN in two GEMMs and two kernels, with the `[M, 10240]` bf16 tile never written: **1.2-1.5× faster** than the unfused INT8 chain, and bit-identical to it. The erf-GELU was proved over every bf16 value (`debug/native/probe_gelu_exact.cpp`), so this is not an approximation |
+| `int8.prepare_weight_fused(w)` | the weight preparation in one C pass: **15.5×** the torch chain (22.6 ms against 350 ms for 2.17 B, per step). It is not the same function as `prepare_weight` (5.7 % of the values differ by one unit), and the INT8 path's error is unchanged |
+| `int8.TrainableInt8Linear` | a **trainable** INT8 weight: the parameter stays bf16 and is quantized every forward, the forward is the INT8 model's and the backward is the bf16 model's (`dW` bit for bit). It is capture-safe: a captured step re-quantizes the *current* weight on every replay |
+
+`docs/sdxl.md` has the measurements and the arithmetic behind them.
+
+## 2. Forkable: two Triton kernels that are exactly what a Cosmos DiT needs
 When the Anima DiT lands it will contain `rms_norm + adaLN modulation`, `rope`
 inside attention, and a SwiGLU/situ FFN. Three of those already have fused
 Triton kernels here, each verified bit-exact against the eager chain:

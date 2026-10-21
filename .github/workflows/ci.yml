@@ -31,7 +31,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.12"]
+        # One version, on purpose: the package is one maintainer's, and a run
+        # per push per version is noise that hides a real failure.  Add a
+        # version here when there is a reason to support it -- and raise
+        # `requires-python` in pyproject.toml with it, so the claim and the
+        # coverage stay the same thing.
+        python: ["3.12"]
     steps:
       - uses: actions/checkout@v5
 

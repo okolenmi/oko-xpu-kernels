@@ -489,6 +489,27 @@ rusticl/Mesa) give identical performance, so JIT choice is not a factor.
 
 ---
 
+## The bf16 path: what is left, measured
+
+The question "can bf16 be made faster?" has an answer for each candidate, and
+most of them are closed:
+
+| candidate | verdict |
+|---|---|
+| fuse the activation into the GEMM (oneDNN post-op) | **closed**: `mkldnn::_linear_pointwise` exists on this backend but accepts only `relu` -- `gelu_tanh` and `gelu_erf` are refused by name ("not supported for conv/linear post unary fusion") -- and the `relu` path does not actually fuse: 2.234 ms against 2.252 ms for the unfused `F.linear` alone, i.e. noise. The GELU pass itself costs +0.366 ms at M=4096, K=3072, N=8192 (a read and a write of 67 MB), so there was something to win and oneDNN does not win it here. |
+| the norms | **done**: rms_norm+rope and rms_norm+adaLN are fused Triton kernels, 1.5-2x on those stages, and their backwards are fused too (14x on rope fwd+bwd). |
+| the activation's transcendental | **done**: `sycl::tanh` has a data-dependent slow path on this card, and the `expm1` form is bf16-identical for every finite bf16 input. |
+| the GEMMs | **closed**: oneDNN is at the card's int8 rate; a hand-written ESIMD GEMM was 3-4x slower. |
+| the attention | **closed**: every XPU SDPA backend is the same oneDNN kernel. |
+| the rest | at the measured memory floor (read 468 GB/s, write 397 GB/s on a 400 MB buffer). |
+
+The one shape still open in the bf16 path is the **residual add** of a
+pre-norm block: folding it into the norm's epilogue would save one launch and
+one read-write pass per add (~84 launches and ~6 ms of device time per step
+in a 42-block model, in a step that is host-bound). It is training-safe --
+the add's backward is the identity -- but the payoff is small next to the
+capture, which removes the launches altogether.
+
 ## What is left
 
 One bottleneck, and it is a hardware-shape constraint rather than a missing

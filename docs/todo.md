@@ -108,26 +108,22 @@ Still open:
 
 ## 3. Backward for `adaln.rms_adaln`
 
-**Done** (`adaln._GATE_BWD`, `debug/probe_adaln_backward.py`): `dx`, `dscale`
-and `dshift`, verified against `torch.autograd` of the eager chain in fp32
-(9.4e-8 worst relative) and the formula pinned in float64 by
-`tests/test_adaln_backward.py` (autograd, `gradcheck`, the norm's orthogonality
-property, and the reduction shapes for every broadcast a trainer passes:
-`[1,1,D]`, `[D]`, `[B,S,D]`, `[1,S,D]`, `[B,1,D]`).
+**Done**, including the fused reduction (`adaln._GATE_BWD`,
+`debug/probe_adaln_backward.py`): `dx`, `dscale` and `dshift`, verified against
+`torch.autograd` of the eager chain in fp32 (1.5e-7 worst relative over 1.59 M
+values, both a single shared modulation vector and one per batch element) and the
+formula pinned in float64 by `tests/test_adaln_backward.py` (autograd,
+`gradcheck`, the norm's orthogonality property, and the reduction shapes for
+every broadcast a trainer passes: `[1,1,D]`, `[D]`, `[B,S,D]`, `[1,S,D]`,
+`[B,1,D]`).
 
-Forward+backward 1.48 ms vs 5.79 ms eager (3.9x). The remaining cost is not
-`dx` (0.25 ms) but the two modulation reductions (1.13 ms) -- sums over the rows
-the modulation was broadcast across, which a per-row kernel cannot do without
-atomics, so they are torch today.
+Forward+backward 0.81 ms vs 5.14 ms eager (6.3×). The order was: 3.9× with two
+torch reductions, 6.3× once they became two Triton kernels. It also made
+`dscale`/`dshift` three orders of magnitude more accurate (1.7e-3 → 3.1e-7)
+because the sums now stay in fp32 instead of going through a bf16 temporary --
+worth remembering: the "fast path" was also the precise one.
 
-- [ ] **fused modulation reduction.** One pass over `x` and `dy` (48 MB instead
-      of the ~170 MB the fp32 temporary costs), accumulate `dscale` and `dshift`
-      together, reduce chunk partials in a second tiny kernel (no atomics).
-      Expected ~0.2 ms against 1.13 ms, i.e. ~1.5 ms -> ~0.55 ms per call, about
-      40 ms/step over 42 blocks. This is the biggest measured, unclaimed win
-      left in the Triton half.
-      Chunking must respect the modulation's broadcast group (partial sums must
-      not span two groups), which is the only subtle part.
+Nothing open here. The next lever is not in this stage.
 
 ## 4. Switch ComfyUI to import this package
 

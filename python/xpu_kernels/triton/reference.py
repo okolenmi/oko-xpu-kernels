@@ -142,6 +142,10 @@ def _reduce_like(grad: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     :func:`rms_adaln_backward` usable with a per-block modulation ``[1, 1, D]``
     as well as with a full ``[B, S, D]`` one.
     """
+    if grad.dim() < ref.dim():
+        # a grouped reduction returns one row per distinct vector, which is
+        # fewer axes than the modulation it came from
+        grad = grad.reshape(ref.shape)
     n_lead = grad.dim() - ref.dim()
     dims = list(range(n_lead))
     for i, size in enumerate(ref.shape):

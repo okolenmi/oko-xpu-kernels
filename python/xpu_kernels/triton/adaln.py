@@ -37,6 +37,7 @@ NUM_WARPS = 4
 
 _kernel = None
 _kernel_bwd = None
+_kernel_mod = None
 _triton = None
 
 try:
@@ -72,13 +73,13 @@ try:
 
     @triton.jit
     def _rms_adaln_bwd_rows_kernel(
-        x_ptr, dy_ptr, scale_ptr, dx_ptr, v_ptr,
+        x_ptr, dy_ptr, scale_ptr, dx_ptr, rstd_ptr,
         d, scale_group,
-        stride_xr, stride_sr, stride_dyr, stride_dxr, stride_vr,
+        stride_xr, stride_sr, stride_dyr, stride_dxr,
         eps,
-        block_d: tl.constexpr, write_v: tl.constexpr, out_dtype: tl.constexpr,
+        block_d: tl.constexpr, write_rstd: tl.constexpr, out_dtype: tl.constexpr,
     ):
-        """One program per row: ``dx`` in a single pass, and ``v`` if asked.
+        """One program per row: ``dx``, plus ``rstd`` for the modulation sums.
 
         ``y = v * (1 + scale) + shift`` with ``v = x * rstd``, so with
         ``dv = dy * (1 + scale)``:
@@ -87,11 +88,12 @@ try:
             dscale = sum(dy * v),  dshift = sum(dy)  over the broadcast axes
 
         Only the first line is per-row, and it is the whole kernel.  The two
-        modulation gradients are sums over rows, which is why the kernel hands
-        back ``v`` instead: a per-row kernel cannot reduce across rows without
-        atomics, and the reduction is one torch call on an already-materialised
-        tensor.  ``write_v`` is False when neither ``scale`` nor ``shift`` needs
-        a gradient, so an inference-only backward does not pay for it.
+        modulation gradients are sums over rows, so the kernel hands back
+        ``rstd`` (a scalar per row, 16 KB for the whole model) instead of ``v``:
+        the reduction then reads ``x`` and ``dy`` once and never needs a
+        materialised ``v``.  ``write_rstd`` is False when neither ``scale`` nor
+        ``shift`` needs a gradient, so an inference-only backward does not pay
+        for it.
 
         ``shift`` is not read: ``dx`` and ``dscale`` do not depend on it.
         """
@@ -111,14 +113,80 @@ try:
         dx = rstd * (dv - (tl.sum(v * dv) / d) * v)
 
         tl.store(dx_ptr + row * stride_dxr + cols, dx.to(out_dtype), mask=mask)
-        if write_v:
-            tl.store(v_ptr + row * stride_vr + cols, v.to(out_dtype), mask=mask)
+        if write_rstd:
+            tl.store(rstd_ptr + row, rstd)
+
+    @triton.jit
+    def _rms_adaln_mod_partials_kernel(
+        x_ptr, dy_ptr, rstd_ptr, part_ptr,
+        d, group, n_chunks, n_rows,
+        stride_xr, stride_dyr,
+        d_block: tl.constexpr, chunk: tl.constexpr,
+    ):
+        """Stage 1 of the modulation sums: one program per (group, chunk, block).
+
+            dscale = sum(dy * x * rstd),  dshift = sum(dy)
+
+        summed over the rows of one broadcast group.  A per-row program cannot
+        reduce across rows, and atomics would both cost more than the writes and
+        make the result order-dependent, so each program sums a run of ``chunk``
+        rows of one group into a partial and stage 2 adds the partials.
+
+        ``rstd`` comes from the ``dx`` kernel: without it this pass would have to
+        read each row twice (once for the sum of squares, once for its block).
+        """
+        pid = tl.program_id(0)
+        g = pid // n_chunks
+        c = pid % n_chunks
+        cols = tl.program_id(1) * d_block + tl.arange(0, d_block)
+        mask = cols < d
+
+        base = g * group + c * chunk
+        acc_s = tl.zeros((d_block,), tl.float32)
+        acc_v = tl.zeros((d_block,), tl.float32)
+        for i in tl.static_range(chunk):
+            r = base + i
+            live = (c * chunk + i) < group and r < n_rows
+            # clamp so a masked-out tail never reads out of bounds
+            r = tl.minimum(r, n_rows - 1)
+            x = tl.load(x_ptr + r * stride_xr + cols, mask=mask & live, other=0.0).to(tl.float32)
+            dy = tl.load(dy_ptr + r * stride_dyr + cols, mask=mask & live, other=0.0).to(tl.float32)
+            rs = tl.load(rstd_ptr + r)
+            rs = tl.where(live, rs, 0.0)
+            acc_s += dy
+            acc_v += dy * x * rs
+
+        n_part = tl.num_programs(0)
+        tl.store(part_ptr + pid * d + cols, acc_s, mask=mask)
+        tl.store(part_ptr + (n_part + pid) * d + cols, acc_v, mask=mask)
+
+    @triton.jit
+    def _rms_adaln_mod_reduce_kernel(
+        part_ptr, dscale_ptr, dshift_ptr,
+        d, n_chunks, n_groups,
+        d_block: tl.constexpr,
+    ):
+        """Stage 2: add the chunk partials of one group. No atomics, deterministic."""
+        g = tl.program_id(0)
+        cols = tl.program_id(1) * d_block + tl.arange(0, d_block)
+        mask = cols < d
+        n_part = n_chunks * n_groups
+        acc_s = tl.zeros((d_block,), tl.float32)
+        acc_v = tl.zeros((d_block,), tl.float32)
+        for c in range(0, n_chunks):
+            pid = g * n_chunks + c
+            acc_s += tl.load(part_ptr + pid * d + cols, mask=mask, other=0.0)
+            acc_v += tl.load(part_ptr + (n_part + pid) * d + cols, mask=mask, other=0.0)
+        tl.store(dshift_ptr + g * d + cols, acc_s, mask=mask)
+        tl.store(dscale_ptr + g * d + cols, acc_v, mask=mask)
 
     _kernel = _rms_adaln_rows_kernel
     _kernel_bwd = _rms_adaln_bwd_rows_kernel
+    _kernel_mod = (_rms_adaln_mod_partials_kernel, _rms_adaln_mod_reduce_kernel)
 except Exception:  # pragma: no cover - no triton on this box
     _kernel = None
     _kernel_bwd = None
+    _kernel_mod = None
 
 
 def enabled():
@@ -197,10 +265,19 @@ def _prep_modulation(t, x, n, d):
     return adaln_prep_modulation(t, x, n, d)
 
 
-def _rows_bwd_kernel(dy, x, scale, eps, need_v=True):
+#: Rows per program in stage 1 of the modulation sums.  Large enough that the
+#: partial buffer is small (group/chunk rows x d), small enough to keep the
+#: grid wide: at S=3973, D=3072 this is ~250 x 24 programs.
+MOD_CHUNK = 16
+
+#: Columns per program in both stages of the modulation sums.
+MOD_BLOCK = 128
+
+
+def _rows_bwd_kernel(dy, x, scale, eps, need_rstd=True):
     """Launch the backward kernel. No gate, no fallback: the probe calls this.
 
-    Returns ``(dx, v)`` with ``v`` None when ``need_v`` is false.
+    Returns ``(dx, rstd)`` with ``rstd`` None when ``need_rstd`` is false.
     """
     d = x.shape[-1]
     n = x.numel() // d
@@ -213,39 +290,80 @@ def _rows_bwd_kernel(dy, x, scale, eps, need_v=True):
     s_flat, s_group = _prep_modulation(scale, x, n, d)
 
     dx = torch.empty_like(x_flat)
-    v = torch.empty_like(x_flat) if need_v else dx
+    rstd = torch.empty((n,), device=x.device, dtype=torch.float32)
     _kernel_bwd[(n,)](
-        x_flat, dy_flat, s_flat, dx, v,
+        x_flat, dy_flat, s_flat, dx, rstd,
         d, s_group,
-        x_flat.stride(0), s_flat.stride(0), dy_flat.stride(0),
-        dx.stride(0), v.stride(0),
+        x_flat.stride(0), s_flat.stride(0), dy_flat.stride(0), dx.stride(0),
         eps,
         block_d=min(_triton.next_power_of_2(d), 4096),
-        write_v=need_v,
+        write_rstd=need_rstd,
         out_dtype=tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float32,
         num_warps=NUM_WARPS)
-    return dx.reshape(x.shape), (v.reshape(x.shape) if need_v else None)
+    return dx.reshape(x.shape), (rstd if need_rstd else None)
 
 
-def _rows_bwd(dy, x, scale, shift, eps, need_v=True):
+def _mod_reduction_kernel(dy, x, rstd, group, n_groups):
+    """Launch the two-stage modulation sums. Returns ``(dscale, dshift)`` fp32.
+
+    Both are ``[n_groups, d]``: one row per distinct modulation vector.  The
+    caller maps that back to the shape the modulation was passed in.
+    """
+    d = x.shape[-1]
+    n = x.numel() // d
+    x_flat = x.reshape(n, d)
+    dy_flat = dy.reshape(n, d)
+    n_chunks = (group + MOD_CHUNK - 1) // MOD_CHUNK
+    part = torch.empty((2 * n_groups * n_chunks, d), device=x.device,
+                       dtype=torch.float32)
+    dscale = torch.empty((n_groups, d), device=x.device, dtype=torch.float32)
+    dshift = torch.empty((n_groups, d), device=x.device, dtype=torch.float32)
+
+    part_kernel, reduce_kernel = _kernel_mod
+    d_block = MOD_BLOCK
+    part_kernel[(n_groups * n_chunks, (d + d_block - 1) // d_block)](
+        x_flat, dy_flat, rstd, part,
+        d, group, n_chunks, n,
+        x_flat.stride(0), dy_flat.stride(0),
+        d_block=d_block, chunk=MOD_CHUNK, num_warps=NUM_WARPS)
+    reduce_kernel[(n_groups, (d + d_block - 1) // d_block)](
+        part, dscale, dshift,
+        d, n_chunks, n_groups,
+        d_block=d_block, num_warps=NUM_WARPS)
+    return dscale, dshift
+
+
+def _rows_bwd(dy, x, scale, shift, eps, need_mod=True):
     """The fused backward, or the torch one when the kernel has not been proved.
 
     Returns ``(dx, dscale, dshift)``.  The fallback is the analytic gradient in
     `reference`, which is the same arithmetic with torch's reduction order -- it
     is slower, not wrong.
+
+    The modulation sums run as one kernel *per group structure*: `dscale` follows
+    `scale`'s groups and `dshift` follows `shift`'s, and when the two differ (a
+    per-dim `scale` with a per-block `shift`, say) the pair is not fused and both
+    come from torch.  Same numbers either way.
     """
     if _kernel_bwd is None or not _GATE_BWD.ok():
         return _reference.rms_adaln_backward(dy, x, scale, shift, eps)
-    dx, v = _rows_bwd_kernel(dy, x, scale, eps, need_v)
-    dscale = dshift = None
-    if need_v:
-        # the modulation gradients are sums over the rows the modulation was
-        # broadcast across; fp32 so the reduction does not round at bf16
-        dscale = _reference._reduce_like(
-            dy.to(torch.float32) * v.to(torch.float32), scale)
-    if shift is not None:
-        dshift = _reference._reduce_like(dy, shift)
-    return dx, dscale, dshift
+
+    if not need_mod:
+        dx, _ = _rows_bwd_kernel(dy, x, scale, eps, need_rstd=False)
+        return dx, None, None
+
+    d = x.shape[-1]
+    n = x.numel() // d
+    _, s_group = _prep_modulation(scale, x, n, d)
+    _, h_group = _prep_modulation(shift, x, n, d)
+    if s_group != h_group:
+        return _reference.rms_adaln_backward(dy, x, scale, shift, eps)
+
+    dx, rstd = _rows_bwd_kernel(dy, x, scale, eps, need_rstd=True)
+    dscale, dshift = _mod_reduction_kernel(dy, x, rstd, s_group, n // s_group)
+    return (dx,
+            _reference._reduce_like(dscale, scale),
+            _reference._reduce_like(dshift, shift))
 
 
 def _probe_forward(ref):
@@ -284,17 +402,25 @@ def _probe_backward(ref):
     shift = torch.randn(1, 1, D, generator=gen, device=device) * 0.1
     dy = torch.randn(B, S, D, generator=gen, device=device) * 0.1
 
-    xr = x.detach().clone().requires_grad_(True)
-    sr = scale.detach().clone().requires_grad_(True)
-    hr = shift.detach().clone().requires_grad_(True)
-    ref(xr, sr, hr, 1e-6).backward(dy)
+    n = x.numel() // D
+    out = {}
+    # two modulation shapes: a single vector shared by every row, and one per
+    # batch element.  The second has n_groups > 1, which is what exercises the
+    # chunk-to-group mapping in the reduction kernel; the first has one group of
+    # n rows, where an off-by-one in `row // group` would show up as a wrong sum.
+    for tag, mod in (("", scale), ("_grouped", scale.repeat(B, 1, 1))):
+        xx = x.detach().clone().requires_grad_(True)
+        sx = mod.detach().clone().requires_grad_(True)
+        hx = mod.detach().clone().requires_grad_(True)
+        gx, gs, gh = torch.autograd.grad(ref(xx, sx, hx, 1e-6), (xx, sx, hx), dy)
 
-    dx, v = _rows_bwd_kernel(dy, x, scale, 1e-6)
-    return {
-        "dx": (dx, xr.grad),
-        "dscale": (_reference._reduce_like(dy * v, scale), sr.grad),
-        "dshift": (_reference._reduce_like(dy, shift), hr.grad),
-    }
+        _, group = _prep_modulation(mod, x, n, D)
+        dx, rstd = _rows_bwd_kernel(dy, x, mod, 1e-6)
+        dscale, dshift = _mod_reduction_kernel(dy, x, rstd, group, n // group)
+        out["dx" + tag] = (dx, gx)
+        out["dscale" + tag] = (_reference._reduce_like(dscale, mod), gs)
+        out["dshift" + tag] = (_reference._reduce_like(dshift, mod), gh)
+    return out
 
 
 #: Budget for the backward: same arithmetic, different reduction order (see
@@ -364,7 +490,7 @@ class _RmsAdaLN(torch.autograd.Function):
         x, scale, shift = ctx.saved_tensors
         dx, dscale, dshift = _rows_bwd(
             dy, x, scale, shift, ctx.eps,
-            ctx.need_v and ctx.needs_input_grad[1])
+            ctx.need_v and (ctx.needs_input_grad[1] or ctx.needs_input_grad[2]))
         if not ctx.needs_input_grad[1]:
             dscale = None
         if not ctx.needs_input_grad[2]:

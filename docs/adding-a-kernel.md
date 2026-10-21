@@ -78,6 +78,18 @@ A backward is a kernel like any other, with two extra rules:
   algebraic identity is involved, add a float64 gradcheck as well — it catches
   errors that a bit-exact match against a wrong formula would hide.
 
+* **Prefer a reduction to an atomic.** A gradient that sums across rows cannot
+  be a per-row kernel, and atomics make the result depend on execution order.
+  The adaLN backward does it in two stages -- one program per (group, run of
+  rows, column block) writes a partial, a second kernel adds the partials --
+  which is deterministic and, measured, faster than the fp32 temporary the
+  torch version needed (`docs/performance.md`).
+* **Return the cheapest thing the next pass needs.** The same kernel first
+  returned `v` (a whole tensor) so torch could multiply and reduce it; returning
+  `rstd` (one scalar per row) instead removed a 24 MB write, a 24 MB read and a
+  48.8 MB fp32 temporary, and made the sums more accurate. When a backward needs
+  a cross-row quantity, check whether one number per row will do.
+
 ## Device graphs
 
 A training step wants to be captured, so a kernel must not do any of these

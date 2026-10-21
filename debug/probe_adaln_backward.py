@@ -1,9 +1,12 @@
 """adaLN forward+backward: fused vs the eager chain, and how accurate the gradient is.
 
-The backward is one kernel for `dx` plus two torch reductions for `dscale` and
-`dshift` (they sum over rows the modulation was broadcast across, which a
-per-row kernel cannot do without atomics). The probe reports the total and the
-pieces, because the pieces are what would be fused next if it were worth it.
+The backward is a per-row kernel for `dx` plus a two-stage reduction for
+`dscale` and `dshift` (they sum over the rows the modulation was broadcast
+across, which a per-row kernel cannot do without atomics). The probe reports the
+total and each piece, so a regression in one of them is visible, and it compares
+the gradient against the same computation in float64 -- the modulation sums are
+three orders of magnitude more accurate than the torch reduction they replaced,
+which is worth knowing before anyone "optimizes" them back.
 
     PYTHONPATH=python LEVEL_ZERO_V1_SDK_PATH=~/.local/levelzero \\
         python debug/probe_adaln_backward.py
@@ -87,17 +90,21 @@ def main():
     print(f"forward+backward   eager {e:6.3f} ms   fused {f:6.3f} ms ({e / f:5.2f}x)")
 
     # where the fused backward goes
-    dx = torch.empty_like(x)
-    t_dx = timed(lambda: adaln._rows_bwd_kernel(dy, x, scale, EPS)[0])
-    dx_k, v = adaln._rows_bwd_kernel(dy, x, scale, EPS)
-    t_v = timed(lambda: adaln._rows_bwd_kernel(dy, x, scale, EPS, need_v=True)[0])
-    t_ds = timed(lambda: reference._reduce_like(
-        dy.to(torch.float32) * v.to(torch.float32), scale))
-    t_dh = timed(lambda: reference._reduce_like(dy, shift))
-    print(f"\n  dx kernel (no v)        {t_dx:6.3f} ms")
-    print(f"  dx kernel (+ v for dscale) {t_v:6.3f} ms")
-    print(f"  dscale reduction        {t_ds:6.3f} ms")
-    print(f"  dshift reduction        {t_dh:6.3f} ms")
+    n = x.numel() // D
+    _, group = adaln._prep_modulation(scale, x, n, D)
+    t_dx = timed(lambda: adaln._rows_bwd_kernel(dy, x, scale, EPS, need_rstd=False)[0])
+    t_dx_r = timed(lambda: adaln._rows_bwd_kernel(dy, x, scale, EPS, need_rstd=True)[0])
+    _, rstd = adaln._rows_bwd_kernel(dy, x, scale, EPS)
+    t_mod = timed(lambda: adaln._mod_reduction_kernel(dy, x, rstd, group, n // group))
+    dscale, dshift = adaln._mod_reduction_kernel(dy, x, rstd, group, n // group)
+    t_ds = timed(lambda: reference._reduce_like(dscale, scale))
+    t_dh = timed(lambda: reference._reduce_like(dshift, shift))
+    print(f"\n  dx kernel                        {t_dx:6.3f} ms")
+    print(f"  dx kernel + rstd                 {t_dx_r:6.3f} ms")
+    print(f"  modulation kernel (both sums)    {t_mod:6.3f} ms")
+    print(f"  reshape of each to the caller's shape {t_ds + t_dh:6.3f} ms")
+    print(f"  torch reduction, for comparison  "
+          f"{timed(lambda: reference._reduce_like(dy.to(torch.float32) * reference.rms_adaln_normalized(x, EPS).to(torch.float32), scale)):6.3f} ms")
 
     # accuracy against the same gradient in float64
     gx, gs, gh = fused_fwd_bwd()

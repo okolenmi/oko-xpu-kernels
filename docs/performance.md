@@ -187,45 +187,46 @@ medians:
 
 | | time | |
 |---|---|---|
-| eager chain forward | 2.053 ms | |
-| fused forward | 0.246 ms | **8.4× vs eager** (1.56× vs the shipped Triton kernel, see above) |
-| eager forward+backward | 5.793 ms | |
-| fused forward+backward | 1.478 ms | **3.9×** |
-| — `dx` kernel | 0.25-0.27 ms | |
-| — `dscale` reduction | 0.995 ms | |
-| — `dshift` reduction | 0.133 ms | |
+| eager chain forward | 1.67 ms | |
+| fused forward | 0.222 ms | **7.5× vs eager** (1.56× vs the shipped Triton kernel, see above) |
+| eager forward+backward | 5.14 ms | |
+| fused forward+backward | 0.812 ms | **6.3×** |
+| — `dx` kernel (+ `rstd`) | 0.25-0.27 ms | |
+| — modulation kernel, both sums | 0.35 ms | |
+| — reshape/launch glue | ~0.13 ms | |
 
 `dx` is the norm's vjp, `rstd * (dv - (v . dv)/D * v)`, and it is per row, so it
-is one kernel. `dscale` and `dshift` are sums over the rows the modulation was
-broadcast across -- a per-row kernel cannot do that without atomics -- so the
-kernel writes `v` back and the gradients come from two torch reductions. That is
-why the reduction is 70 % of the backward: `dy.float() * v.float()` is an fp32
-temporary (48.8 MB written and read again for a 3973-term sum). Measured
-alternatives for the same reduction:
+is one kernel. The modulation gradients are sums *across* rows:
 
-| | time | rel vs float64 |
+    dscale = sum(dy * x * rstd)    dshift = sum(dy)
+
+over the rows each modulation vector was broadcast across. A per-row kernel
+cannot reduce across rows, and atomics would cost more than the writes and make
+the result depend on execution order, so it is two kernels: one program per
+(group, run of 16 rows, column block) writes a partial, and a tiny second kernel
+adds the partials of each group. Deterministic, no atomics.
+
+The `dx` kernel hands back `rstd` (one fp32 per row -- 16 KB for the whole model)
+rather than `v`, which is what makes the reduction one pass: it reads `x` and `dy`
+once, and no `v` tensor is ever materialized. That is also why the gradient got
+*more* accurate than the torch version it replaced:
+
+| vs the same gradient in float64 | before (torch reduction) | now |
 |---|---|---|
-| fp32 product, `sum(dim=(0,1))` (shipped) | 1.33 ms | 7.8e-08 |
-| fp32 product, `reshape(-1,D).sum(0)` | 1.03 ms | 7.8e-08 |
-| bf16 product, `sum(..., dtype=float32)` | **0.57 ms** | 1.65e-03 |
+| `dx` | 1.7e-05 | 1.7e-05 |
+| `dscale` | 1.7e-03 | **3.1e-07** |
+| `dshift` | 1.6e-03 | **5.8e-08** |
 
-The bf16 product is 2x faster and its 1.7e-3 is the same order as the bf16
-storage error already in `dy` and `v`, so it is defensible -- but a fused
-reduction kernel is both faster *and* exact (one pass over x and dy, fp32
-accumulation, no temporary), and is the next step (`docs/todo.md`).
+The torch version multiplied two bf16 tensors in fp32 into a 48.8 MB temporary,
+so it inherited bf16's storage error and then summed; the kernel keeps `dy * x *
+rstd` in fp32 registers and never rounds the product. The device gate probes all
+three outputs (in fp32, against `torch.autograd` of the eager chain) including a
+`[B, 1, D]` modulation, which is the case where the group is not the whole
+tensor -- worst relative error 1.5e-7 over 1.59 M values.
 
-**Accuracy** against the same gradient in float64:
-
-| | relative L2 |
-|---|---|
-| `dx` | 1.7e-05 |
-| `dscale` | 1.7e-03 |
-| `dshift` | 1.6e-03 |
-
-`dscale`/`dshift` carry bf16 storage error because `dy` and `v` are bf16; `dx`
-does not, because the kernel never rounds its intermediate to bf16. The device
-gate probes all three in fp32 and reports 9.4e-8 worst relative error against
-`torch.autograd` of the eager chain.
+Chunk size was swept, 8 to 128 rows per program: 0.35-0.89 ms, best at 16 with a
+128-column block (the shipped `MOD_CHUNK`/`MOD_BLOCK`), and all sizes agree with
+float64 to 2-4e-7, so the constant is a tuning knob, not a correctness one.
 
 ---
 

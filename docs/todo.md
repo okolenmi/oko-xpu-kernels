@@ -215,10 +215,30 @@ Two notes for the next person:
       JSON API answers 404 now, which means no project by that name). The GitHub
       repo is `okolenmi/oko-xpu-kernels`, so the dist name and the repo name
       differ -- decide which one to publish under before the first upload.
-- [ ] `pip wheel` in CI and an sdist that carries `build/libxpuint8.so`. The
-      wheel is the thing that makes this installable without a DPC++ toolchain,
-      and it will only work for the oneAPI runtime it was built against (see
-      Build above), so it needs a versioned tag, not plain `latest`.
+- [x] `./wheel.sh` builds a wheel that *carries* `libxpuint8.so` (there is no
+      way to install it without a DPC++ toolchain -- the point is that the
+      consumer does not need one), plus `--sdist` for a source-only archive.
+      Staging matters: the `.so` goes into `xpu_kernels/int8/` because that is
+      where the loader looks first, and `wheel.sh` removes it again on exit
+      because a staged copy shadows `build/libxpuint8.so` for every later
+      in-tree run. `setup.py` exists only to stop bdist_wheel tagging the result
+      `py3-none-any`: it is `py3-none-linux_x86_64` (an ELF, but no CPython
+      extension -- the ABI is torch's), and it is *not* manylinux because
+      `libsycl.so.8` is linked, not bundled.
+      `MANIFEST.in` puts `src/`, `include/` and `build.sh` in the sdist (it
+      carried only Python before, so the documented "run ./build.sh" was
+      impossible for an sdist consumer), and keeps a `.so` out of it.
+      Verified end to end: extract the sdist, `./build.sh`, `python -m
+      xpu_kernels` on the card (every gate active); `pip install` from the sdist
+      reports `available() == False` until a `.so` is built. Install the wheel
+      into a scratch prefix: import, `available()` True, `linear` runs, and the
+      loader picks the bundled `.so` rather than the repo's. That check is now a CI step on the XPU runner
+      (which also gets `pip install -e .` -- it was missing, so the device job
+      could not have imported the package on a clean runner).
+- [ ] Publish a release, and with it the version tag: `0.2.0+oneapi2025.3`
+      (toolchain in the local segment), the repo name `okolenmi/oko-xpu-kernels`
+      versus the dist name `xpu-kernels`, and a README paragraph on which oneAPI
+      each wheel needs. Not done because there is no upload target yet.
 - [ ] `xpu-kernels bench` -- one CLI over the probes in `debug/` (they all take
       their shape as a constant today). Low value until someone else needs to
       reproduce a number.

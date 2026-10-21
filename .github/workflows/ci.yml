@@ -53,6 +53,11 @@ jobs:
       - name: Build libxpuint8.so
         run: ./build.sh
 
+      # The package is not importable from the repo root without this (it lives
+      # in python/), and the wheel build below needs the same metadata.
+      - name: Install the package
+        run: pip install -e . --no-deps && pip install pytest
+
       # The self-test is the whole point: it probes every gate against its
       # reference on this machine, so an upgrade that moves a value fails here
       # instead of changing a render.
@@ -63,3 +68,27 @@ jobs:
 
       - name: CPU-side tests on the XPU machine too
         run: python -m pytest -q
+
+      # The wheel is the artefact another project installs; it is built here
+      # because the .so has to come from a machine with oneAPI 2025.x, and
+      # installed again from a scratch prefix so a missing package-data entry or
+      # a wrong wheel tag fails here instead of at somebody's `pip install`.
+      - name: Wheel with libxpuint8.so
+        env:
+          PYTHON: python
+        run: ./wheel.sh
+
+      - name: Install the wheel into a scratch prefix
+        run: |
+          pip install --no-deps --target "$RUNNER_TEMP/whl" dist/*.whl
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$RUNNER_TEMP/whl" python - <<'PY'
+          import xpu_kernels
+          assert xpu_kernels.available(), "the wheel does not load its own .so"
+          print(xpu_kernels.__file__, xpu_kernels.device_name())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xpu-kernels-wheel
+          path: dist/*.whl

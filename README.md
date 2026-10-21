@@ -74,6 +74,22 @@ The library is optional at run time: if it is missing, the Python package says
 so once and every call raises; ComfyUI's equivalent path falls back to a pure
 torch implementation (4-6x slower, same numbers within INT8 noise).
 
+## Distribute
+
+```bash
+./wheel.sh                    # -> dist/xpu_kernels-0.2.0-py3-none-linux_x86_64.whl
+./wheel.sh --sdist            # source only: no .so, no toolchain needed
+```
+
+`wheel.sh` builds the `.so` first (with the pin above), stages it inside the
+package, and tags the result `linux_x86_64` rather than `any` -- the payload is a
+real ELF. It is not manylinux: the `.so` links `libsycl.so.8` and does not bundle
+it, so a wheel only works in a process using the oneAPI runtime it was built
+against. Tag a published release with that toolchain (`0.2.0+oneapi2025.3`)
+rather than publishing one "latest" wheel that quietly stops loading when oneAPI
+moves. The sdist installs without a toolchain and reports the library as
+unavailable until you run `./build.sh`.
+
 ## Use from Python
 
 Install it as a package -- that is what a consumer should do, and what ComfyUI

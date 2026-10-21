@@ -1,0 +1,26 @@
+# What the sdist carries beyond the package itself.
+#
+# The source archive is only useful if it can build libxpuint8.so, so the C++
+# source, the public headers and the pinned-toolchain build script go with it.
+# The Python side installs and imports without any of that (the library reports
+# itself unavailable); this is what turns it into a working install on a machine
+# with icpx.
+#
+# Not included: debug/ and benchmarks/. They are the evidence behind the docs
+# and several of them take absolute paths or sizes from this machine.
+
+include build.sh
+include wheel.sh
+include LICENSE
+include README.md
+
+recursive-include src *.cpp *.h
+recursive-include include *.h
+recursive-include reference *.py *.md
+recursive-include tests *.py
+recursive-include python *.py
+
+# Never ship a binary in the source archive: it would be tagged for whatever
+# runtime built it, and the point of the sdist is that it has none.
+exclude python/xpu_kernels/libxpuint8.so
+exclude python/xpu_kernels/int8/libxpuint8.so

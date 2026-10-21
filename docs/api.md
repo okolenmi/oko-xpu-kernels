@@ -33,10 +33,42 @@ activation paths are bit-identical to the unfused chains they replace.
 Composed paths and per-layer fallbacks:
 
 ```python
-y = xpu_kernels.ffn_situ(x, up8, up_s, down8, down_s)   # down(situ(up(x))), two GEMMs
+y = xpu_kernels.ffn(x, up8, up_s, down8, down_s, act="geglu_erf")  # the fused FFN
 reason = xpu_kernels.unsupported_reason(x, w8, w_scale)  # None, or why this shape cannot
 model.some_linear = xpu_kernels.Int8Linear.from_linear(model.some_linear)
 ```
+
+### The activations
+
+| name | id | form | used by |
+|---|---|---|---|
+| `gelu_tanh` | 1 | the tanh approximation, on `[.., K]` | MossImage |
+| `swiglu` | 2 | `silu(gate) * up`, on `[.., 2K]` as `[gate, up]` | — |
+| `situ` | 3 | `tanh(g/4)·sigmoid(g)·tanh(h/25)`, on `[.., 2K]` as `[hidden, gate]` | MossImage |
+| `geglu_erf` | 4 | `hidden * gelu(gate)`, on `[.., 2K]` as `[hidden, gate]` | **SDXL** |
+| `gelu_erf` | 5 | the erf GELU, on `[.., K]` | **SDXL** (diffusers' shape) |
+
+`xpu_kernels.ACTIVATIONS` is the map; `xpu_kernels.PAIRED_ACTIVATIONS` says
+which of them read a pair of halves. Every one of them is **bit-identical to
+the chain it replaces** — the erf GELU included, which was proved over all
+65 536 bf16 values (`debug/native/probe_gelu_exact.cpp`).
+
+### The fused FFN
+
+```python
+y = xpu_kernels.ffn(x, up_w8, up_scale, down_w8, down_scale, act="geglu_erf")
+```
+
+`up_w8` is `[2*ffn, K]` holding `[hidden | gate]` for a paired activation and
+`[ffn, K]` for an unpaired one; `down_w8` is `[K, ffn]`. The up-projection's
+int32 accumulator goes straight into the fused dequant+activation+rotate+
+quantize kernel, so the `[M, 2*ffn]` bf16 tile never exists — the FFN is two
+GEMMs and two kernels, not eight. The down-projection's epilogue is the
+ordinary one, so `down_bias` is free, but the up-projection must be unbiased
+(its bias would have to be added before the activation, inside the kernel).
+
+Measured at SDXL's shapes, the fused path is **1.2-1.5× faster than the
+unfused INT8 chain** (`debug/probe_sdxl_ffn.py`).
 
 `unsupported_reason` returns a *reason*, not a `None`: "K=384 is not a multiple
 of the ConvRot group size (256)". `linear` raises it as a `TypeError` with that

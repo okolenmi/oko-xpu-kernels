@@ -59,6 +59,35 @@ def test_pair_activation_wants_two_halves():
     assert "situ" in int8.unsupported_reason(_x(), _w(), _scale(), act="silu")
 
 
+def test_the_activation_set():
+    # the fused FFN's activations, and which of them read a pair of halves
+    assert set(int8.ACTIVATIONS) >= {"gelu_tanh", "swiglu", "situ",
+                                      "geglu_erf", "gelu_erf"}
+    assert "situ" in int8.PAIRED_ACTIVATIONS
+    assert "geglu_erf" in int8.PAIRED_ACTIVATIONS
+    assert "gelu_erf" not in int8.PAIRED_ACTIVATIONS
+
+
+def test_the_new_activations_in_the_argument_checks():
+    # SDXL's GEGLU is a paired activation: it wants two halves
+    reason = int8.unsupported_reason(_x(k=512), _w(k=512), _scale(),
+                                     act="geglu_erf")
+    assert "1024" in reason
+    # the erf GELU on its own is not
+    reason = int8.unsupported_reason(_x(k=512), _w(k=512), _scale(),
+                                     act="gelu_erf")
+    assert reason is None or "libxpuint8" in reason or "XPU" in reason
+
+
+def test_ffn_rejects_an_unknown_activation_before_anything_else():
+    with pytest.raises(TypeError) as exc:
+        int8.ffn(_x(), _w(), _scale(), _w(), _scale(), act="silu")
+    assert "silu" in str(exc.value)
+    with pytest.raises(TypeError) as exc:
+        int8.ffn(_x(), _w(), _scale(), _w(), _scale(), act="swiglu")
+    assert "swiglu" in str(exc.value)
+
+
 def test_group_size_multiple():
     # the activation has to match K, or the column check fires first
     assert "256" in int8.unsupported_reason(_x(k=384), _w(k=384), _scale())

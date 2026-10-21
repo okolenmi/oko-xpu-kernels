@@ -164,6 +164,34 @@ F16 situ_reg(F16 h, F16 g) {
     return (p * th).template convert<BF>().template convert<float>();
 }
 
+// The erf-GELU, 0.5 * x * (1 + erf(x / sqrt(2))).
+//
+// This is *bit-identical* to torch's F.gelu(approximate="none") on this
+// backend, for every bf16 input: debug/native/probe_gelu_exact.cpp compares
+// the two over all 65536 bf16 values and finds 0 mismatches.  The formula and
+// the order of the operations are the ones torch uses, the intermediate stays
+// in fp32, and the result is rounded to bf16 once at the end -- which is what
+// torch does with a bf16 input.
+//
+// (The tanh approximation above could be reproduced exactly for the same
+// reason: sycl::tanh and sycl::expm1 agree on every bf16.  The erf form was
+// not assumed to be reproducible -- oneDNN's erf was expected to differ from
+// SVML's -- and it turns out they do not differ.)
+F16 gelu_erf_reg(F16 x) {
+    return 0.5f * x * (1.0f + sycl::erf(x * 0.7071067811865476f));
+}
+
+// The activation ids.  A *paired* activation reads two halves of the input
+// (the model chunks `hidden, gate`); an unpaired one reads a single tensor.
+//
+//   0  none              1 input
+//   1  gelu_tanh         1 input    (the tanh approximation)
+//   2  swiglu            2 inputs   (gate first, up second)
+//   3  situ              2 inputs   (hidden first, gate second)
+//   4  geglu_erf         2 inputs   (hidden first, gate second) -- SDXL's GEGLU
+//   5  gelu_erf          1 input    -- the erf GELU on its own
+constexpr bool act_is_paired(int act) { return act == 2 || act == 3 || act == 4; }
+
 template <int ACT>
 F16 load_activated_reg(const uint16_t *gate, const uint16_t *up) {
     if constexpr (ACT == 0) {
@@ -178,6 +206,18 @@ F16 load_activated_reg(const uint16_t *gate, const uint16_t *up) {
         const F16 u = load_reg(up);
         const F16 silu = (g / (1.0f + sycl::exp(-g))).template convert<BF>().template convert<float>();
         return (silu * u).template convert<BF>().template convert<float>();
+    } else if constexpr (ACT == 4) {
+        // SDXL's GEGLU: the chunk is `x, gate`, and the block computes
+        // x * gelu(gate).  torch's chain is gelu(gate) in bf16, then the
+        // product of two bf16 values -- which is exact in fp32 and rounded
+        // once, so this is the same function.
+        const F16 h = load_reg(gate);
+        const F16 g = load_reg(up);
+        const F16 y = gelu_erf_reg(g).template convert<BF>().template convert<float>();
+        return (h * y).template convert<BF>().template convert<float>();
+    } else if constexpr (ACT == 5) {
+        const F16 x = load_reg(gate);
+        return gelu_erf_reg(x).template convert<BF>().template convert<float>();
     } else {
         // ACT == 3: MossImage's situ, see situ_reg.
         return situ_reg(load_reg(gate), load_reg(up));
@@ -186,29 +226,43 @@ F16 load_activated_reg(const uint16_t *gate, const uint16_t *up) {
 
 // Load one 16-element register of the hidden half and the matching register of
 // the gate half straight from the int32 GEMM accumulators, dequantize both, and
-// apply MossImage's situ activation.
+// apply the activation.
 //
-// This is the dequant epilogue and the situ quantizer fused into one pass: the
+// This is the dequant epilogue and the quantizer fused into one pass: the
 // up-projection GEMM writes int32 [M, 2K]; instead of dequantizing that to
 // bf16 [M, 2K] and reading it back, the quantizer reads the accumulator.
 //
 // The arithmetic is bit-identical to the unfused pair: launch_dequant_epilogue
 // computes `float(acc) * (w_scale * x_scale)` in fp32 and stores the bf16
-// rounding of it, so the situ input here is rounded to bf16 the same way
-// before the activation, and situ itself keeps exactly the steps of
-// load_activated_reg<3>.
-F16 load_dequant_situ_reg(const int32_t *hidden, const int32_t *gate,
+// rounding of it, so the activation's input here is rounded to bf16 the same
+// way before the activation, and the activation itself keeps exactly the
+// steps of load_activated_reg<ACT>.
+//
+// ACT == 5 is the unpaired form: the accumulator is [M, K] and the gate
+// pointers are unused.
+template <int ACT>
+F16 load_dequant_act_reg(const int32_t *hidden, const int32_t *gate,
                           const float *hidden_w, const float *gate_w, float x_scale) {
     const I32 hi = reinterpret_cast<const I32 *>(hidden)[0];
-    const I32 gi = reinterpret_cast<const I32 *>(gate)[0];
     const F16 hw = reinterpret_cast<const F16 *>(hidden_w)[0];
-    const F16 gw = reinterpret_cast<const F16 *>(gate_w)[0];
     // dequant, then the bf16 round that the bf16 store/reload used to impose
     F16 h = (F16(hi.convert<float>()) * (hw * x_scale))
                 .template convert<BF>().template convert<float>();
-    F16 g = (F16(gi.convert<float>()) * (gw * x_scale))
-                .template convert<BF>().template convert<float>();
-    return situ_reg(h, g);
+    if constexpr (ACT == 5) {
+        return gelu_erf_reg(h).template convert<BF>().template convert<float>();
+    } else {
+        const I32 gi = reinterpret_cast<const I32 *>(gate)[0];
+        const F16 gw = reinterpret_cast<const F16 *>(gate_w)[0];
+        F16 g = (F16(gi.convert<float>()) * (gw * x_scale))
+                    .template convert<BF>().template convert<float>();
+        if constexpr (ACT == 3) {
+            return situ_reg(h, g);
+        } else {
+            // ACT == 4: SDXL's GEGLU, hidden * gelu(gate)
+            const F16 y = gelu_erf_reg(g).template convert<BF>().template convert<float>();
+            return (h * y).template convert<BF>().template convert<float>();
+        }
+    }
 }
 
 // Round-to-nearest and clamp into the int8 range, entirely in vector registers.
@@ -266,9 +320,9 @@ void convrot_body(nd_item<1> it, const uint16_t *x, int8_t *qout, float *scale, 
                   const F16 &d3) {
     const size_t row = it.get_global_id(0) >> 4;
     const size_t lane = it.get_local_id(0) & 15;
-    const size_t input_K = ACT >= 2 ? K * 2 : K;  // swiglu (2) and situ (3) read a paired input
+    const size_t input_K = act_is_paired(ACT) ? K * 2 : K;  // a paired activation reads two halves
     const uint16_t *xr = x + row * input_K;
-    const uint16_t *ur = ACT >= 2 ? xr + K : nullptr;
+    const uint16_t *ur = act_is_paired(ACT) ? xr + K : nullptr;
 
     F16 amaxv(0.f);
 
@@ -403,7 +457,7 @@ void launch_convrot_quant_warp(queue &q, const uint16_t *x, int8_t *qout, float 
                                 size_t M, size_t K, bool wait) {
     const size_t n_groups = K / GS;
     const size_t wg = n_groups * SUBG;  // one work-group per row
-    const size_t input_K = ACT >= 2 ? K * 2 : K;  // swiglu (2) and situ (3) read a paired input
+    const size_t input_K = act_is_paired(ACT) ? K * 2 : K;  // a paired activation reads two halves
     const F16 c0 = h4_col(0, false), c1 = h4_col(1, false), c2 = h4_col(2, false),
               c3 = h4_col(3, false);
     const F16 d0 = h4_col(0, true), d1 = h4_col(1, true), d2 = h4_col(2, true),
@@ -417,7 +471,7 @@ void launch_convrot_quant_warp(queue &q, const uint16_t *x, int8_t *qout, float 
             const size_t sgid = lid / SUBG;  // which group of the row
             const size_t lane = lid % SUBG;  // which register of the group
             const uint16_t *xr = x + row * input_K;
-            const uint16_t *ur = ACT >= 2 ? xr + K : nullptr;
+            const uint16_t *ur = act_is_paired(ACT) ? xr + K : nullptr;
             const uint16_t *p = xr + sgid * GS + lane * 16;
             const uint16_t *up = ur ? ur + sgid * GS + lane * 16 : nullptr;
 
@@ -453,26 +507,32 @@ void launch_convrot_quant_warp(queue &q, const uint16_t *x, int8_t *qout, float 
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 1c: dequantize the up-projection accumulator, apply situ, rotate and
-// quantize -- one pass instead of dequant -> bf16 -> rotate+quantize.
+// Kernel 1c: dequantize the up-projection accumulator, apply the activation,
+// rotate and quantize -- one pass instead of dequant -> bf16 -> rotate+quantize.
 //
 // Same work decomposition as launch_convrot_quant_warp: a row is owned by a
 // whole work-group, and lane L of a sub-group holds register L (16 values) of
-// its ConvRot group. acc is int32 [M, 2K]; the hidden half is the first K
-// columns and the gate half the second K (the model chunks `hidden, gate`).
+// its ConvRot group.  For a paired activation (situ, geglu_erf) acc is int32
+// [M, 2K]; the hidden half is the first K columns and the gate half the
+// second K (the model chunks `hidden, gate`).  For the unpaired one
+// (gelu_erf) acc is int32 [M, K] and there is no second half.
 // x_scale is the per-row scale of the up-projection's input, w_scale the
 // per-column scale of its output.
 // ---------------------------------------------------------------------------
-void launch_dequant_situ_quant_warp(queue &q, const int32_t *acc, int8_t *qout,
-                                     float *scale, const float *x_scale,
-                                     const float *w_scale, size_t M, size_t K,
-                                     bool wait) {
+template <int ACT>
+void launch_dequant_act_quant_warp(queue &q, const int32_t *acc, int8_t *qout,
+                                   float *scale, const float *x_scale,
+                                   const float *w_scale, size_t M, size_t K,
+                                   bool wait) {
     const size_t n_groups = K / GS;
     const size_t wg = n_groups * SUBG;  // one work-group per row
     const F16 c0 = h4_col(0, false), c1 = h4_col(1, false), c2 = h4_col(2, false),
               c3 = h4_col(3, false);
     const F16 d0 = h4_col(0, true), d1 = h4_col(1, true), d2 = h4_col(2, true),
               d3 = h4_col(3, true);
+    constexpr bool paired = act_is_paired(ACT);
+    const size_t row_stride = paired ? 2 * K : K;
+    const size_t gate_off = paired ? K : 0;
 
     auto event = q.submit([&](handler &h) {
         sycl::local_accessor<float, 1> lmax(range<1>(n_groups), h);
@@ -482,11 +542,11 @@ void launch_dequant_situ_quant_warp(queue &q, const int32_t *acc, int8_t *qout,
             const size_t sgid = lid / SUBG;  // which group of the row
             const size_t lane = lid % SUBG;  // which register of the group
             const size_t off = sgid * GS + lane * 16;
-            const int32_t *ar = acc + row * (2 * K);
+            const int32_t *ar = acc + row * row_stride;
 
-            F16 v = load_dequant_situ_reg(ar + off, ar + K + off,
-                                          w_scale + off, w_scale + K + off,
-                                          x_scale[row]);
+            F16 v = load_dequant_act_reg<ACT>(ar + off, ar + gate_off + off,
+                                              w_scale + off, w_scale + gate_off + off,
+                                              x_scale[row]);
             v = inreg(v, c0, c1, c2, c3, d0, d1, d2, d3);
             const auto sg = it.get_sub_group();
             v = bfly_xor(sg, v, 1u, 2u);  // axis 2
@@ -760,7 +820,10 @@ int xpuint8_convrot_quantize_act(const void *x, int8_t *q, float *scale, int64_t
     if (activation == 1) return convrot_quantize<1>(*g_queue, x, q, scale, M, K, true);
     if (activation == 2) return convrot_quantize<2>(*g_queue, x, q, scale, M, K, true);
     if (activation == 3) return convrot_quantize<3>(*g_queue, x, q, scale, M, K, true);
-    set_error("activation must be 1 (GELU-tanh), 2 (SwiGLU) or 3 (situ)");
+    if (activation == 4) return convrot_quantize<4>(*g_queue, x, q, scale, M, K, true);
+    if (activation == 5) return convrot_quantize<5>(*g_queue, x, q, scale, M, K, true);
+    set_error("activation must be 1 (GELU-tanh), 2 (SwiGLU), 3 (situ), 4 (GEGLU) "
+              "or 5 (GELU-erf)");
     return 6;
 }
 
@@ -775,11 +838,17 @@ int xpuint8_convrot_quantize_act_stream(const void *sycl_queue, const void *x, i
     if (activation == 1) return convrot_quantize<1>(queue, x, q, scale, M, K, false);
     if (activation == 2) return convrot_quantize<2>(queue, x, q, scale, M, K, false);
     if (activation == 3) return convrot_quantize<3>(queue, x, q, scale, M, K, false);
-    set_error("activation must be 1 (GELU-tanh), 2 (SwiGLU) or 3 (situ)");
+    if (activation == 4) return convrot_quantize<4>(queue, x, q, scale, M, K, false);
+    if (activation == 5) return convrot_quantize<5>(queue, x, q, scale, M, K, false);
+    set_error("activation must be 1 (GELU-tanh), 2 (SwiGLU), 3 (situ), 4 (GEGLU) "
+              "or 5 (GELU-erf)");
     return 6;
 }
 
-// Fused dequantize + situ + rotate + quantize. acc is int32 [M, 2K].
+// Fused dequantize + activation + rotate + quantize.  For a paired activation
+// (situ, geglu_erf) acc is int32 [M, 2K] and w_scale has 2K entries; for the
+// unpaired one (gelu_erf) acc is int32 [M, K] and w_scale has K entries.
+// SwiGLU is not supported here: its chunk order is the opposite one.
 int dequant_act_quantize(queue &q, const void *acc, int8_t *qout, float *scale,
                          const float *x_scale, const float *w_scale, int64_t M,
                          int64_t K, int32_t activation, bool wait) {
@@ -791,13 +860,21 @@ int dequant_act_quantize(queue &q, const void *acc, int8_t *qout, float *scale,
         set_error("K must be divisible by the ConvRot group size (256)");
         return 3;
     }
-    if (activation != 3) {
-        set_error("dequant_act_quantize only supports activation 3 (situ)");
+    if (activation != 3 && activation != 4 && activation != 5) {
+        set_error("dequant_act_quantize supports activation 3 (situ), "
+                  "4 (GEGLU) or 5 (GELU-erf)");
         return 6;
     }
     try {
-        launch_dequant_situ_quant_warp(q, static_cast<const int32_t *>(acc), qout,
-                                       scale, x_scale, w_scale, M, K, wait);
+        if (activation == 3)
+            launch_dequant_act_quant_warp<3>(q, static_cast<const int32_t *>(acc), qout,
+                                            scale, x_scale, w_scale, M, K, wait);
+        else if (activation == 4)
+            launch_dequant_act_quant_warp<4>(q, static_cast<const int32_t *>(acc), qout,
+                                            scale, x_scale, w_scale, M, K, wait);
+        else
+            launch_dequant_act_quant_warp<5>(q, static_cast<const int32_t *>(acc), qout,
+                                            scale, x_scale, w_scale, M, K, wait);
     } catch (const exception &e) {
         set_error(std::string("dequant_act_quantize: ") + e.what());
         return 5;

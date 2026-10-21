@@ -184,4 +184,8 @@ def _flat2d(x):
     return x.reshape(-1, x.shape[-1]), x.shape
 
 
-ACTIVATIONS = {"gelu_tanh": 1, "swiglu": 2, "situ": 3}
+ACTIVATIONS = {"gelu_tanh": 1, "swiglu": 2, "situ": 3, "geglu_erf": 4, "gelu_erf": 5}
+
+#: The activations that read a *pair* of halves (``[hidden, gate]`` or
+#: ``[gate, up]``) rather than a single tensor.
+PAIRED_ACTIVATIONS = ("swiglu", "situ", "geglu_erf")

@@ -442,6 +442,38 @@ not add the ~2 ms it might be worth to the 6.4 above.
 
 ---
 
+## The SDXL FFN: the fused GEGLU against the unfused chain
+
+`debug/probe_sdxl_ffn.py`. SDXL's FFN is a GEGLU — `x, gate = proj(x).chunk(2,
+-1)`, `out = x * F.gelu(gate)` — with `proj` a Linear(1280 → 10240) and the
+second projection a Linear(5120 → 1280). The unfused INT8 chain writes the
+[M, 10240] bf16 tile, reads it back for the activation, writes the product and
+reads that again for the quantizer; the fused kernel reads the int32
+accumulator once and writes the int8 result.
+
+| M | fused | unfused | bf16 | fused / unfused |
+|---|---|---|---|---|
+| 4096 | 2.178 ms | 3.281 ms | 2.348 ms | **0.66×** |
+| 1024 | 0.567 ms | 0.794 ms | 0.576 ms | **0.71×** |
+| 256 | 0.376 ms | 0.467 ms | 0.186 ms | 0.81× |
+| 64 | 0.385 ms | 0.472 ms | 0.138 ms | 0.82× |
+
+**1.2-1.5× faster than the unfused INT8 chain**, and bit-identical to it
+(`debug/verify_ffn_geglu.py`). Below M≈1024 the INT8 path is host-bound
+(0.38 ms of host time, whatever the shape) while the bf16 path is not, so the
+bf16 column wins there — that is the same effect as in "The headline, at other
+shapes", and it is what a device-graph capture removes.
+
+The activation itself is the erf GELU, and it **is** reproducible bit for bit:
+`debug/native/probe_gelu_exact.cpp` compares `sycl::erf`'s GELU against
+torch's `F.gelu(approximate="none")` over all 65 536 bf16 values and finds 0
+mismatches. The tanh approximation could be reproduced for the same reason
+(`sycl::tanh` and `sycl::expm1` agree on every bf16); the erf form was
+expected *not* to be, because oneDNN's erf was not assumed to round like
+SVML's.
+
+---
+
 ## The hand-written GEMM is L2-bound, not DPAS-bound
 
 `debug/probe_gemm_shapes.py`. v3 reaches 43 TOPS = 12.5% of the 344 TOPS DPAS

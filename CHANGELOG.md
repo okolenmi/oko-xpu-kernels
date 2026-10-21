@@ -44,6 +44,35 @@
   `a2aacfda45409493a490b0402b61f850`). It is the check that a release is good,
   and it is a script now, not a habit.
 
+* **SDXL's activation is fused, and it is bit-exact.** The library now has
+  `geglu_erf` (SDXL's `hidden * gelu(gate)`, the GEGLU of ComfyUI and of the
+  training project) and `gelu_erf` (diffusers' plain GELU MLP), both fused
+  into the rotate+quantize kernel, so an SDXL FFN is two GEMMs and two
+  kernels instead of eight, and the `[M, 10240]` bf16 tile never exists.
+
+  The plan said this could not be done: the erf-GELU was expected to be
+  irreproducible against torch, because the tanh form could be reproduced
+  (`sycl::tanh` and `sycl::expm1` agree on every bf16) and oneDNN's erf was
+  not assumed to round like SVML's. **The measurement said otherwise**:
+  `debug/native/probe_gelu_exact.cpp` compares the two over all 65 536 bf16
+  values and finds **0 mismatches**. So the fused path is bit-identical to the
+  chain a model writes (`debug/verify_ffn_geglu.py` checks the whole FFN, the
+  half order and the capture).
+
+* **The FFN takes the activation as an argument.** `int8.ffn(x, up, up_s,
+  down, down_s, act=...)`, with `ffn_situ` kept as the name for MossImage's
+  one. The activations are `gelu_tanh`, `swiglu`, `situ`, `geglu_erf` and
+  `gelu_erf`; `xpu_kernels.ACTIVATIONS` is the map and
+  `xpu_kernels.PAIRED_ACTIVATIONS` says which of them read a pair of halves.
+
+* **Measured:** the fused FFN is **1.2-1.5× faster than the unfused INT8
+  chain** at SDXL's shapes (2.178 ms against 3.281 ms at M=4096), and at
+  parity with bf16 at the big M (0.93×).
+
+* The PNG gate is unchanged (`a2aacfda45409493a490b0402b61f850`) with the
+  rebuilt library, and `python -m xpu_kernels` now checks the fused GEGLU
+  against the unfused chain as part of the self-test.
+
 ## 0.3.0
 
 *Released after 0.2.0, which shipped the INT8 path, the two Triton kernels and

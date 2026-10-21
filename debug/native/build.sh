@@ -29,6 +29,7 @@ build_one "$HERE/probe_rotate_ablation.cpp"     probe_rotate_ablation
 build_one "$HERE/probe_epilogue.cpp"            probe_epilogue
 build_one "$HERE/probe_ffn_situ.cpp"            probe_ffn_situ
 build_one "$HERE/probe_tanh_exact.cpp"          probe_tanh_exact
+build_one "$HERE/probe_gelu_exact.cpp"          probe_gelu_exact
 build_one "$HERE/probe_lane_utilisation.cpp"    probe_lane_utilisation
 build_one "$HERE/probe_bf16_rotate.cpp"         probe_bf16_rotate
 build_one "$HERE/probe_load_store_width.cpp"    probe_load_store_width

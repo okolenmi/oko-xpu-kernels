@@ -79,16 +79,25 @@ weight's per-output-channel scale cannot fold into a single epilogue scale. It
 needs a new epilogue, not a new kernel. Only worth it if the memory saving
 becomes the binding constraint.
 
-## 6. SDXL: the fused FFN with an erf-GELU
+## 6. SDXL: the fused FFN with an erf-GELU — done
 
 SDXL's FFN is `Linear(1280→10240)` → `chunk` → `x * F.gelu(gate)` →
 `Linear(5120→1280)`, which is the same shape as the library's fused
-`ffn_situ`. The library's version is MossImage's activation; SDXL's is the
-erf-GELU, and **the erf-GELU cannot be reproduced bit-exactly against torch**
-(the tanh form could: the C code reproduces torch's steps). A fused kernel
-that changes the arithmetic moves the row's abs-max, which moves a whole row's
-int8 values, which changes the image — so this is a decision with a
-measurement, not a task. See `docs/sdxl.md`.
+`ffn_situ`. The library's version was MossImage's activation; SDXL's is the
+erf-GELU, and the plan said it could not be reproduced bit-exactly against
+torch.
+
+**It can.** `debug/native/probe_gelu_exact.cpp` compares `sycl::erf`'s GELU
+against torch's `F.gelu(approximate="none")` over all 65 536 bf16 values and
+finds 0 mismatches — oneDNN's erf and SVML's agree on every bf16 input, so
+the fused path is bit-identical to the chain a model writes
+(`debug/verify_ffn_geglu.py`).
+
+The library now has `geglu_erf` (SDXL's GEGLU) and `gelu_erf` (diffusers'
+shape), both fused into the rotate+quantize kernel, and `int8.ffn(...)` takes
+the activation as an argument (`ffn_situ` is the old name for one of them).
+The fused FFN is **1.2-1.5× faster than the unfused INT8 chain** at SDXL's
+shapes, and at parity with bf16 at the big M.
 
 ## 7. Small things
 
@@ -114,6 +123,7 @@ measurement, not a task. See `docs/sdxl.md`.
 | the fused NF4 dequantizer | 20.75 → 0.66 ms (31×), bit-exact, no scratch |
 | the fused weight dequantizer | 215 → 63 ms for 2.17 B parameters, bit-identical |
 | the SDXL parameter map and the speed at SDXL's shapes | 86 % of the parameters are INT8-eligible; the INT8 path is 2.5× faster on the FFN's down-projection and 1.5× slower on its up-projection (the int32 accumulator) — `debug/probe_sdxl_shapes.py`, `docs/sdxl.md` |
+| SDXL's activation in the fused FFN | `geglu_erf` and `gelu_erf`, bit-identical to torch's chains (the erf-GELU proved over every bf16 value); 1.2-1.5× faster than the unfused INT8 chain — `debug/verify_ffn_geglu.py` |
 | a 64-element ConvRot group | closed by measurement: the layers it would reach are 1.8 % of SDXL, not 15 % |
 | the rope and adaLN backwards | fused, differentiable, verified against autograd; the adaLN's modulation gradients are *more* accurate than the torch chain's |
 | the rotate's structural floor | closed by measurement: the floor is a property of the format (the row's abs-max is over the rotated row), not a missing kernel — `debug/native/probe_cross_lane.cpp` |

@@ -36,6 +36,7 @@ change:
 | `verify_rotate_scales.py` | the rotation against float64 (the eager bf16 bmm is up to 40 % wrong) |
 | `verify_published_wheel.sh` | the **published** wheel renders the recorded PNG md5 — the download, the install, the gate, and the server restart |
 | `verify_situ.py`, `verify_ffn_fusion.py`, `verify_qkv_rope_fuse.py` | the fused paths against the unfused chains |
+| `verify_ffn_geglu.py` | SDXL's GEGLU: the fused FFN against the chain a model writes, the half order, and the capture |
 | `verify_quant_lib.py` | the Triton quantizer against the torch chain, within the gate's budget |
 
 ## The probes (the ones that measure)
@@ -54,6 +55,7 @@ change:
 | `probe_alloc_cost.py` | how expensive are the temporaries? | `torch.empty` is 0.004 ms regardless of size |
 | `probe_load_ab.py` | paired A/B of two library builds | the method to use for any small effect |
 | `probe_sdxl_shapes.py` | the INT8-vs-BF16 ratio at **SDXL's** shapes and token counts | 2.5× faster on the FFN's down-projection, 1.5× slower on its up-projection (the int32 accumulator), and host-bound below M≈1024 |
+| `probe_sdxl_ffn.py` | the fused GEGLU FFN against the unfused INT8 chain | 1.2-1.5× faster, and at parity with bf16 at the big M |
 
 `bench_bf16_fair.py` is the one that matters most: the original
 `benchmarks/bench_pipeline.py` compares INT8 against a BF16 `linear()` that
@@ -81,6 +83,7 @@ Run any of them as `./debug/native/bin/<name> [args]`.
 | `probe_lane_utilisation` | do the 4 idle lanes at K=3072 cost 25 %? | no, it is a cache-size effect |
 | `probe_load_store_width` | do 64-byte loads help? | no |
 | `probe_tanh_exact` | is `expm1(2x)/(expm1(2x)+2)` bf16-identical to `tanh`? | yes, for every finite bf16 input |
+| `probe_gelu_exact` | can the erf-GELU be reproduced bit for bit? | yes: `sycl::erf`'s GELU matches torch's `F.gelu(approximate="none")` for all 65536 bf16 values (the reference is dumped by `debug/probe_gelu_torch.py`) |
 | `reproduce_reduce_over_group` | does `reduce_over_group` still kill the process? | not on driver 1.17.39758 — but no fix was ever claimed |
 
 `debug/native/rejected/` holds the experiments that did not work (the fp16

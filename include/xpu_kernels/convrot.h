@@ -50,7 +50,13 @@ int xpuint8_convrot_quantize_stream(const void *sycl_queue, const void *x, int8_
 
 // Apply a supported elementwise activation before rotation and quantization.
 // activation: 1 = GELU with tanh approximation, x is bf16 [M,K];
-//             2 = SwiGLU, x is bf16 [M,2*K] laid out as [gate, up].
+//             2 = SwiGLU, x is bf16 [M,2*K] laid out as [gate, up];
+//             3 = situ, x is bf16 [M,2*K] laid out as [hidden, gate];
+//             4 = GEGLU (SDXL's), x is bf16 [M,2*K] laid out as [hidden, gate],
+//                 the result being hidden * gelu(gate) with the erf GELU;
+//             5 = GELU with the erf form, x is bf16 [M,K].
+// In every case the output is int8 [M,K]: for a paired activation K is the
+// *half* width, so the input is 2*K wide.
 int xpuint8_convrot_quantize_act(const void *x, int8_t *q, float *scale, int64_t M,
                                  int64_t K, int32_t activation);
 int xpuint8_convrot_quantize_act_stream(const void *sycl_queue, const void *x, int8_t *q,
@@ -89,12 +95,15 @@ int xpuint8_dequant_epilogue_slice_stream(const void *sycl_queue, const int32_t 
                                           void *out, const float *x_scale,
                                           const float *w_scale, const float *bias,
                                           int64_t M, int64_t N, int64_t acc_row_stride);
-// Fused dequantize + activation + rotate + quantize. acc is int32 [M,2*K]: the
-// first K columns are the activation, the second K the gate. Applies
-// activation 3 (situ) to the dequantized pair, then rotates and quantizes the
-// first half into q (int8 [M,K]) with per-row scale. Equivalent to
-// xpuint8_dequant_epilogue followed by xpuint8_convrot_quantize_act(..., 3),
-// without the bf16 round trip. x_scale is [M], w_scale is [2*K].
+// Fused dequantize + activation + rotate + quantize.
+// For a paired activation (3 = situ, 4 = GEGLU) acc is int32 [M,2*K]: the
+// first K columns are the hidden half and the second K the gate. For the
+// unpaired one (5 = GELU-erf) acc is int32 [M,K] and there is no second half.
+// The activation is applied to the dequantized value, then the result is
+// rotated and quantized into q (int8 [M,K]) with a per-row scale --
+// equivalent to xpuint8_dequant_epilogue followed by
+// xpuint8_convrot_quantize_act(..., activation), without the bf16 round trip.
+// x_scale is [M]; w_scale is [2*K] for a paired activation and [K] otherwise.
 int xpuint8_dequant_act_quantize(const void *acc, int8_t *q, float *scale,
                                  const float *x_scale, const float *w_scale,
                                  int64_t M, int64_t K, int32_t activation);

@@ -15,6 +15,7 @@ import torch
 from .._capture import is_capturing
 from ._lib import (
     ACTIVATIONS,
+    PAIRED_ACTIVATIONS,
     _err,
     _flat2d,
     _lib,
@@ -66,7 +67,9 @@ def quantize_act(x, activation: str):
     x2, shape = _flat2d(x)
     m, k2 = x2.shape
     act = ACTIVATIONS[activation]
-    k = k2 // 2 if act != 1 else k2
+    # a paired activation consumes [.., 2K] and produces [.., K]; an unpaired
+    # one consumes [.., K] and produces [.., K]
+    k = k2 // 2 if activation in PAIRED_ACTIVATIONS else k2
     q = torch.empty((m, k), device=x.device, dtype=torch.int8)
     scale = torch.empty((m,), device=x.device, dtype=torch.float32)
     rc = fn(_stream(x.device), ctypes.c_void_p(x2.data_ptr()),
@@ -410,11 +413,11 @@ def unsupported_reason(x, w8, w_scale, act=None):
                 f"(the kernels consume bf16)")
     if w8.dtype != torch.int8 or w8.dim() != 2:
         return f"weight must be an int8 [N, K] tensor, got {w8.dtype} {tuple(w8.shape)}"
-    if act not in (None, "gelu_tanh", "swiglu", "situ"):
-        return (f"unknown activation {act!r}; expected None, 'gelu_tanh', "
-                f"'swiglu' or 'situ'")
+    if act is not None and act not in ACTIVATIONS:
+        return (f"unknown activation {act!r}; expected None or one of "
+                f"{', '.join(sorted(ACTIVATIONS))}")
     k = int(w8.shape[1])
-    want = k * 2 if act in ("swiglu", "situ") else k
+    want = k * 2 if act in PAIRED_ACTIVATIONS else k
     if x.shape[-1] != want:
         return (f"activation has {x.shape[-1]} columns but this weight wants "
                 f"{want} (K={k}{' with two halves' if want != k else ''})")
@@ -499,30 +502,43 @@ def dequant_slice(acc, x_scale, w_scale, bias=None):
 
 
 def dequant_act_quantize(acc, x_scale, w_scale, activation="situ"):
-    """Dequant, activate, rotate and quantize an up|gate accumulator in one pass.
+    """Dequant, activate, rotate and quantize an up-projection accumulator in one pass.
 
-    ``acc`` is int32 [M, 2K] holding [gate | up].  Returns ``(int8 [M, K],
-    fp32 [M])`` -- the quantized activation for the *next* INT8 linear, with
-    the bf16 intermediate never written.  This is what makes a
-    ``down(situ(up(x)))`` block two kernels instead of eight.
+    ``acc`` is int32 [M, 2K] holding [hidden | gate] for a paired activation
+    (``situ``, ``geglu_erf``) and int32 [M, K] for an unpaired one
+    (``gelu_erf``).  Returns ``(int8 [M, K], fp32 [M])`` -- the quantized
+    activation for the *next* INT8 linear, with the bf16 intermediate never
+    written.  This is what makes a ``down(act(up(x)))`` block two kernels
+    instead of eight.
+
+    The activation ids are the C ones: ``situ`` 3, ``geglu_erf`` 4 (SDXL's
+    ``hidden * gelu(gate)``, with the erf GELU), ``gelu_erf`` 5.  SwiGLU is not
+    supported here: its chunk order is the opposite one.
     """
     lib = _lib()
     fn = getattr(lib, "xpuint8_dequant_act_quantize_stream", None)
     if fn is None:
         raise RuntimeError("this build has no fused dequant+activation+quantize")
-    if acc.dim() != 2 or acc.dtype != torch.int32 or acc.shape[1] % 2:
-        raise TypeError("acc must be an int32 [M, 2K] tensor")
-    m, k2 = acc.shape
-    k = k2 // 2
+    act_id = ACTIVATIONS[activation]
+    paired = activation in PAIRED_ACTIVATIONS
+    if acc.dim() != 2 or acc.dtype != torch.int32:
+        raise TypeError("acc must be an int32 [M, N] tensor")
+    m, n = acc.shape
+    if paired:
+        if n % 2:
+            raise TypeError(f"acc must be an int32 [M, 2K] tensor for {activation}, got {n} columns")
+        k = n // 2
+    else:
+        k = n
     q = torch.empty((m, k), device=acc.device, dtype=torch.int8)
     scale = torch.empty((m,), device=acc.device, dtype=torch.float32)
     # both scales are indexed per accumulator column/row, so both must be flat
     xs = expand_scale(x_scale, m, acc.device)
-    ws = expand_scale(w_scale, k2, acc.device)
+    ws = expand_scale(w_scale, n, acc.device)
     rc = fn(_stream(acc.device), ctypes.c_void_p(acc.data_ptr()),
             ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(scale.data_ptr()),
             ctypes.c_void_p(xs.data_ptr()), ctypes.c_void_p(ws.data_ptr()),
-            m, k, ACTIVATIONS[activation])
+            m, k, act_id)
     if rc != 0:
         _err(lib, "dequant_act_quantize")
     return q, scale
@@ -606,32 +622,50 @@ def linear(x, w8, w_scale, bias=None, act: Optional[str] = None, residual=None,
     return out if input_dtype == torch.bfloat16 else out.to(dtype=input_dtype)
 
 
-def ffn_situ(x, up_w8, up_scale, down_w8, down_scale, down_bias=None):
-    """``situ(up(x)) @ down.T`` with the bf16 intermediate never written.
+def ffn(x, up_w8, up_scale, down_w8, down_scale, down_bias=None, act="situ"):
+    """``act(up(x)) @ down.T`` with the bf16 intermediate never written.
 
-    ``up_w8`` is [2*ffn, K] holding ``[up | gate]`` and ``down_w8`` is
-    [K, ffn].  The up-projection's int32 accumulator goes straight into the
-    fused dequant+situ+rotate+quantize kernel (:func:`dequant_act_quantize`), so
-    the [M, 2*ffn] bf16 tile that the two-op form writes and reads again does
-    not exist.  The down-projection's epilogue is the ordinary one, so
-    ``down_bias`` is free but the up-projection must be unbiased (its bias would
-    have to be added before the activation, inside the fused kernel).
+    ``up_w8`` is [2*ffn, K] holding ``[hidden | gate]`` for a paired activation
+    (``situ``, ``geglu_erf``) and [ffn, K] for an unpaired one (``gelu_erf``);
+    ``down_w8`` is [K, ffn].  The up-projection's int32 accumulator goes
+    straight into the fused dequant+activation+rotate+quantize kernel
+    (:func:`dequant_act_quantize`), so the [M, 2*ffn] bf16 tile that the
+    two-op form writes and reads again does not exist.  The down-projection's
+    epilogue is the ordinary one, so ``down_bias`` is free but the
+    up-projection must be unbiased (its bias would have to be added before the
+    activation, inside the fused kernel).
+
+    The activations are the C ones: ``situ`` (MossImage's), ``geglu_erf``
+    (SDXL's ``hidden * gelu(gate)``) and ``gelu_erf``.  Each is bit-identical
+    to the eager chain it replaces -- the erf-GELU was proved over every bf16
+    value in ``debug/native/probe_gelu_exact.cpp``.
 
     Raises ``TypeError`` like :func:`linear`; see :func:`unsupported_reason`.
     """
+    if act not in ACTIVATIONS:
+        raise TypeError(f"unknown activation {act!r}; "
+                        f"known: {', '.join(sorted(ACTIVATIONS))}")
+    if act not in ("situ", "geglu_erf", "gelu_erf"):
+        raise TypeError(f"the fused FFN supports situ, geglu_erf and gelu_erf, "
+                        f"not {act!r}")
+    paired = act in PAIRED_ACTIVATIONS
     reason = unsupported_reason(x, up_w8, up_scale, None)
     if reason is not None:
         raise TypeError(reason)
     m, n, k = _dims(x, up_w8, None)
-    if n % 2 or (n // 2) % 256 or (n // 2) % 16:
-        raise TypeError(f"up-projection N={n} must be 2*ffn with ffn a multiple "
-                        f"of 256 (and of 16) for the fused situ epilogue")
+    if paired and n % 2:
+        raise TypeError(f"up-projection N={n} must be 2*ffn for the {act} "
+                        f"activation")
+    inner = n // 2 if paired else n
+    if inner % 256 or inner % 16:
+        raise TypeError(f"the FFN's inner width {inner} must be a multiple of "
+                        f"256 (and of 16) for the fused {act} epilogue")
     if down_w8.dtype != torch.int8 or down_w8.dim() != 2:
         raise TypeError(f"down weight must be an int8 [K, ffn] tensor, got "
                         f"{down_w8.dtype} {tuple(down_w8.shape)}")
-    if tuple(down_w8.shape) != (k, n // 2):
+    if tuple(down_w8.shape) != (k, inner):
         raise TypeError(f"down weight is {tuple(down_w8.shape)}, expected "
-                        f"{(k, n // 2)}")
+                        f"{(k, inner)}")
     if down_w8.device != x.device:
         raise TypeError(f"down weight is on {down_w8.device} but the activation "
                         f"is on {x.device}")
@@ -654,11 +688,19 @@ def ffn_situ(x, up_w8, up_scale, down_w8, down_scale, down_bias=None):
 
     xq, xs = quantize(x2)
     acc = torch._int_mm(xq, up_w8.t())
-    q2, xs2 = dequant_act_quantize(acc, xs, expand_scale(up_scale, n, device), "situ")
+    q2, xs2 = dequant_act_quantize(acc, xs, expand_scale(up_scale, n, device), act)
     acc2 = torch._int_mm(q2, down_w8.t())
     out = dequant(acc2, xs2, down_scale, down_bias)
     out = out.reshape(*x.shape[:-1], k)
     return out if input_dtype == torch.bfloat16 else out.to(dtype=input_dtype)
+
+
+def ffn_situ(x, up_w8, up_scale, down_w8, down_scale, down_bias=None):
+    """``situ(up(x)) @ down.T`` -- :func:`ffn` with MossImage's activation.
+
+    Kept as its own name because it is the one the MossImage path calls.
+    """
+    return ffn(x, up_w8, up_scale, down_w8, down_scale, down_bias, act="situ")
 
 
 class Int8Linear(torch.nn.Module):

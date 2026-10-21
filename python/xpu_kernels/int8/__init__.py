@@ -62,13 +62,14 @@ of its 7 bytes/element.  Those are the floors the kernels sit on; a kernel
 
 from __future__ import annotations
 
-from ._lib import available, device_name, load
+from ._lib import ACTIVATIONS, PAIRED_ACTIVATIONS, available, device_name, load
 from .ops import (
     Int8Linear,
     dequant,
     dequant_weight,
     dequant_weight_torch,
     dequant_act_quantize,
+    ffn,
     dequant_slice,
     expand_scale,
     ffn_situ,
@@ -89,9 +90,10 @@ from .ops import (
 from .selftest import selftest
 
 __all__ = [
-    "Int8Linear", "available", "dequant", "dequant_act_quantize",
+    "ACTIVATIONS", "Int8Linear", "PAIRED_ACTIVATIONS", "available",
+    "dequant", "dequant_act_quantize",
     "dequant_slice", "dequant_weight", "dequant_weight_torch", "device_name", "expand_scale",
-    "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
+    "ffn", "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
     "prepare_weight", "quantize", "quantize_act", "quantize_row",
     "quantize_row_torch", "rotate",
     "selftest", "unsupported_reason",

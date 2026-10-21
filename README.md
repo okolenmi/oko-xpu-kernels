@@ -46,6 +46,7 @@ Triton kernels, the C entry points — is in [`docs/api.md`](docs/api.md).
 | the row-quantizer (the gradient path) | 4.17 → **0.27 ms**, 9 kernel launches become 1 |
 | the NF4 dequantizer | 20.75 → **0.66 ms** (31×), bit-exact, no scratch |
 | the weight dequantizer (2.17 B parameters) | 215 → **63 ms**, bit-identical |
+| the fused FFN (dequant + activation + quantize in one pass) | **1.2-1.5×** over the unfused INT8 chain, bit-identical |
 | `rms_norm+rope` / `rms_norm+adaLN` | **2.34×** / **1.56×**, bit-exact, differentiable |
 | device-graph capture: host time per stage | 648-1282 → **40-82 µs** |
 

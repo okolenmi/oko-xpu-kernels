@@ -77,15 +77,21 @@ torch implementation (4-6x slower, same numbers within INT8 noise).
 ## Distribute
 
 ```bash
-./wheel.sh                    # -> dist/xpu_kernels-0.2.0-py3-none-linux_x86_64.whl
+./wheel.sh                    # -> dist/xpu_kernels-0.2.0-py3-none-manylinux_2_35_x86_64.whl
 ./wheel.sh --sdist            # source only: no .so, no toolchain needed
 ```
 
 `wheel.sh` builds the `.so` first (with the pin above), stages it inside the
-package, and tags the result `linux_x86_64` rather than `any` -- the payload is a
-real ELF. It is not manylinux: the `.so` links `libsycl.so.8` and does not bundle
+package, and tags the result with a platform, because the payload is a real
+ELF and `any` would be a lie. The tag is `manylinux_2_35_x86_64`: PyPI refuses
+the plain `linux_x86_64` that `bdist_wheel` produces ("unsupported platform
+tag"), and the manylinux number is the oldest glibc the payload may need --
+the `.so` here references `GLIBC_2.32` and no more. The tag is not a claim that
+the wheel is self-contained: the `.so` links `libsycl.so.8` and does not bundle
 it, so a wheel only works in a process using the oneAPI runtime it was built
-against. PyPI forbids local version identifiers (PEP 440), so the version stays
+against -- the same deal as Intel's own runtime wheels on PyPI.
+
+PyPI forbids local version identifiers (PEP 440), so the version stays
 plain and the toolchain is recorded in the tag and the release notes instead
 (`v0.2.0-oneapi2025.3`) -- a wheel that says which runtime it wants is better
 than a "latest" that quietly stops loading when oneAPI moves. The sdist installs

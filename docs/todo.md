@@ -254,10 +254,18 @@ Two notes for the next person:
       consumer with a different oneAPI patch release may lack the symbols --
       fail closed rather than publish something that cannot load. Rehearse with
       `workflow_dispatch` (builds, publishes nothing), then tag.
-      Remaining: create the `pypi` environment in repo settings (optional --
-      GitHub creates it implicitly), push the workflow, tag `v0.2.0`, and
-      re-run the PNG gate against the *published* wheel, not only the local
-      build.
+      Remaining: move the tag onto the current commit (the wheel's platform
+      tag was wrong, and a re-run of the failed job would use the workflow at
+      the tag's commit), then re-run the PNG gate against the *published*
+      wheel, not only the local build.
+      **PyPI does not accept the platform tag `linux_x86_64`** -- it answered
+      "400 Bad Request: Binary wheel ... has an unsupported platform tag" --
+      so the wheel is tagged `manylinux_2_35_x86_64` and the CI job builds on
+      ubuntu-22.04 (glibc 2.35) to match, checking the `.so` with `objdump -T`
+      so the tag cannot claim a glibc the payload does not need. The tag is
+      not a promise of self-containment: the `.so` links `libsycl.so.8`
+      unbundled, like Intel's own runtime wheels. Accepted tags are in
+      `warehouse/utils/wheel.py`.
 - [ ] `xpu-kernels bench` -- one CLI over the probes in `debug/` (they all take
       their shape as a constant today). Low value until someone else needs to
       reproduce a number.

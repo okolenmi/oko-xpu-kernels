@@ -24,11 +24,12 @@ name: release
 # because PyPI must not accept local versions (PEP 440) -- the toolchain lives
 # in the tag and the release notes instead.
 #
-# The jobs run on ubuntu-24.04 rather than ubuntu-latest, and that is not a
+# The jobs run on a pinned image rather than ubuntu-latest, and that is not a
 # detail: the wheel carries an ELF, and a wheel built against a newer glibc
-# does not load on an older one.  ubuntu-latest migrates to Ubuntu 26.04
-# (glibc 2.4x) as of 2026-10-19, and the machines that have oneAPI 2025.3 --
-# the ones this wheel is for -- are not all on the newest libc.
+# does not load on an older one.  The wheel job builds on ubuntu-22.04
+# (glibc 2.35) because that is what the manylinux_2_35_x86_64 tag claims, and
+# it checks the .so against that number.  ubuntu-latest migrates to Ubuntu
+# 26.04 (glibc 2.4x) as of 2026-10-19, which would make the tag a lie.
 #
 # The wheel is built here, on a GitHub-hosted runner, and not on a self-hosted
 # one: the .so needs a DPC++ compiler, and that compiler is a downloadable apt
@@ -52,6 +53,12 @@ permissions:
 
 env:
   ONEAPI_VERSION: 2025.3.2-832
+  # The platform tag of the wheel.  PyPI refuses the plain "linux_x86_64" that
+  # bdist_wheel produces ("unsupported platform tag"), so the tag is a
+  # manylinux one, and it names the oldest glibc the payload may need.  The
+  # wheel job builds on ubuntu-22.04 (glibc 2.35) and checks the .so against
+  # this number, so the tag cannot drift away from the binary.
+  XPUINT8_PLATFORM_TAG: manylinux_2_35_x86_64
 
 jobs:
   sdist:
@@ -94,7 +101,10 @@ jobs:
           path: dist/*
 
   wheel:
-    runs-on: ubuntu-24.04
+    # glibc 2.35, because the wheel claims manylinux_2_35_x86_64.  Building on
+    # a newer base would make the tag a lie and pip would install a wheel that
+    # fails on the systems the tag claims to support.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
 
@@ -156,7 +166,8 @@ jobs:
       # There is no GPU on this runner, so the library cannot be initialised
       # here (xpuint8_init enumerates devices). What can be checked is that the
       # payload is where the loader looks for it, that it links the SYCL
-      # runtime the consumer's torch provides, and that the package imports and
+      # runtime the consumer's torch provides, that it does not need a glibc
+      # newer than the wheel's tag claims, and that the package imports and
       # reports "unavailable" instead of crashing.
       - name: The wheel carries a .so that links libsycl.so.8
         run: |
@@ -166,6 +177,19 @@ jobs:
           so="$RUNNER_TEMP/whl/xpu_kernels/int8/libxpuint8.so"
           test -f "$so" || { echo "the wheel does not carry the .so where the loader looks"; exit 1; }
           readelf -d "$so" | grep -q 'libsycl\.so\.8' || { echo "the .so does not link libsycl.so.8"; exit 1; }
+
+          # The tag is a promise about glibc; the .so must not need more.
+          tag="$XPUINT8_PLATFORM_TAG"
+          case "$tag" in manylinux_*) ;; *) echo "unexpected tag $tag"; exit 1;; esac
+          want=$(echo "$tag" | sed -E 's/^manylinux_([0-9]+_[0-9]+)_.*/\1/' | tr '_' '.')   # 2.35
+          need=$(objdump -T "$so" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "the .so needs glibc $need; the wheel claims $want"
+          python3 -c "import sys; sys.exit(0 if tuple(map(int, '$need'.split('.'))) <= tuple(map(int, '$want'.split('.'))) else 1)" \
+            || { echo "the .so needs glibc $need but the tag claims $want"; exit 1; }
+
+          # And the file itself must carry the tag, or PyPI will refuse it.
+          ls dist/*.whl | grep -q "$tag" || { echo "the wheel is not tagged $tag"; ls -1 dist; exit 1; }
+
           cd "$RUNNER_TEMP"
           PYTHONPATH="$RUNNER_TEMP/whl" python - <<'PY'
           import xpu_kernels

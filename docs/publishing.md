@@ -54,16 +54,33 @@ machine that does the timing measurements, and the job would queue forever.
 
 Two smaller things the runner pins, both learned the hard way:
 
-* **`ubuntu-24.04`, not `ubuntu-latest`.** The wheel carries an ELF, and a
-  wheel built against a newer glibc does not load on an older one.
-  `ubuntu-latest` migrates to Ubuntu 26.04 (glibc 2.4x) as of 2026-10-19, and
-  the machines that have oneAPI 2025.3 are not all on the newest libc.
 * **setuptools in the interpreter.** The wheel is built with
   `--no-build-isolation`, so the build backend has to be importable where pip
   runs. A 3.12 venv from the runner image has none (ensurepip stopped
   shipping it), and the first run of this workflow died with
   `Cannot import 'setuptools.build_meta'`. `wheel.sh` now says so in one line
   instead of letting pip say it in a stack trace.
+* **The platform tag is `manylinux_2_35_x86_64`, and the job builds on
+  ubuntu-22.04 to match it.** PyPI does not accept the plain `linux_x86_64`
+  that `bdist_wheel` produces -- it answered "400 Bad Request: Binary wheel
+  ... has an unsupported platform tag 'linux_x86_64'" -- and its list of
+  accepted tags is `any`, `win*`, the legacy `manylinux1/2010/2014`, and the
+  PEP 600/656 `manylinux_X_Y_arch` / `musllinux_X_Y_arch` families
+  (`warehouse/utils/wheel.py`). The number in the tag is a promise: pip will
+  not install the wheel on an older glibc, and the build must not reference
+  symbols newer than the tag claims. The job therefore builds on ubuntu-22.04
+  (glibc 2.35) and checks the `.so` with `objdump -T`; a `.so` that needs a
+  newer glibc fails the release instead of shipping a wheel that breaks on the
+  systems the tag claims to support.
+
+  The tag is *not* a claim that the wheel is self-contained: the `.so` links
+  `libsycl.so.8` and does not bundle it, so the wheel needs the oneAPI 2025.x
+  runtime at run time. That is the same deal as Intel's own runtime wheels on
+  PyPI, which are manylinux-tagged and depend on an external runtime of their
+  own. The release notes say so.
+
+  The tag can be overridden with `XPUINT8_PLATFORM_TAG` for a build on a
+  different base; the CI check compares the two and fails if they disagree.
 
 The `device` job in `ci.yml` is a different thing and stays as it is: it needs
 a real GPU, so it is skipped unless the repository variable `XPU_RUNNER` is

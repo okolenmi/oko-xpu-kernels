@@ -232,10 +232,15 @@ float64 to 2-4e-7, so the constant is a tuning knob, not a correctness one.
 
 ## Graph capture: verified, and it is a host-time win
 
-`debug/verify_graph_capture.py` captures the fused rope forward **and** its
-backward for q and k in one `torch.xpu.XPUGraph`, replays it on new data, and
-compares against the eager path. Result: all four tensors (q/k outputs, q/k
-gradients) are bit-identical on replay.
+`debug/verify_graph_capture.py` captures two stages, replays them on new data,
+and compares against the eager path:
+
+* the fused rope forward **and** its backward for q and k, in one graph -- all
+  four tensors (q/k outputs, q/k gradients) bit-identical on replay;
+* the adaLN forward and backward, including both modulation gradients -- all
+  four tensors bit-identical. That one matters because its backward allocates a
+  6 MB partials buffer *inside* the captured region (the two-stage reduction),
+  which is exactly the allocation pattern the graph pool has to absorb.
 
 Two things this settles:
 
@@ -253,15 +258,17 @@ Device time is unchanged by the graph (four kernels either way; at the
 production shape 1.15 ms eager vs 1.15 ms of graph work plus the static-input
 copies). The win is host time, which is what a launch-bound step pays:
 
-| at S=256, where the host is the limit | host per step |
-|---|---|
-| eager: autograd engine + the torch chain | 648-694 µs |
-| graph replay | 73-81 µs |
+| at S=256, where the host is the limit | rope | adaLN |
+|---|---|---|
+| eager: autograd engine + the torch chain | 648-1282 µs | 632 µs |
+| graph replay | 40-82 µs | 40 µs |
 
-**~9x less host time per rope stage** (the range is run-to-run variance, and the
-device time in those runs was 0.33-0.68 ms, so the measurement is not
-device-limited). For the 42-block model that is ~24 ms/step of host budget back,
-which matters because the trainer's step is ~22 300 launches at ~48 µs each.
+**8-16x less host time per stage.** The ranges are run-to-run variance on an
+interactive desktop (the device time in those runs was 0.33-0.68 ms, so the
+measurement is not device-limited); the eager number is the one that grows with
+the number of kernels, and it is the one a launch-bound step pays. Across 42
+blocks that is ~25-50 ms/step of host budget back, which matters when the step
+is ~22 300 launches at ~48 µs each.
 
 ---
 

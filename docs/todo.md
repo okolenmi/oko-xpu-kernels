@@ -78,10 +78,11 @@ the loss curve, not the per-element relative error.
 The trainer needs the whole step capturable: no host sync, no fresh allocations
 during the step, no shapes that depend on values.
 
-**Verified for the rope stage** (`debug/verify_graph_capture.py`): forward and
-backward for q and k captured in one `torch.xpu.XPUGraph`, replayed on new data,
-bit-identical to eager in all four tensors. Host time per stage 648-694 us ->
-73-81 us (~9x).
+**Verified for rope and adaLN** (`debug/verify_graph_capture.py`): forward and
+backward captured in one `torch.xpu.XPUGraph` for each, replayed on new data,
+bit-identical to eager in all eight tensors -- including adaLN's modulation
+gradients, whose two-stage reduction allocates a partials buffer inside the
+capture. Host time per stage 648-1282 us -> 40-82 us (8-16x).
 
 What that changed in the plan:
 
@@ -96,8 +97,14 @@ What that changed in the plan:
 
 Still open:
 
-- [ ] the same capture verification for `adaln` (forward; backward once item 3
-      lands) and for the INT8 `linear_dx` GEMM.
+- [x] the same capture verification for `adaln`, including both modulation
+      gradients and the partials buffer its backward allocates inside the
+      capture: bit-identical replay. Host cost 632 -> 40 us per stage.
+- [ ] the INT8 side needs no capture test of its own: `linear_dx` is one
+      `torch.matmul` and `linear_dx_int8` is `_int_mm` plus elementwise torch,
+      all of which are torch's business inside a graph. What *is* ours is
+      `dequant_weight`, which runs once before capture and must not be inside
+      one -- it allocates a second copy of the weight.
 - [ ] decide the fallback policy: `reference.rms_rope_backward` allocates ~10
       tensors and is not what anyone wants inside a capture. The gate is latched
       per process, so the practical answer is "check `status()` at startup, fail

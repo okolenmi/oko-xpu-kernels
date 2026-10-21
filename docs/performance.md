@@ -547,20 +547,58 @@ capture, which removes the launches altogether.
 
 ## What is left
 
-One bottleneck, and it is a hardware-shape constraint rather than a missing
-optimisation:
+**The rotate's structural floor is not reachable, and the last open shape
+cannot be built at the shapes that matter.** This took a measurement to
+establish (`debug/native/probe_cross_lane.cpp`), and the answer is not the one
+the notes above predicted.
 
-> The rotate must hold 256 floats (16 zmm) live across load → row abs-max →
-> quantize. That costs 3.1x versus an interleaved access pattern, and it is why
-> the rotate runs at 138 GB/s instead of 600.
+The constraint is not really "16 registers live": it is that **the row's
+abs-max is over the row**, and the row's values only exist after the
+rotation. So every element of a row waits for every element of that row to be
+transformed -- the load, the transform, the scale and the store are serialised
+per row, whatever the register pressure is. The 3.1x in the copy-loop
+experiment is that serialisation, not the spilling.
 
-Closing it needs one group split across 4 lanes with a single cross-lane axis.
-A 512-bit cross-lane exchange needs 16 `select_from_group` calls, so the same
-verdict as the shared-memory version is expected — but it is the only shape
-that has not actually been implemented.
+The shape that was left to try is a group split across 4 lanes with a single
+cross-lane axis (the axis-3 butterfly moves across the lanes, the axis-2 one
+stays inside). The measurements:
 
-**If the rotate reached its 0.27 ms structural floor, INT8 would be ~35%
-faster than BF16 instead of at parity.**
+| | measured |
+|---|---|
+| one cross-lane exchange, 512 bits, vector form | **84 ns** (a scalar `select_from_group` is 17.3 ns, so the 512-bit move costs about five of them, not sixteen) |
+| exchanges the split needs, per lane per row | 12 at K=1024, **36 at K=3072**, 96 at K=8192 |
+| what that costs | ~1 us at K=1024, ~3 us at K=3072 -- **negligible** against a prize of 250 us |
+
+So the exchange is *not* the obstacle, and the "16 `select_from_group` calls
+per exchange" figure overstates it by 3x. The obstacle is the **reduction
+domain**:
+
+| K | groups per row | lane-slots if each group is split 4 ways | sub-groups of 16 lanes |
+|---|---|---|---|
+| 1024 | 4 | 16 | **1** -- feasible |
+| 3072 (the model's) | 12 | 48 | 3 -- the row's abs-max would have to cross them |
+| 8192 (the FFN's) | 32 | 128 | 8 -- likewise |
+
+A row's scale is reduced inside one sub-group today. Split the groups and the
+row's scale would have to cross sub-groups, which means shared memory and a
+barrier (measured at 1.33 ms for the staging variant) or a second pass
+(0.75 ms) -- both far worse than the 0.402 ms the rotate costs now. And if the
+16-lane sub-group is kept and each lane takes three quarter-groups instead,
+the pressure only falls from 16 registers to 12, which is not what the
+interleaving needed.
+
+At K=1024 the split *is* buildable (one sub-group, 12 exchanges, ~1 us). It
+would be worth a try there -- but K=1024 is not a shape this model has, and
+the model is what the library is for.
+
+**The only route to the 0.27 ms floor left is to change the format**: a scale
+per block instead of per row would let each block's stores proceed
+independently, but it changes the numbers (the scale is part of the
+quantization), so it is a design decision with its own gate, not an
+optimisation of this one. The practical consequence for the headline stands:
+**INT8 stays at parity with BF16, not 35 % faster**, and the gap is a
+property of the format rather than a missing kernel.
+
 ---
 
 ## Timing discipline

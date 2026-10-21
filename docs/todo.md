@@ -340,19 +340,25 @@ Two notes for the next person:
 
 ## 6. Opportunities measured, not taken
 
-- [ ] **the rotate's register residency -- the headline's next step.** The
-      rotate must hold 256 floats (16 zmm) live across load -> row abs-max ->
-      quantize, which costs 3.1x versus an interleaved access pattern: it runs
-      at 138 GB/s instead of 600. The one shape that has not been implemented is
-      a group split across 4 lanes with a single cross-lane axis (a 512-bit
-      cross-lane exchange needs 16 `select_from_group` calls, so the verdict is
-      expected to be the same as the shared-memory version -- but it is the
-      only shape left). **If the rotate reaches its 0.27 ms structural floor,
-      INT8 goes from parity with BF16 to ~35 % faster** (`docs/performance.md`,
-      "What is left"). This is the most valuable thing left inside the
-      library: it is the difference between "INT8 matches bf16" and "INT8
-      beats bf16 by a third", and it is a self-contained piece of ESIMD work
-      with a measured target and a known floor.
+- [x] **the rotate's register residency -- closed, and not buildable.** The
+      rotate is 3.1x off its floor because the row's abs-max is over the
+      *rotated* row, so every element of a row waits for every other element
+      of that row to be transformed: the load, the transform, the scale and
+      the store are serialised per row, whatever the register pressure is.
+      The last open shape (a group split across 4 lanes, one cross-lane axis)
+      was measured rather than guessed
+      (`debug/native/probe_cross_lane.cpp`): the exchange is *cheap* -- 84 ns
+      per 512-bit move, 36 per lane per row at K=3072, ~3 us against a 250 us
+      prize, and the "16 `select_from_group` calls" figure overstates it by
+      3x -- but splitting the groups makes the row's scale cross sub-groups
+      (3 at K=3072, 8 at K=8192), which means a barrier (1.33 ms) or a second
+      pass (0.75 ms), both worse than the 0.402 ms the rotate costs now.
+      Keeping the 16-lane sub-group and giving each lane three quarter-groups
+      only drops the pressure from 16 registers to 12, which is not what the
+      interleaving needed. So **INT8 stays at parity with BF16**, and the gap
+      is a property of the format, not a missing kernel. The only route left
+      is a scale per *block* instead of per row -- which changes the numbers,
+      so it is a design decision with its own gate, not an optimisation.
 - [x] **a fused NF4 dequantizer** (trainer-facing). `xpu_kernels.triton.nf4`:
       the QLoRA storage format (16 normal quantiles, a per-block absmax, two
       4-bit indices per byte) dequantized in one kernel. 100 M parameters:

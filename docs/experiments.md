@@ -83,6 +83,7 @@ serialisation, not the reduce.
 | AOT `spir64_gen12` | unavailable | this compiler accepts only generic `spir64` |
 | idle lanes (4/16 idle at K=3072) | not a cost | K=1024 with 4/16 busy is the *fastest* per element — cache size |
 | 2 / 4 rows per work-group | **0.76 / 0.42 ms** | 1.6-3x loss |
+| group split across 4 lanes, one cross-lane axis | **not buildable at K=3072** | the exchange is cheap (84 ns per 512-bit move, 36 of them per lane per row = ~3 us against a 250 us prize) but the row's abs-max would have to cross 3 sub-groups; see `docs/performance.md`, "What is left", and `debug/native/probe_cross_lane.cpp` |
 
 ---
 

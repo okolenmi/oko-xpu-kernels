@@ -206,21 +206,27 @@ cannot reach** (item 4).
 
 The numbers above are from the library's probe (the denoiser alone, batch 1).
 The trainer's own command line (`--resolution 512 --batch 4 --rank 16
---batch-area 1.5 --param adapter.base_precision=int8 --graph`) says the same
-thing about the whole step:
+--batch-area 1.5 --param adapter.base_precision=int8 --param
+buckets.max_shapes=4`) says the same thing about the whole step — the
+minimum over the steps of one shape:
 
-| run | the replayed step | the live memory |
-|---|---|---|
-| int8 base, **no** `buckets.max_shapes` | **never replays** (0 in 20 steps) | 3489 MB |
-| int8 base, `buckets.max_shapes=4` | 1452 ms (12 replays in 24) | 3489 MB |
-| **bf16** base, `buckets.max_shapes=4` | 1324 ms (12 replays in 24) | 5548 MB |
-| int8 base, `int8_grad=int8`, `max_shapes=4` | 1481 ms (12 replays in 24) | 3489 MB |
+| base | eager (no graph) | replayed (graph) | the graph's effect | live memory |
+|---|---|---|---|---|
+| **bf16** | **1134 ms** | 1324 ms | **−14 % — the graph is slower** | 5546 MB |
+| **int8** | 1550 ms | **1452 ms** | +6 % | 3489 MB |
 
-* **The step is device-bound, not host-bound**: the graph buys **1.16×** here
-  (1539 ms eager → 1324 ms replayed), not the 2× the old tree's numbers show.
-  The host is ~15 % of the step.
-* **The int8 base costs +10-12 % and saves 2.06 GB** — the same +10-12 % the
-  probe measures, so the int8 base does what the library says.
+* **The step is device-bound.** A replay is one launch, so its 1324 ms is
+  pure device time, and the eager step's wall is 1134 ms. The host is not the
+  bottleneck here — that was the old tree, where the step had enough host
+  work for the graph to be worth 2×.
+* **The graph costs 17 % of the device time** — a replay is *slower* than the
+  same work executed eagerly. The graph's private pool holds ~2 GB more than
+  the eager run, and the pool's memory layout costs the device time. The
+  int8 base reduces that penalty (its 2 GB of headroom is why its graph
+  penalty is 6 %), which is the same effect from the other side.
+* **The int8 base is a memory trade that needs the graph to be cheap:**
+  +37 % eagerly (it launches about twice the kernels), +10 % replayed, and
+  2.06 GB of live memory freed (5546 → 3489 MB).
 * **`buckets.max_shapes` is the difference between a graph and no graph.**
   Without it every step's shape is new, the graph's three-sighting warm-up
   never completes, each new shape costs 4-5 s to compile and capture, and the
@@ -234,7 +240,9 @@ of a training step — the data, the conditioning, the optimizer's update, the
 residency accounting — is outside the capture and keeps its host cost, so
 "the capture removes the host cost" is only true of the region it captures.
 
-The next lever inside that region is the checkpointing's recompute, which
+But in the trainer's current step even that is not a win: the step is
+device-bound, and the capture's pool costs 17 % of the device time (above).
+The next lever inside the region is the checkpointing's recompute, which
 under the capture is a device cost:
 
 | | eager step | **captured step** | host time | aten calls | peak |

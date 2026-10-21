@@ -120,12 +120,13 @@ jobs:
       - name: Install the build backend
         run: pip install "setuptools>=77"
 
-      # The compiler is several GB installed; the runner ships a few GB of
-      # toolchains this project will never use.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          df -h /
+      # No cleanup step.  Deleting the runner's dotnet/Android/GHC trees was a
+      # precaution for images with a small disk, and it cost more time than the
+      # compiler install: those are tens of thousands of small files, so the
+      # removal is I/O bound and takes minutes.  The runner has ~100 GB free
+      # and oneAPI needs about 6, so there is nothing to buy here.
+      - name: Disk space
+        run: df -h /
 
       - name: Install the pinned oneAPI compiler
         run: |

@@ -215,10 +215,15 @@ minimum over the steps of one shape:
 | **bf16** | **1134 ms** | 1324 ms | **−14 % — the graph is slower** | 5546 MB |
 | **int8** | 1550 ms | **1452 ms** | +6 % | 3489 MB |
 
-* **The step is device-bound.** A replay is one launch, so its 1324 ms is
-  pure device time, and the eager step's wall is 1134 ms. The host is not the
-  bottleneck here — that was the old tree, where the step had enough host
-  work for the graph to be worth 2×.
+* **The trainer's step is device-bound; the same UNet at batch 1 is not.** A
+  replay is one launch, so its 1324 ms is pure device time, and the eager
+  step's wall is 1134 ms. But that is a property of *this* step, not of the
+  model: at batch 1 the same UNet's forward+backward is **launch-bound** — the
+  eager step is 359 ms of wall while the captured one is 205 ms of device
+  time, so 43 % of the eager step is the host waiting to issue kernels. Batch
+  3 makes the GEMMs big enough that the device catches up and passes the
+  host. The rule: **the graph pays where the step is launch-bound, and that
+  is decided by the batch size and the resolution, not by the graph.**
 * **The graph costs 14 % of the step, and the reason is the attention.** The
   capture forces `sdpa_kernel(EFFICIENT_ATTENTION)` (the flash kernel cannot
   be captured — it uses the work-group scratch memory, which the SYCL Graph

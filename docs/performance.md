@@ -270,6 +270,70 @@ is ~22 300 launches at ~48 µs each.
 
 ---
 
+## The SDXL UNet on this card: launch-bound at batch 1, device-bound at batch 3
+
+The same model, measured two ways: the *wall* (what a user waits for), the
+device time (the kernels' own time, from the profiler and from a capture), and
+a **captured replay**, which is the device time with the host's launch work
+removed. The capture is the decisive measurement: a replay is one launch, so
+whatever the eager path spends beyond the replay's time is host time.
+
+ComfyUI's own SDXL UNet (random weights, bf16, batch 1, the flash attention):
+
+| | the wall | the device (the kernels' sum) | the captured replay |
+|---|---|---|---|
+| 512×512 | 106.5 ms | 36.7 ms (1865 launches) | **46.0 ms** |
+| 1024×1024 | 125.9 ms | 118.5 ms (1865 launches) | 174.3 ms (the math attention) |
+
+**At 512×512 the device is idle 66 % of the time** — the eager forward is
+launch-bound, and a graph would replace 106.5 ms with ~46 ms, a **2.3x** win on
+the UNet forward. At 1024×1024 the device is 94 % busy: the graph buys ~6 %, and
+with the attention a capture is forced to use it *loses* 43 % (see below).
+
+The trainer's UNet, the same architecture, the same conclusion at batch 1 and
+the opposite one at batch 3:
+
+| | the eager wall | the captured replay (the math attention) |
+|---|---|---|
+| 512×512, batch 1, forward+backward | 359.4 ms | 205.3 ms |
+| 512×512, batch 3, forward+backward | 335.3 ms | — |
+
+So the rule is not "the graph is good" or "the graph is bad": **the graph pays
+where the step is launch-bound**, and that is a property of the batch size and
+the resolution. Batch 3 makes the GEMMs big enough that the device catches up
+with the host and passes it, which is why the trainer's step sees a *loss* and
+ComfyUI's inference at 512² sees a 2.3x win.
+
+### The attention a capture is forced to use
+
+The flash attention cannot be captured on this stack: it uses the work-group
+scratch memory, which the SYCL Graph extension does not support.
+
+```
+RuntimeError: The sycl_ext_oneapi_work_group_scratch_memory feature is not
+yet available for use with the SYCL Graph extension.
+```
+
+A capture therefore has to run the **math** attention, which on XPU is also
+what `EFFICIENT_ATTENTION` falls back to (it is not supported there either).
+The cost of that substitution, measured on this trainer's UNet (512×512,
+batch 1, device time by events):
+
+| attention | the forward | forward+backward |
+|---|---|---|
+| the default (flash) | 120.8 ms | 402.9 ms |
+| `EFFICIENT_ATTENTION` (→ math on XPU) | 163.4 ms | **558.5 ms** |
+| `MATH` | 164.3 ms | 548.3 ms |
+
+**+36 % of the device time** for the training step, and **+25 %** for
+ComfyUI's 512×512 forward (the math's device time 46 ms against the flash's
+36.7 ms). So the capture is worth 2.3x at 512×512 *even with the math
+attention*, and it is a loss at 1024×1024. Making the flash attention
+capturable is what would make the graph a win everywhere — a runtime
+limitation, and worth reporting upstream.
+
+---
+
 ## INT8 backward: `dL/dx = dy @ W`
 
 There is no kernel here, and that is the finding. `linear_dx` is one bf16 GEMM,

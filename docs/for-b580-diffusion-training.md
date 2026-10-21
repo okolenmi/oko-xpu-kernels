@@ -54,7 +54,7 @@ one-line escape hatch:
 
 | file | fused | measured here | note for training |
 |---|---|---|---|
-| `xpu_kernels/triton/adaln.py` | RMSNorm + adaLN scale/shift in one pass over the row | 25 → 16 ms/step (**1.56×**), bit-exact | forward only. Autograd wrapper needed: run the kernel under `no_grad` in forward, recompute the norm in backward (or write a Triton backward) |
+| `xpu_kernels/triton/adaln.py` | RMSNorm + adaLN scale/shift in one pass over the row | 25 → 16 ms/step (**1.56×**), bit-exact | **differentiable now**: one kernel for `dx` + a reduction for `dscale`/`dshift`; fwd+bwd 3.9× vs the eager chain, 9.4e-8 against autograd. Works with every modulation shape a trainer passes |
 | `xpu_kernels/triton/rope.py` | RMSNorm + rope in one pass; also reads the INT8 GEMM accumulator directly | rope alone **2.34×** (35.7 → 15.3 ms/forward), bit-exact | **differentiable now**: fused backward, fwd+bwd **14.3×** vs the eager chain (0.62 vs 8.88 ms per tensor), gradient closer to float64 than autograd's |
 | `src/xpuint8.cpp` `situ_reg` | situ with `expm1` tanh | −0.41 ms/call, −34.7 ms/step | see §3 — this one is a *finding*, not just code |
 | `xpu_kernels/int8/ops.py` | INT8 weight → the backward's `dx = dy @ W` | exact vs the same GEMM in autograd, 0.9% from the unquantized weight (that *is* the INT8 weight), dequant is one-time (~0.4 s for 3.7B) | `dequant_weight` + `linear_dx`, or `Int8Linear.dx(dy)`. `dW` and a quantized-`dy` variant are still open — `docs/todo.md` |

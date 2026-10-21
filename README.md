@@ -180,6 +180,11 @@ The gate itself is shared and tested on CPU (`tests/test_gate.py`): it coalesces
 the process", and "never pass a probe that could not run". `docs/adding-a-kernel.md`
 is the checklist for a new kernel, including the backward-pass rules.
 
+`rms_adaln` is differentiable too: the backward is one kernel for `dx` plus a
+reduction for `dscale`/`dshift` (sums over the rows the modulation was broadcast
+across), 3.9× faster than the eager chain forward+backward and verified against
+`torch.autograd` at 9.4e-8.
+
 `rms_rope_split_half` is differentiable: with a grad-requiring input it routes
 through an `autograd.Function` whose backward is a single fused kernel (the
 per-head `dot` product never leaves registers, so there is no scratch buffer and
@@ -233,7 +238,7 @@ C API and `docs/architecture.md` for the algorithm.
 | Row-strided dequant epilogue | working, bit-identical; lets a q|k|v GEMM drop the q/k epilogue entirely |
 | Triton `rms_norm + rope` | working, **2.34×**, bit-identical to the shipped kernel (`num_warps=4` pinned) |
 | Triton rope **backward** | working, **14.3×** on fwd+bwd vs the eager chain, differentiable wrapper |
-| Triton `rms_norm + adaLN` | working, **1.56×**, bit-identical |
+| Triton `rms_norm + adaLN` | working, **1.56×**, bit-identical, **differentiable** (fwd+bwd 3.9× vs eager) |
 | INT8 `dL/dx` (weight-only) | working, **exact** vs the same GEMM in autograd, 0.9 % from the unquantized weight (that is the INT8 weight); dequant is one-time |
 | INT8 `dW`, quantized-`dy` gradient | **not implemented** — design and the scale-layout argument in [`docs/todo.md`](docs/todo.md) |
 | Device-graph capture | rope fwd+bwd captured in one `XPUGraph`, replay bit-identical, **host time 694 → 81 µs** per stage |

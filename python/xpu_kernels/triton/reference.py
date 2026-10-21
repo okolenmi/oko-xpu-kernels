@@ -32,6 +32,9 @@ import torch
 
 __all__ = [
     "SAME_ARITHMETIC_REL",
+    "rms_adaln",
+    "rms_adaln_backward",
+    "rms_adaln_normalized",
     "rms_norm",
     "rms_rope_backward",
     "rms_rope_split_half",
@@ -106,7 +109,7 @@ def rms_rope_backward(dy: torch.Tensor, x: torch.Tensor,
         dx = inv_rms * (dw - (w . dw) / D * w),   w = x * inv_rms
 
     which needs one dot product per head row -- the only whole-row quantity in
-    the backward, and the reason the Triton version runs two passes.
+    the backward, and the reason it is a single pass: one program holds a row.
 
     The cast in ``rms_norm`` is treated as an identity (straight-through), which
     is what ``torch.autograd`` does for a cast; the reference chain and this
@@ -127,3 +130,70 @@ def rms_rope_backward(dy: torch.Tensor, x: torch.Tensor,
     dot = (dw * w).sum(dim=-1, keepdim=True)
     dx = inv_rms * (dw - (dot / d.shape[-1]) * w)
     return dx.to(x.dtype)
+
+
+def _reduce_like(grad: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Sum ``grad`` over the dimensions ``ref`` was broadcast along.
+
+    ``torch.autograd`` gives a broadcast input the shape it was passed in, not
+    the shape of the output, so the vjp of ``y = ... + shift`` is ``dy`` summed
+    over every axis where ``shift`` had size 1 (including any leading axes it
+    did not have).  This is that reduction, and it is what makes
+    :func:`rms_adaln_backward` usable with a per-block modulation ``[1, 1, D]``
+    as well as with a full ``[B, S, D]`` one.
+    """
+    n_lead = grad.dim() - ref.dim()
+    dims = list(range(n_lead))
+    for i, size in enumerate(ref.shape):
+        if size == 1 and grad.shape[i + n_lead] != 1:
+            dims.append(i + n_lead)
+    out = grad.sum(dim=tuple(dims), keepdim=True) if dims else grad
+    return out.reshape(ref.shape)
+
+
+def rms_adaln_normalized(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """``x * rstd`` -- the value the modulation is applied to.
+
+    ``dscale`` is ``sum(dy * v)`` over the broadcast axes, so the backward needs
+    this whether or not it recomputes the kernel's intermediate.
+    """
+    xf = _work(x)
+    return xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor,
+              eps: float = 1e-6) -> torch.Tensor:
+    """The adaLN chain: ``x * rstd * (1 + scale) + shift``, differentiable.
+
+    ``scale`` and ``shift`` may have any shape broadcastable to ``x`` -- a
+    per-block ``[1, 1, D]`` modulation is the usual case, and
+    :func:`_reduce_like` collects their gradients back into that shape.
+    """
+    out = rms_adaln_normalized(x, eps) * (1 + _work(scale)) + _work(shift)
+    return out.to(x.dtype)
+
+
+def rms_adaln_backward(dy: torch.Tensor, x: torch.Tensor, scale: torch.Tensor,
+                       shift: torch.Tensor = None, eps: float = 1e-6):
+    """``(dx, dscale, dshift)`` for :func:`rms_adaln`, analytically.
+
+    With ``v = x * rstd`` and ``dv = dy * (1 + scale)``:
+
+        dscale = sum(dy * v)        over the axes the modulation was broadcast
+        dshift = sum(dy)            down those same axes
+        dx     = rstd * (dv - (v . dv) / D * v)
+
+    the last line being the norm's vjp (the same identity as the rope backward).
+    ``dx`` does not depend on ``shift``, which is why the kernel never loads it.
+    The cast in :func:`rms_adaln` is straight-through, as for the other chains.
+    """
+    xf = _work(x)
+    v = rms_adaln_normalized(x, eps)
+    d = _work(dy)
+    dv = d * (1 + _work(scale))
+    proj = (v * dv).sum(dim=-1, keepdim=True) / xf.shape[-1]
+    dx = (torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+          * (dv - proj * v))
+    dscale = _reduce_like(d * v, scale).to(scale.dtype)
+    dshift = None if shift is None else _reduce_like(d, shift).to(shift.dtype)
+    return dx.to(x.dtype), dscale, dshift

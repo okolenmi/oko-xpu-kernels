@@ -26,6 +26,7 @@ import os
 
 import torch
 
+from . import reference as _reference
 from ._gate import ACCELERATORS, Gate, probe_device
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 NUM_WARPS = 4
 
 _kernel = None
+_kernel_bwd = None
 _triton = None
 
 try:
@@ -68,9 +70,55 @@ try:
         out = (x - 0.0) * rstd * (1.0 + sc) + sh
         tl.store(y_ptr + row * stride_yr + cols, out.to(dtype), mask=mask)
 
+    @triton.jit
+    def _rms_adaln_bwd_rows_kernel(
+        x_ptr, dy_ptr, scale_ptr, dx_ptr, v_ptr,
+        d, scale_group,
+        stride_xr, stride_sr, stride_dyr, stride_dxr, stride_vr,
+        eps,
+        block_d: tl.constexpr, write_v: tl.constexpr, out_dtype: tl.constexpr,
+    ):
+        """One program per row: ``dx`` in a single pass, and ``v`` if asked.
+
+        ``y = v * (1 + scale) + shift`` with ``v = x * rstd``, so with
+        ``dv = dy * (1 + scale)``:
+
+            dx = rstd * (dv - (v . dv) / D * v)      (the norm's vjp)
+            dscale = sum(dy * v),  dshift = sum(dy)  over the broadcast axes
+
+        Only the first line is per-row, and it is the whole kernel.  The two
+        modulation gradients are sums over rows, which is why the kernel hands
+        back ``v`` instead: a per-row kernel cannot reduce across rows without
+        atomics, and the reduction is one torch call on an already-materialised
+        tensor.  ``write_v`` is False when neither ``scale`` nor ``shift`` needs
+        a gradient, so an inference-only backward does not pay for it.
+
+        ``shift`` is not read: ``dx`` and ``dscale`` do not depend on it.
+        """
+        row = tl.program_id(0)
+        cols = tl.arange(0, block_d)
+        mask = cols < d
+
+        x = tl.load(x_ptr + row * stride_xr + cols, mask=mask, other=0.0).to(tl.float32)
+        rstd = tl.math.rsqrt(tl.sum(x * x) / d + eps)
+        v = x * rstd
+
+        sc = tl.load(scale_ptr + (row // scale_group) * stride_sr + cols,
+                     mask=mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptr + row * stride_dyr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        dv = dy * (1.0 + sc)
+        dx = rstd * (dv - (tl.sum(v * dv) / d) * v)
+
+        tl.store(dx_ptr + row * stride_dxr + cols, dx.to(out_dtype), mask=mask)
+        if write_v:
+            tl.store(v_ptr + row * stride_vr + cols, v.to(out_dtype), mask=mask)
+
     _kernel = _rms_adaln_rows_kernel
+    _kernel_bwd = _rms_adaln_bwd_rows_kernel
 except Exception:  # pragma: no cover - no triton on this box
     _kernel = None
+    _kernel_bwd = None
 
 
 def enabled():
@@ -149,6 +197,57 @@ def _prep_modulation(t, x, n, d):
     return adaln_prep_modulation(t, x, n, d)
 
 
+def _rows_bwd_kernel(dy, x, scale, eps, need_v=True):
+    """Launch the backward kernel. No gate, no fallback: the probe calls this.
+
+    Returns ``(dx, v)`` with ``v`` None when ``need_v`` is false.
+    """
+    d = x.shape[-1]
+    n = x.numel() // d
+    x_flat = x.reshape(n, d)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+    dy_flat = dy.reshape(n, d)
+    if not dy_flat.is_contiguous():
+        dy_flat = dy_flat.contiguous()
+    s_flat, s_group = _prep_modulation(scale, x, n, d)
+
+    dx = torch.empty_like(x_flat)
+    v = torch.empty_like(x_flat) if need_v else dx
+    _kernel_bwd[(n,)](
+        x_flat, dy_flat, s_flat, dx, v,
+        d, s_group,
+        x_flat.stride(0), s_flat.stride(0), dy_flat.stride(0),
+        dx.stride(0), v.stride(0),
+        eps,
+        block_d=min(_triton.next_power_of_2(d), 4096),
+        write_v=need_v,
+        out_dtype=tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float32,
+        num_warps=NUM_WARPS)
+    return dx.reshape(x.shape), (v.reshape(x.shape) if need_v else None)
+
+
+def _rows_bwd(dy, x, scale, shift, eps, need_v=True):
+    """The fused backward, or the torch one when the kernel has not been proved.
+
+    Returns ``(dx, dscale, dshift)``.  The fallback is the analytic gradient in
+    `reference`, which is the same arithmetic with torch's reduction order -- it
+    is slower, not wrong.
+    """
+    if _kernel_bwd is None or not _GATE_BWD.ok():
+        return _reference.rms_adaln_backward(dy, x, scale, shift, eps)
+    dx, v = _rows_bwd_kernel(dy, x, scale, eps, need_v)
+    dscale = dshift = None
+    if need_v:
+        # the modulation gradients are sums over the rows the modulation was
+        # broadcast across; fp32 so the reduction does not round at bf16
+        dscale = _reference._reduce_like(
+            dy.to(torch.float32) * v.to(torch.float32), scale)
+    if shift is not None:
+        dshift = _reference._reduce_like(dy, shift)
+    return dx, dscale, dshift
+
+
 def _probe_forward(ref):
     """One row-block, bf16, with a scale/shift that is not all ones."""
     device = probe_device()
@@ -165,6 +264,43 @@ def _default_reference():
     return rms_adaln
 
 
+def _probe_backward(ref):
+    """Fused backward vs ``torch.autograd`` of the eager chain, in fp32.
+
+    fp32 for the same reason as the rope backward: in bf16 the forward's cast
+    makes autograd round the gradient, which would put the reference ~1 ULP away
+    from the smooth gradient and force a budget loose enough to hide a real
+    error (``debug/probe_rope_backward.py`` measures that effect).
+
+    All three outputs are checked, because the kernel produces ``dx`` and ``v``
+    and ``v`` is what ``dscale`` is built from -- a right ``dx`` with a wrong
+    ``v`` would still train, wrongly, and only show up as a drifting modulation.
+    """
+    device = probe_device()
+    gen = torch.Generator(device=device).manual_seed(3)
+    B, S, D = 2, 128, 3072
+    x = torch.randn(B, S, D, generator=gen, device=device) * 0.3
+    scale = torch.randn(1, 1, D, generator=gen, device=device) * 0.1
+    shift = torch.randn(1, 1, D, generator=gen, device=device) * 0.1
+    dy = torch.randn(B, S, D, generator=gen, device=device) * 0.1
+
+    xr = x.detach().clone().requires_grad_(True)
+    sr = scale.detach().clone().requires_grad_(True)
+    hr = shift.detach().clone().requires_grad_(True)
+    ref(xr, sr, hr, 1e-6).backward(dy)
+
+    dx, v = _rows_bwd_kernel(dy, x, scale, 1e-6)
+    return {
+        "dx": (dx, xr.grad),
+        "dscale": (_reference._reduce_like(dy * v, scale), sr.grad),
+        "dshift": (_reference._reduce_like(dy, shift), hr.grad),
+    }
+
+
+#: Budget for the backward: same arithmetic, different reduction order (see
+#: ``rope.BWD_REL``).  Measured worst case on the fp32 probe is ~1e-6.
+BWD_REL = 1e-4
+
 _GATE = Gate(
     "rms_adaln", _probe_forward,
     default_reference=_default_reference,
@@ -173,24 +309,35 @@ _GATE = Gate(
 )
 
 
+_GATE_BWD = Gate(
+    "rms_adaln_backward", _probe_backward,
+    default_reference=lambda: _reference.rms_adaln,
+    env="XPU_KERNELS_NO_ADALN_BWD",
+    num_warps=NUM_WARPS, rel=BWD_REL,
+)
+
+
 def set_reference(fn=None):
-    """Point the gate at the implementation it must match, or clear it.
+    """Point the gates at the implementation they must match, or clear them.
 
     ``fn`` must have the signature ``fn(x, scale, shift, eps) -> x'`` and be the
     path the caller falls back to.  Without it, ``comfy_kitchen``'s kernel is
-    used when importable; otherwise the kernel stays inactive.
+    used when importable; otherwise the kernels stay inactive.  The backward
+    gate wants the *differentiable forward* to differentiate; its default is
+    ``reference.rms_adaln``, which takes the same signature.
     """
     _GATE.set_reference(fn)
+    _GATE_BWD.set_reference(fn)
 
 
 def gates():
     """This module's permission slips, by name (for the status report)."""
-    return {"rms_adaln": _GATE}
+    return {"rms_adaln": _GATE, "rms_adaln_backward": _GATE_BWD}
 
 
-def describe():
+def describe(which="rms_adaln"):
     """One line: is this kernel in use, and if not, why."""
-    return _GATE.describe()
+    return gates()[which].describe()
 
 
 def _self_test():
@@ -198,6 +345,42 @@ def _self_test():
     return _GATE.ok()
 
 
+class _RmsAdaLN(torch.autograd.Function):
+    """The fused forward with the fused backward attached."""
+
+    @staticmethod
+    def forward(ctx, x, scale, shift, eps):
+        out = _run(x, scale, shift, eps)
+        # the modulation gradients are sums over rows, so `v` is only worth
+        # materializing when one of them is actually being learned
+        need_v = ctx.needs_input_grad[1] or ctx.needs_input_grad[2]
+        ctx.save_for_backward(x, scale, shift)
+        ctx.eps = eps
+        ctx.need_v = need_v
+        return out
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, scale, shift = ctx.saved_tensors
+        dx, dscale, dshift = _rows_bwd(
+            dy, x, scale, shift, ctx.eps,
+            ctx.need_v and ctx.needs_input_grad[1])
+        if not ctx.needs_input_grad[1]:
+            dscale = None
+        if not ctx.needs_input_grad[2]:
+            dshift = None
+        return dx, dscale, dshift, None
+
+
 def rms_adaln(x, scale, shift, eps=1e-6):
-    """Drop-in for `comfy_kitchen.rms_adaln` (mean pinned to 0)."""
+    """Drop-in for `comfy_kitchen.rms_adaln` (mean pinned to 0).
+
+    Differentiable: with a grad-requiring input this routes through
+    :class:`_RmsAdaLN`, whose backward is a single fused kernel (or the torch
+    gradient in `reference` if the backward gate is closed).  Under
+    ``torch.no_grad`` it is the plain forward, unchanged and bit-exact.
+    """
+    if torch.is_grad_enabled() and (x.requires_grad or scale.requires_grad
+                                   or shift.requires_grad):
+        return _RmsAdaLN.apply(x, scale, shift, eps)
     return _run(x, scale, shift, eps)

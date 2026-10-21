@@ -108,11 +108,26 @@ Still open:
 
 ## 3. Backward for `adaln.rms_adaln`
 
-Same shape of work as the rope backward: `dx`, `dscale` and `dshift` (a trainer
-that learns the modulation needs all three; adaLN modulation params are
-per-block, so their gradients are a column reduction). Gate: `torch.autograd` of
-the eager chain in fp32, plus float64 gradcheck; the formula is much simpler than
-rope's (no reduction over the row beyond the norm).
+**Done** (`adaln._GATE_BWD`, `debug/probe_adaln_backward.py`): `dx`, `dscale`
+and `dshift`, verified against `torch.autograd` of the eager chain in fp32
+(9.4e-8 worst relative) and the formula pinned in float64 by
+`tests/test_adaln_backward.py` (autograd, `gradcheck`, the norm's orthogonality
+property, and the reduction shapes for every broadcast a trainer passes:
+`[1,1,D]`, `[D]`, `[B,S,D]`, `[1,S,D]`, `[B,1,D]`).
+
+Forward+backward 1.48 ms vs 5.79 ms eager (3.9x). The remaining cost is not
+`dx` (0.25 ms) but the two modulation reductions (1.13 ms) -- sums over the rows
+the modulation was broadcast across, which a per-row kernel cannot do without
+atomics, so they are torch today.
+
+- [ ] **fused modulation reduction.** One pass over `x` and `dy` (48 MB instead
+      of the ~170 MB the fp32 temporary costs), accumulate `dscale` and `dshift`
+      together, reduce chunk partials in a second tiny kernel (no atomics).
+      Expected ~0.2 ms against 1.13 ms, i.e. ~1.5 ms -> ~0.55 ms per call, about
+      40 ms/step over 42 blocks. This is the biggest measured, unclaimed win
+      left in the Triton half.
+      Chunking must respect the modulation's broadcast group (partial sums must
+      not span two groups), which is the only subtle part.
 
 ## 4. Switch ComfyUI to import this package
 

@@ -180,6 +180,55 @@ formula is pinned separately by `tests/test_rope_backward.py` in float64 against
 
 ---
 
+## adaLN backward
+
+`debug/probe_adaln_backward.py`, B=1, S=3973, D=3072, bf16, modulation `[1, 1, D]`,
+medians:
+
+| | time | |
+|---|---|---|
+| eager chain forward | 2.053 ms | |
+| fused forward | 0.246 ms | **8.4× vs eager** (1.56× vs the shipped Triton kernel, see above) |
+| eager forward+backward | 5.793 ms | |
+| fused forward+backward | 1.478 ms | **3.9×** |
+| — `dx` kernel | 0.25-0.27 ms | |
+| — `dscale` reduction | 0.995 ms | |
+| — `dshift` reduction | 0.133 ms | |
+
+`dx` is the norm's vjp, `rstd * (dv - (v . dv)/D * v)`, and it is per row, so it
+is one kernel. `dscale` and `dshift` are sums over the rows the modulation was
+broadcast across -- a per-row kernel cannot do that without atomics -- so the
+kernel writes `v` back and the gradients come from two torch reductions. That is
+why the reduction is 70 % of the backward: `dy.float() * v.float()` is an fp32
+temporary (48.8 MB written and read again for a 3973-term sum). Measured
+alternatives for the same reduction:
+
+| | time | rel vs float64 |
+|---|---|---|
+| fp32 product, `sum(dim=(0,1))` (shipped) | 1.33 ms | 7.8e-08 |
+| fp32 product, `reshape(-1,D).sum(0)` | 1.03 ms | 7.8e-08 |
+| bf16 product, `sum(..., dtype=float32)` | **0.57 ms** | 1.65e-03 |
+
+The bf16 product is 2x faster and its 1.7e-3 is the same order as the bf16
+storage error already in `dy` and `v`, so it is defensible -- but a fused
+reduction kernel is both faster *and* exact (one pass over x and dy, fp32
+accumulation, no temporary), and is the next step (`docs/todo.md`).
+
+**Accuracy** against the same gradient in float64:
+
+| | relative L2 |
+|---|---|
+| `dx` | 1.7e-05 |
+| `dscale` | 1.7e-03 |
+| `dshift` | 1.6e-03 |
+
+`dscale`/`dshift` carry bf16 storage error because `dy` and `v` are bf16; `dx`
+does not, because the kernel never rounds its intermediate to bf16. The device
+gate probes all three in fp32 and reports 9.4e-8 worst relative error against
+`torch.autograd` of the eager chain.
+
+---
+
 ## Graph capture: verified, and it is a host-time win
 
 `debug/verify_graph_capture.py` captures the fused rope forward **and** its

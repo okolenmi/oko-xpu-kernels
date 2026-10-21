@@ -31,6 +31,8 @@ from .int8 import (
     dequant_slice,
     dequant_weight,
     device_name,
+    expand_scale,
+    ffn_situ,
     linear,
     linear_acc,
     linear_dx,
@@ -42,6 +44,7 @@ from .int8 import (
     quantize_row,
     rotate,
     selftest,
+    unsupported_reason,
 )
 from . import int8, triton
 
@@ -49,8 +52,9 @@ __version__ = "0.2.0"
 
 __all__ = [
     "Int8Linear", "available", "dequant", "dequant_act_quantize",
-    "dequant_slice", "dequant_weight", "device_name", "linear", "linear_acc",
-    "linear_dx", "linear_dx_int8", "load", "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate",
-    "selftest",
+    "dequant_slice", "dequant_weight", "device_name", "expand_scale",
+    "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
+    "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate",
+    "selftest", "unsupported_reason",
     "int8", "triton",
 ]

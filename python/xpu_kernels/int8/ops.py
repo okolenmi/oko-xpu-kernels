@@ -16,9 +16,9 @@ from ._lib import (
     ACTIVATIONS,
     _err,
     _flat2d,
-    _fp32,
     _lib,
     _stream,
+    load,
 )
 
 def rotate(x):
@@ -88,7 +88,10 @@ def prepare_weight(w, group: int = 256):
         raise ValueError(f"K={w.shape[1]} is not a multiple of the group size {group}")
     wr = rotate(w.detach().to(device=w.device, dtype=torch.bfloat16).contiguous())
     amax = wr.abs().amax(dim=1).clamp_min(1e-30)
-    scale = amax / 127.0
+    # fp32 on purpose: the kernel reads an fp32 scale, and an 8-bit-mantissa
+    # bf16 scale would quantize the *scale* on top of the weight.  ``wr / scale``
+    # then promotes to fp32, so the round-to-int8 decision uses the exact scale.
+    scale = amax.float() / 127.0
     q = torch.round(wr / scale[:, None]).clamp_(-127, 127).to(torch.int8)
     return q, scale.contiguous()
 
@@ -177,6 +180,105 @@ def linear_dx_int8(dy, w8, w_scale):
     return rotate(dx).reshape(*dy.shape[:-1], w8.shape[1])
 
 
+def expand_scale(scale, n, device=None):
+    """A flat fp32 ``[n]`` scale, broadcasting a per-tensor scalar.
+
+    The kernels index ``scale[i]`` for every ``i < n``, so a scalar *must* be
+    materialised: a 1-element buffer where ``n`` values are read is an
+    out-of-bounds read, not a broadcast.  That is why this exists -- a
+    per-tensor weight scale (``[1]``, ``[N, 1]`` or a python float) is legal
+    input to :func:`linear`, and getting it wrong is a silent wrong result.
+
+    The fast path returns ``scale`` unchanged when it is already a flat fp32
+    ``[n]`` tensor on the right device, which is the case for a per-channel
+    scale after :func:`prepare_weight` -- no allocation, no copy.  Otherwise it
+    allocates, so call it once per weight and keep the result rather than
+    re-expanding inside a hot loop.
+    """
+    if not isinstance(scale, torch.Tensor):
+        if not isinstance(scale, (float, int)):
+            raise TypeError(f"scale must be a tensor or a python float, "
+                            f"got {type(scale).__name__}")
+        if device is None:
+            raise TypeError("a python-scalar scale needs an explicit device")
+        return torch.full((n,), float(scale), device=device, dtype=torch.float32)
+    if (scale.dtype == torch.float32 and scale.dim() == 1 and scale.numel() == n
+            and scale.is_contiguous() and (device is None or scale.device == device)):
+        return scale
+    s = scale.reshape(-1).to(device=device or scale.device, dtype=torch.float32)
+    if s.numel() == 1 and n != 1:
+        s = s.expand(n)
+    return s.contiguous()
+
+
+def _dims(x, w8, act):
+    m = 1
+    for d in x.shape[:-1]:
+        m *= int(d)
+    return m, int(w8.shape[0]), int(w8.shape[1])
+
+
+def unsupported_reason(x, w8, w_scale, act=None):
+    """Why this call cannot use the fused kernels, or ``None`` if it can.
+
+    Returned instead of a bare bool so a caller can log *why* a layer fell back;
+    ``None`` from the kernel layer is indistinguishable from a typo.  The
+    checks are ordered cheapest-and-most-likely-first, and are the single source
+    of truth: :func:`linear` raises exactly this message, so the two cannot
+    drift apart.
+
+    A caller that wants fallback semantics (ComfyUI does, per layer) writes::
+
+        if int8.unsupported_reason(x, w8, ws, act):
+            return fallback(...)
+        return int8.linear(x, w8, ws, act=act)
+    """
+    if not isinstance(x, torch.Tensor) or not isinstance(w8, torch.Tensor):
+        return "activation and weight must be torch tensors"
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        return (f"activation dtype {x.dtype} is not bfloat16 or float32 "
+                f"(the kernels consume bf16)")
+    if w8.dtype != torch.int8 or w8.dim() != 2:
+        return f"weight must be an int8 [N, K] tensor, got {w8.dtype} {tuple(w8.shape)}"
+    if act not in (None, "gelu_tanh", "swiglu", "situ"):
+        return (f"unknown activation {act!r}; expected None, 'gelu_tanh', "
+                f"'swiglu' or 'situ'")
+    k = int(w8.shape[1])
+    want = k * 2 if act in ("swiglu", "situ") else k
+    if x.shape[-1] != want:
+        return (f"activation has {x.shape[-1]} columns but this weight wants "
+                f"{want} (K={k}{' with two halves' if want != k else ''})")
+    # 256 is a multiple of 16, so this covers the vector width too
+    if k % 256:
+        return f"K={k} is not a multiple of the ConvRot group size (256)"
+    if w8.shape[0] % 16:
+        return (f"N={w8.shape[0]} is not a multiple of 16; the dequant epilogue "
+                f"reads the output 16 columns at a time and would drop the tail")
+    if isinstance(w_scale, torch.Tensor):
+        # any float dtype is fine: it is converted to fp32 exactly, which is
+        # what the kernel reads.  Integer scales are not -- they would be a
+        # different quantity, not a rounded one.
+        if not w_scale.is_floating_point():
+            return (f"weight scale dtype {w_scale.dtype} is not floating point; "
+                    f"a per-channel scale is amax/127")
+        if w_scale.dim() > 2:
+            return (f"weight scale has {w_scale.dim()} dims; expected a scalar, "
+                    f"[N] or [N, 1]")
+        if w_scale.numel() not in (1, w8.shape[0]):
+            return (f"weight scale has {w_scale.numel()} values; expected 1 or "
+                    f"N={w8.shape[0]}")
+    elif not isinstance(w_scale, (float, int)):
+        return "weight scale must be a tensor or a python float"
+    if load() is None:
+        return "libxpuint8.so is not available (see xpu_kernels.int8._lib)"
+    if x.device.type != "xpu":
+        return f"activation is on {x.device}; the kernels need an XPU tensor"
+    if w8.device != x.device:
+        return (f"weight is on {w8.device} but the activation is on {x.device}; "
+                f"the kernels take raw pointers into one queue")
+    return None
+
+
 def dequant(acc, x_scale, w_scale, bias=None):
     """bf16 dequant of an int32 [M, N] accumulator with per-row and per-column scales."""
     lib = _lib()
@@ -184,8 +286,10 @@ def dequant(acc, x_scale, w_scale, bias=None):
         raise TypeError("acc must be an int32 [M, N] tensor")
     m, n = acc.shape
     out = torch.empty((m, n), device=acc.device, dtype=torch.bfloat16)
-    xs, ws = _fp32(x_scale), _fp32(w_scale)
-    b = None if bias is None else _fp32(bias)
+    # the kernel reads x_scale[m] and w_scale[n] for every row/column, so both
+    # have to be flat and n long -- a scalar is broadcast here, not by the C side
+    xs, ws = expand_scale(x_scale, m, acc.device), expand_scale(w_scale, n, acc.device)
+    b = None if bias is None else expand_scale(bias, n, acc.device)
     rc = lib.xpuint8_dequant_epilogue_stream(
         _stream(acc.device), ctypes.c_void_p(acc.data_ptr()),
         ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(xs.data_ptr()),
@@ -212,8 +316,8 @@ def dequant_slice(acc, x_scale, w_scale, bias=None):
         raise TypeError("acc must be an int32 [M, N] tensor")
     m, n = acc.shape
     out = torch.empty((m, n), device=acc.device, dtype=torch.bfloat16)
-    xs, ws = _fp32(x_scale), _fp32(w_scale)
-    b = None if bias is None else _fp32(bias)
+    xs, ws = expand_scale(x_scale, m, acc.device), expand_scale(w_scale, n, acc.device)
+    b = None if bias is None else expand_scale(bias, n, acc.device)
     rc = fn(_stream(acc.device), ctypes.c_void_p(acc.data_ptr()),
             ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(xs.data_ptr()),
             ctypes.c_void_p(ws.data_ptr()),
@@ -242,7 +346,9 @@ def dequant_act_quantize(acc, x_scale, w_scale, activation="situ"):
     k = k2 // 2
     q = torch.empty((m, k), device=acc.device, dtype=torch.int8)
     scale = torch.empty((m,), device=acc.device, dtype=torch.float32)
-    xs, ws = _fp32(x_scale), _fp32(w_scale)
+    # both scales are indexed per accumulator column/row, so both must be flat
+    xs = expand_scale(x_scale, m, acc.device)
+    ws = expand_scale(w_scale, k2, acc.device)
     rc = fn(_stream(acc.device), ctypes.c_void_p(acc.data_ptr()),
             ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(scale.data_ptr()),
             ctypes.c_void_p(xs.data_ptr()), ctypes.c_void_p(ws.data_ptr()),
@@ -272,12 +378,117 @@ def linear_acc(x, w8, w_scale, act: Optional[str] = None):
     return acc, xs.reshape(-1)
 
 
-def linear(x, w8, w_scale, bias=None, act: Optional[str] = None):
-    """INT8 ConvRot linear: bf16 [.., K] -> bf16 [.., N] (N = w8.shape[0])."""
-    acc, xs = linear_acc(x, w8, w_scale, act)
+def linear(x, w8, w_scale, bias=None, act: Optional[str] = None, residual=None,
+           residual_scale=None, return_acc: bool = False):
+    """INT8 ConvRot linear: bf16/fp32 [.., K] -> bf16/fp32 [.., N].
+
+    The one entry point for a projection, covering what the kernels fuse:
+
+    * ``act`` folds an activation into the *input* quantizer, so ``act(x)`` is
+      never materialised: ``gelu_tanh`` on [.., K], ``swiglu``/``situ`` on
+      [.., 2K] laid out as ``[up | gate]``, both producing [.., K].
+    * ``residual``/``residual_scale`` apply ``residual + residual_scale * out``
+      after the dequant, which is where a pre-norm block's addcmul belongs.
+    * ``return_acc`` skips the output epilogue and returns
+      ``(int32 [M, N], fp32 [M], fp32 [N])`` -- the accumulator plus the two
+      scales it still needs.  Use it when the consumer walks the accumulator
+      itself (:func:`dequant_slice`, :func:`dequant_act_quantize`).  Only for a
+      plain, unbiased projection: there is no epilogue to add a bias or residual
+      to.
+
+    Raises ``TypeError`` with a specific message when the shape, dtype or device
+    is outside what the kernels handle; :func:`unsupported_reason` returns that
+    message without raising, for callers that fall back per layer.
+
+    ``x`` may be float32 (CLIP text encoders pass it); the compute precision is
+    bf16 either way, and the result is returned in the caller's dtype.
+    """
+    reason = unsupported_reason(x, w8, w_scale, act)
+    if reason is not None:
+        raise TypeError(reason)
+    if return_acc and (bias is not None or residual is not None):
+        raise ValueError("return_acc skips the epilogue, so bias and residual "
+                         "cannot be applied")
+    m, n, _ = _dims(x, w8, act)
+    input_dtype = x.dtype
+    x2 = x.reshape(m, -1)
+    if x2.dtype != torch.bfloat16:
+        x2 = x2.to(dtype=torch.bfloat16)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+
+    if act is None:
+        xq, xs = quantize(x2)
+    else:
+        xq, xs = quantize_act(x2, act)
+    acc = torch._int_mm(xq, w8.t())
+    if return_acc:
+        return acc, xs.reshape(-1), expand_scale(w_scale, n, acc.device)
+
     out = dequant(acc, xs, w_scale, bias)
-    shape = (*x.shape[:-1], w8.shape[0])
-    return out.reshape(shape)
+    if residual is not None:
+        residual = residual.reshape(m, n).to(
+            out.dtype if input_dtype == torch.bfloat16 else input_dtype)
+        if input_dtype != torch.bfloat16:
+            out = out.to(dtype=input_dtype)
+        out = torch.addcmul(residual, out, residual_scale)
+    out = out.reshape(*x.shape[:-1], n)
+    return out if input_dtype == torch.bfloat16 else out.to(dtype=input_dtype)
+
+
+def ffn_situ(x, up_w8, up_scale, down_w8, down_scale, down_bias=None):
+    """``situ(up(x)) @ down.T`` with the bf16 intermediate never written.
+
+    ``up_w8`` is [2*ffn, K] holding ``[up | gate]`` and ``down_w8`` is
+    [K, ffn].  The up-projection's int32 accumulator goes straight into the
+    fused dequant+situ+rotate+quantize kernel (:func:`dequant_act_quantize`), so
+    the [M, 2*ffn] bf16 tile that the two-op form writes and reads again does
+    not exist.  The down-projection's epilogue is the ordinary one, so
+    ``down_bias`` is free but the up-projection must be unbiased (its bias would
+    have to be added before the activation, inside the fused kernel).
+
+    Raises ``TypeError`` like :func:`linear`; see :func:`unsupported_reason`.
+    """
+    reason = unsupported_reason(x, up_w8, up_scale, None)
+    if reason is not None:
+        raise TypeError(reason)
+    m, n, k = _dims(x, up_w8, None)
+    if n % 2 or (n // 2) % 256 or (n // 2) % 16:
+        raise TypeError(f"up-projection N={n} must be 2*ffn with ffn a multiple "
+                        f"of 256 (and of 16) for the fused situ epilogue")
+    if down_w8.dtype != torch.int8 or down_w8.dim() != 2:
+        raise TypeError(f"down weight must be an int8 [K, ffn] tensor, got "
+                        f"{down_w8.dtype} {tuple(down_w8.shape)}")
+    if tuple(down_w8.shape) != (k, n // 2):
+        raise TypeError(f"down weight is {tuple(down_w8.shape)}, expected "
+                        f"{(k, n // 2)}")
+    if down_w8.device != x.device:
+        raise TypeError(f"down weight is on {down_w8.device} but the activation "
+                        f"is on {x.device}")
+    if isinstance(down_scale, torch.Tensor):
+        if down_scale.dtype != torch.float32 or down_scale.dim() > 2:
+            raise TypeError("down weight scale must be a float32 scalar or [K]")
+        if down_scale.numel() not in (1, k):
+            raise TypeError(f"down weight scale has {down_scale.numel()} values; "
+                            f"expected 1 or K={k}")
+    elif not isinstance(down_scale, (float, int)):
+        raise TypeError("down weight scale must be a tensor or a python float")
+
+    device = x.device
+    input_dtype = x.dtype
+    x2 = x.reshape(m, k)
+    if x2.dtype != torch.bfloat16:
+        x2 = x2.to(dtype=torch.bfloat16)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+
+    xq, xs = quantize(x2)
+    acc = torch._int_mm(xq, up_w8.t())
+    q2, xs2 = dequant_act_quantize(acc, xs, expand_scale(up_scale, n, device), "situ")
+    acc2 = torch._int_mm(q2, down_w8.t())
+    out = dequant(acc2, xs2, down_scale, down_bias)
+    out = out.reshape(*x.shape[:-1], k)
+    return out if input_dtype == torch.bfloat16 else out.to(dtype=input_dtype)
 
 
 class Int8Linear(torch.nn.Module):

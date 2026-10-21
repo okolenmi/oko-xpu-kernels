@@ -169,6 +169,37 @@ Matching it needs exactly the tiling that is absent here, and even a generous
 for the 0.15 ms epilogue the fusion would delete. So the pipeline uses
 `torch._int_mm` and the GEMM stays a standalone, CPU-verified reference
 implementation.
+## The Python API, and why it is shaped this way
+
+`python/xpu_kernels/int8/` has one file for the ctypes surface (`_lib.py`) and one
+for the operations (`ops.py`). Four decisions that a library has to make, and
+that a module inside an application does not:
+
+**Unsupported is a reason, not a `None`.** `unsupported_reason(x, w8, w_scale,
+act)` returns a specific string ("K=384 is not a multiple of the ConvRot group
+size (256)") or `None`; `linear` raises `TypeError` with exactly that string.
+ComfyUI keeps its per-layer fallback by branching on the predicate, and a
+library user gets an error that says what to fix. One source of truth, so the
+predicate and the exception cannot disagree.
+
+**Only one entry point per projection.** `linear(x, w8, w_scale, bias=None,
+act=None, residual=None, residual_scale=None, return_acc=False)` covers what the
+kernels fuse: an activation inside the input quantizer, the pre-norm addcmul
+after the epilogue, and the accumulator path that skips the epilogue entirely.
+`ffn_situ` is the same idea one level up (`down(situ(up(x)))` in two GEMMs).
+`N % 16` is part of the contract because the epilogue reads 16 columns at a time
+and would otherwise drop the tail in silence.
+
+**No state.** The library caches nothing: `expand_scale` is pure (and returns the
+input unchanged when it is already a flat fp32 `[n]` tensor), so a hot loop sees
+no hidden allocation the first time and a different one later. ComfyUI's
+per-prompt scale memo lives in `comfy/xpu_int8.py`, which is also where
+`reset_caches()` is called from `execution.py`.
+
+**No instrumentation.** `XPU_INT8_TIMING` and the per-region `STATS` counters
+were development scaffolding: they measured the caller's own host time and their
+job is done. An optimisation question now goes to a probe in `debug/`.
+
 ## Verification: what makes these kernels safe to drop in
 
 Every kernel here is a *schedule* change over arithmetic that already exists in

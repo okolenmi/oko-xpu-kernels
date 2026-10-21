@@ -147,51 +147,56 @@ identical to the pre-switch reference. The server log shows the three forward
 gates verifying against `comfy_kitchen` on first use and the qkv dequant fusion
 engaged; the two backward gates correctly stay unprobed under `no_grad`.
 
-**Not done: the INT8 wrapper.** `comfy/xpu_int8.py` is not a duplicate and cannot
-be a shim -- it is a superset (717 lines) with model-shaped entry points the
-package does not have:
+**The INT8 wrapper: also done.** `comfy/xpu_int8.py` was not a duplicate -- it
+was a 717-line superset the package could not express. The missing entry points
+now live in `xpu_kernels.int8`, and the ComfyUI module is a thin adapter over it
+(layout unwrapping, the `None`-means-fallback convention, the per-prompt scale
+memo). The two that turned out to be ComfyUI glue, not library code:
 
-| ComfyUI entry point | what it is |
+| entry point | where it went |
 |---|---|
-| `convrot_int8_linear` | ConvRot linear with residual / input-act / return-acc options, falls back by returning None |
-| `convrot_ffn_situ` | `situ(up_gate(x)) @ down.T` in one pass, consuming the up-projection's int32 accumulator |
-| `convrot_int8_acc` | the GEMM without an epilogue |
-| `dequant_epilogue_slice` | bf16 dequant of a column slice of a wider accumulator (the v third of fused qkv) |
+| `convrot_int8_linear` | `int8.linear(..., act=, residual=, residual_scale=, return_acc=)` -- one entry point for a projection |
+| `convrot_ffn_situ` | `int8.ffn_situ` -- `down(situ(up(x)))` in two GEMMs, ~40 lines of composition |
+| `convrot_int8_acc` | **stays in ComfyUI**: it only unwraps `TensorWiseINT8Layout` and passes `return_acc=True` |
+| `dequant_epilogue_slice` | was already `int8.dequant_slice` (same C kernel, same strided walk) |
 
-- [ ] **move those four into `xpu_kernels.int8`**, then `comfy/xpu_int8.py`
-      becomes a shim like the other two. Sized before starting, because it is not
-      a re-export:
+The four API questions, answered (`docs/architecture.md` has the reasoning):
 
-      | entry point | size | what it actually is |
-      |---|---|---|
-      | `dequant_epilogue_slice` | 24 lines | **already done**: it is `dequant_slice` (same C kernel, same strided walk). Only the failure convention differs -- it returns None, the package raises |
-      | `convrot_int8_acc` | 22 lines | `linear_acc` that takes the raw weight + scale and hands back `(acc, x_scale, w_scale)`. Portable as is |
-      | `convrot_int8_linear` | 131 lines | the primitives plus `_check` validation, the `residual + residual_scale * out` epilogue, `input_act` (gelu_tanh / swiglu / situ), `return_acc`, a `_kernels()` capability probe (`use_stream`, `q_act_stream`), `_SCALE_CACHE`/`_scale_ptr` memoisation, and `XPU_INT8_TIMING` stats |
-      | `convrot_ffn_situ` | 111 lines | up-projection accumulator -> fused situ + rotate + quantize -> down-projection accumulator, i.e. the whole FFN in two GEMMs |
+* **`None` vs raise.** `unsupported_reason(...)` returns the reason string,
+  `linear` raises it as `TypeError`, ComfyUI branches on the predicate. A caller
+  can now tell "this card cannot do it" from "you passed the wrong dtype".
+* **`_SCALE_CACHE`.** The library caches nothing; `expand_scale` is pure and
+  takes the fast path (returns its input) when the scale is already a flat fp32
+  `[n]` tensor. The prompt-scoped memo stayed in the ComfyUI adapter, next to
+  the `reset_caches()` that `execution.py` calls. `prepare_weight` now returns
+  an fp32 scale instead of a bf16 one -- the kernel reads fp32, and an 8-bit
+  mantissa on the scale was quantizing the quantizer.
+* **`XPU_INT8_TIMING`/`STATS`.** Removed. The per-region breakdown (rotate /
+  `_int_mm` / epilogue) was scaffolding for an optimisation question that is
+  closed; the adapter keeps a whole-call host timer and the `[xpu-mem]` line
+  under the same env var, and `debug/` probes answer the rest.
+* **Naming.** The module is `xpu_kernels.int8`, so the operations are bare:
+  `linear`, `linear_acc`, `ffn_situ`, `dequant`, `quantize`. `convrot_*` stays
+  only on the ComfyUI-side names that `comfy/ops.py` calls.
 
-      Two of the four are glue. The other two raise **API questions that a
-      library has to answer differently from a ComfyUI module**, and they are
-      the reason this is not just a move:
+Verified: the package's own tests (`pytest`, 50 CPU-only), `python -m
+xpu_kernels` on the card, ComfyUI's `tests-unit/xpu_int8/test_xpu_int8_linear.py`
+(the fused path vs comfy_kitchen vs a float64 reference, plus the fallback and
+residual cases), and the PNG gate -- seed 1234, 3 steps, `--deterministic`,
+fresh server: md5 `a2aacfda45409493a490b0402b61f850`, unchanged. The server log
+shows the whole model on the fast path with no fallbacks.
 
-      * `None` on unsupported vs raise. `None` suits ComfyUI (the caller falls
-        back per layer). For a library, either is defensible, but it has to be
-        documented once and consistently -- a caller cannot tell "your card
-        cannot do this" from "you passed the wrong dtype" if both are `None`.
-      * `_SCALE_CACHE` memoises a scale-pointer conversion keyed by prompt
-        state. A library should not cache across calls without an explicit
-        handle; the package's `_fp32` already avoids the allocation when the
-        scale is already fp32 and contiguous, which may remove the need.
-      * `XPU_INT8_TIMING`/`STATS` are measurement scaffolding. Keep them out of
-        the library and let the probes measure from outside, or the library
-        grows a debug mode nobody asked for.
-      * naming: `convrot_*` says the weight layout, `int8_*` says the numeric
-        format, and the package currently uses neither for these (`linear`,
-        `linear_acc`). Pick one before someone imports it.
+Two notes for the next person:
 
-      Value is *reusability*, not speed: the C ABI is already shared, so only
-      wrapper code is duplicated today. The training project would use
-      `convrot_ffn_situ` and `convrot_int8_linear` long before it writes those
-      compositions itself, which is the argument for doing it.
+* The `.so` ComfyUI now loads is `xpu-kernels/build/libxpuint8.so`, not
+  `ComfyUI/comfy/lib/libxpuint8.so`: the package's loader prefers the repo it is
+  installed from. The two sources differ only in the include path, but they are
+  separate builds -- the PNG gate above ran against the package's. `build.sh` in
+  this repo is now the build that matters.
+* `execution.py` reads `comfy.xpu_int8._LIB` and calls `reset_caches()` at prompt
+  end. Both are part of the adapter's contract; removing either deletes the
+  per-prompt cache clear silently. There is a `try`-less attribute read, so it
+  fails loudly (it did, during this change).
 
 ## 5. Packaging and CI
 

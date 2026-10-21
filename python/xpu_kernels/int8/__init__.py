@@ -21,6 +21,12 @@ would otherwise run.
     import xpu_kernels, torch
     w8, ws = xpu_kernels.prepare_weight(w)              # once, offline
     y = xpu_kernels.linear(x, w8, ws)                   # bf16 [M,K] -> bf16 [M,N]
+    y = xpu_kernels.linear(x, w8, ws, act="gelu_tanh")  # activation fused into
+                                                       # the input quantizer
+    y = xpu_kernels.ffn_situ(x, up8, up_s, down8, down_s)  # situ FFN, two GEMMs
+
+``unsupported_reason`` is the non-raising form of the argument checks, for a
+caller that falls back per layer instead of raising.
 
 Bit-exactness contract
 ----------------------
@@ -34,7 +40,9 @@ activation paths keep bf16 rounding where the unfused chain had it.
 Constraints worth knowing before you rely on this
 ------------------------------------------------
 * ``K`` must be a multiple of the ConvRot group size (256 for the specialised
-  kernels).  ``N`` must be a multiple of 16 for the dequant epilogue.
+  kernels).  ``N`` must be a multiple of 16 for the dequant epilogue, which
+  reads the output 16 columns at a time -- both are checked, because the C side
+  would otherwise silently drop the tail.
 * Weights must be prepared with ``prepare_weight`` (or an equivalent
   ComfyUI-produced ``TensorWiseINT8Layout`` with ``convrot``); a plain
   ``w / amax * 127`` quantization is incompatible with the activation
@@ -61,6 +69,8 @@ from .ops import (
     dequant_weight,
     dequant_act_quantize,
     dequant_slice,
+    expand_scale,
+    ffn_situ,
     linear,
     linear_acc,
     linear_dx,
@@ -70,12 +80,14 @@ from .ops import (
     quantize_act,
     quantize_row,
     rotate,
+    unsupported_reason,
 )
 from .selftest import selftest
 
 __all__ = [
     "Int8Linear", "available", "dequant", "dequant_act_quantize",
-    "dequant_slice", "dequant_weight", "device_name", "linear",
-    "linear_acc", "linear_dx", "linear_dx_int8", "load",
-    "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate", "selftest",
+    "dequant_slice", "dequant_weight", "device_name", "expand_scale",
+    "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
+    "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate",
+    "selftest", "unsupported_reason",
 ]

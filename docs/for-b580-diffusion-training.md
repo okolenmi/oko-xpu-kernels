@@ -26,7 +26,13 @@ out of ComfyUI.
 import xpu_kernels
 w8, ws = xpu_kernels.prepare_weight(w)          # bf16 [N,K] -> int8 [N,K] + fp32 [N]
 y = xpu_kernels.linear(x, w8, ws, bias)         # bf16 [..,K] -> bf16 [..,N]
+y = xpu_kernels.linear(x, w8, ws, act="gelu_tanh")   # activation fused into the
+                                                    # input quantizer, never materialised
+y = xpu_kernels.ffn_situ(x, up8, up_s, down8, down_s)  # down(situ(up(x))), 2 GEMMs
 model.proj = xpu_kernels.Int8Linear.from_linear(model.proj)   # drop-in, inference
+
+# a layer that cannot use the kernels has a *reason*, not just None:
+reason = xpu_kernels.unsupported_reason(x, w8, ws, act="gelu_tanh")
 ```
 
 Where it fits their project:
@@ -57,6 +63,7 @@ one-line escape hatch:
 | `xpu_kernels/triton/adaln.py` | RMSNorm + adaLN scale/shift in one pass over the row | 25 → 16 ms/step (**1.56×**), bit-exact | **differentiable now**: one kernel for `dx` + a two-stage reduction for `dscale`/`dshift`; fwd+bwd **6.3×** vs the eager chain, 1.5e-7 against autograd. Works with every modulation shape a trainer passes, and the modulation gradients are more accurate than the eager chain's |
 | `xpu_kernels/triton/rope.py` | RMSNorm + rope in one pass; also reads the INT8 GEMM accumulator directly | rope alone **2.34×** (35.7 → 15.3 ms/forward), bit-exact | **differentiable now**: fused backward, fwd+bwd **14.3×** vs the eager chain (0.62 vs 8.88 ms per tensor), gradient closer to float64 than autograd's |
 | `src/xpuint8.cpp` `situ_reg` | situ with `expm1` tanh | −0.41 ms/call, −34.7 ms/step | see §3 — this one is a *finding*, not just code |
+| `xpu_kernels/int8/ops.py` `ffn_situ` | `down(situ(up(x)))` without the bf16 `[M, 2*ffn]` intermediate | 2 GEMMs instead of 2 GEMMs + 3 memory-bound passes over that tile; the second GEMM's input is the fused epilogue's int8 output | one call instead of composing `linear_acc` + `dequant_act_quantize` + `_int_mm` + `dequant` by hand |
 | `xpu_kernels/int8/ops.py` | INT8 weight → the backward's `dx = dy @ W` | exact vs the same GEMM in autograd, 0.9% from the unquantized weight (that *is* the INT8 weight), dequant is one-time (~0.4 s for 3.7B) | `dequant_weight` + `linear_dx`, or `Int8Linear.dx(dy)`. `dW` and a quantized-`dy` variant are still open — `docs/todo.md` |
 
 Two design rules in those files worth copying even if the kernels are rewritten:

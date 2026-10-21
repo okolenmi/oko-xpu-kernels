@@ -13,6 +13,7 @@ import torch
 from . import _lib as L
 from ._lib import available, device_name
 from .ops import (
+    TrainableInt8Linear,
     dequant,
     dequant_act_quantize,
     dequant_slice,
@@ -25,6 +26,7 @@ from .ops import (
     linear_acc,
     linear_dx,
     prepare_weight,
+    prepare_weight_fused,
     quantize,
     quantize_act,
     dequant_weight_torch,
@@ -139,12 +141,26 @@ def selftest(verbose: bool = True) -> bool:
     torch.nn.functional.linear(xr, wr).backward(dy)
     dw_rel = float((dw.float() - wr.grad.float()).norm() / wr.grad.float().norm())
 
+    # the trainable (straight-through) linear: the forward is the INT8
+    # model's, and the weight gradient is the bf16 model's
+    tr = TrainableInt8Linear(w, bias)
+    y_tr = tr(x)
+    # the reference is the INT8 model built with the *fused* preparation, which
+    # is what the module uses (the two preparations differ in the last bit)
+    w8_f, ws_f = prepare_weight_fused(w)
+    y_tr_ref = linear(x, w8_f, ws_f, tr.bias.detach())  # the bias is bf16 here
+    tr_same = bool(y_tr.view(torch.int16).eq(y_tr_ref.view(torch.int16)).all())
+    y_tr.backward(dy)
+    dw_tr = tr.weight.grad
+    dw_same = bool(dw_tr.view(torch.int16).eq(dw.view(torch.int16)).all())
+
     ok = (same and slice_same and rel < 0.02 and q2.dtype == torch.int8
           and code_diff <= 1 and scale_rel < 0.05
           and dx_rel < 1e-6 and w_rel < 0.02 and dx_int8_rel < 0.03
           and dx_q_rel < 0.04
           and quant_rel < 2e-3 and scale_same and dequant_same
-          and dx_gemm_rel < 1e-6 and dw_rel < 1e-6 and geglu_same)
+          and dx_gemm_rel < 1e-6 and dw_rel < 1e-6 and geglu_same
+          and tr_same and dw_same)
     if verbose:
         print(f"device            : {device_name()}")
         print(f"INT8 vs bf16      : relative error {rel:.4f} (expect < 0.02)")
@@ -153,6 +169,8 @@ def selftest(verbose: bool = True) -> bool:
         print(f"fused situ vs chain: max code diff {code_diff}, "
               f"max scale rel {scale_rel:.4f}")
         print(f"fused GEGLU FFN vs the unfused chain: bit-identical {geglu_same}")
+        print(f"trainable INT8 linear: the forward is the INT8 model's {tr_same}, "
+              f"dW is the bf16 model's {dw_same}")
         print(f"backward dx vs autograd: rel {dx_rel:.2e} (expect 0)")
         print(f"dequant_weight    : rel {w_rel:.4f} (the INT8 weight itself)")
         print(f"backward dx, INT8 : rel {dx_int8_rel:.4f}")

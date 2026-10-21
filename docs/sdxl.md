@@ -112,14 +112,23 @@ capture, and `prepare_for_capture` materializes the dense weights outside
 it. Finding (c) says this is where the INT8 path's host cost goes: 0.25 ms
 per call × ~70 attention blocks × 2 linears is seconds of host time per step.
 
-**3. The fused weight preparation, and the straight-through path.** For full
-fine-tuning of SDXL the parameter is bf16 and the forward quantizes it every
-step. The torch chain costs **638 ms for 2.17 B parameters, per step**; the C
-kernel does the same work in **38 ms** (16.7×). The two are not the same
-function — the C kernel keeps the rotated values in fp32 where the chain
-rounds them to bf16, so the scale differs by one ULP and 5.7 % of the values
-differ by one unit — so it needs a decision and a gate of its own
-(`docs/todo.md` items 1 and 2).
+**3. The fused weight preparation, and the straight-through path — done.**
+For full fine-tuning of SDXL the parameter is bf16 and the forward quantizes
+it every step. The torch chain costs **350 ms for 2.17 B parameters, per
+step**; the C kernel does the same work in **22.6 ms** (15.5×) ✓. The two are
+not the same function — the C kernel keeps the rotated values in fp32 where
+the chain rounds them to bf16, so the scale differs by up to one bf16 ULP and
+5.7 % of the values differ by one unit — so it is a *separate* function
+(`prepare_weight_fused`), and the INT8 path's error against the bf16 weight
+is unchanged (0.0123 against 0.0122) ✓.
+
+`TrainableInt8Linear` is the module: a bf16 parameter, quantized every
+forward, with the bf16 model's `dW` in the backward (bit for bit) and two
+backward modes — `"ste"` (no copy of the weight, the weight's own 0.9 %
+error) and `"dense"` (the exact gradient, at the price of a transient 2
+bytes/param copy: 4.3 GB for a 2.17 B base, which does not fit beside the
+activations on a 12.2 GB card). It is capture-safe: a captured step
+re-quantizes the *current* weight on every replay ✓.
 
 **4. The int8 convolution path.** 416 M parameters, 12 % of the model, and
 the ConvRot does not reach them: the contraction is spatial, so the

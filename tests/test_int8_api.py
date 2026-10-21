@@ -119,6 +119,23 @@ def test_linear_raises_the_same_message():
     assert str(exc.value) == reason
 
 
+def test_prepare_weight_fused_checks_the_group_size():
+    # the check runs before the library is touched, so it is testable here
+    with pytest.raises(ValueError) as exc:
+        int8.prepare_weight_fused(torch.zeros((32, 384), dtype=torch.bfloat16))
+    assert "384" in str(exc.value) and "256" in str(exc.value)
+
+
+def test_the_trainable_linear_checks_its_arguments():
+    w = torch.zeros((32, 512), dtype=torch.bfloat16)
+    with pytest.raises(ValueError) as exc:
+        int8.TrainableInt8Linear(w, backward="exact")
+    assert "exact" in str(exc.value)
+    with pytest.raises(TypeError) as exc:
+        int8.TrainableInt8Linear(torch.zeros((32, 512), dtype=torch.float16))
+    assert "bfloat16" in str(exc.value)
+
+
 def test_expand_scale():
     # a flat fp32 [n] tensor is returned as is: no copy on the hot path
     flat = _scale(32)

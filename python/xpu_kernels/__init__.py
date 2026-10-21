@@ -26,6 +26,7 @@ from __future__ import annotations
 from .int8 import (
     ACTIVATIONS,
     Int8Linear,
+    TrainableInt8Linear,
     PAIRED_ACTIVATIONS,
     available,
     dequant,
@@ -45,6 +46,7 @@ from .int8 import (
     linear_dx_int8,
     load,
     prepare_weight,
+    prepare_weight_fused,
     quantize,
     quantize_act,
     quantize_row,
@@ -63,13 +65,13 @@ from . import int8, triton
 __version__ = "0.3.0"
 
 __all__ = [
-    "ACTIVATIONS", "Int8Linear", "PAIRED_ACTIVATIONS", "available", "capture_status", "dequant",
+    "ACTIVATIONS", "Int8Linear", "PAIRED_ACTIVATIONS", "TrainableInt8Linear", "available", "capture_status", "dequant",
     "dequant_act_quantize", "dequant_slice", "dequant_weight",
     "dequant_weight_torch", "device_name",
     "expand_scale", "ffn", "ffn_situ", "int8_linear", "is_capturing", "linear",
     "linear_acc", "linear_dw", "linear_dx", "linear_dx_int8", "load",
     "prepare_for_capture",
-    "prepare_weight", "quantize", "quantize_act", "quantize_row",
+    "prepare_weight", "prepare_weight_fused", "quantize", "quantize_act", "quantize_row",
     "require_capture_ready", "rotate", "selftest", "unsupported_reason",
     "int8", "triton",
 ]

@@ -73,6 +73,33 @@
   rebuilt library, and `python -m xpu_kernels` now checks the fused GEGLU
   against the unfused chain as part of the self-test.
 
+* **A fused weight preparation** (`int8.prepare_weight_fused`): the rotate and
+  the quantization in one C pass instead of a torch chain. **15.5× faster** —
+  0.26 ms against 4.07 ms for 25 M parameters, which is 22.6 ms against 350 ms
+  for SDXL's 2.17 B quantized parameters, *per step*.
+
+  It is a separate function on purpose, because it is **not the same
+  function**: the C kernel keeps the rotated values in fp32 where the chain
+  rounds them to bf16 first, so the row's scale differs by up to one bf16 ULP
+  and 5.7 % of the values differ by one unit. The INT8 path's error against
+  the bf16 weight is unchanged (0.0122 against 0.0123), and the round trip
+  through the fused dequantizer is exact. Swapping it into `prepare_weight`
+  would change every stored weight in the wild, so it did not happen.
+
+* **The straight-through INT8 linear** (`int8.TrainableInt8Linear`): the
+  parameter stays bf16 and is quantized on every forward, so it can be
+  trained. The forward is the INT8 model's; the backward is the bf16 model's
+  — `dW = dy^T @ x`, bit for bit, because the ConvRot rotation cancels in the
+  contraction. Two backward modes: `"ste"` (the default) computes
+  `dx = dy @ W` with the bf16 parameter, so no copy of the weight is made and
+  the error is the weight's own (0.9 %); `"dense"` computes the exact
+  `dy @ dequant(w8, s)` at the price of a transient full-precision copy.
+
+  The forward is **capture-safe**: the quantization is a device-side kernel
+  with no host synchronization, so a captured training step re-quantizes the
+  *current* weight on every replay — which is the property that makes it
+  usable inside a graph at all (`debug/verify_trainable_int8.py`).
+
 ## 0.3.0
 
 *Released after 0.2.0, which shipped the INT8 path, the two Triton kernels and

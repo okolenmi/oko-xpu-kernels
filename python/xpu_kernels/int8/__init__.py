@@ -65,6 +65,7 @@ from __future__ import annotations
 from ._lib import ACTIVATIONS, PAIRED_ACTIVATIONS, available, device_name, load
 from .ops import (
     Int8Linear,
+    TrainableInt8Linear,
     dequant,
     dequant_weight,
     dequant_weight_torch,
@@ -80,6 +81,7 @@ from .ops import (
     linear_dx,
     linear_dx_int8,
     prepare_weight,
+    prepare_weight_fused,
     quantize,
     quantize_act,
     quantize_row,
@@ -94,7 +96,7 @@ __all__ = [
     "dequant", "dequant_act_quantize",
     "dequant_slice", "dequant_weight", "dequant_weight_torch", "device_name", "expand_scale",
     "ffn", "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
-    "prepare_weight", "quantize", "quantize_act", "quantize_row",
+    "prepare_weight", "prepare_weight_fused", "quantize", "quantize_act", "quantize_row",
     "quantize_row_torch", "rotate",
     "selftest", "unsupported_reason",
 ]

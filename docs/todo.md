@@ -3,48 +3,43 @@
 Ranked by what unblocks the most. Every item names the evidence that would
 close it; "done" means measured, not implemented.
 
-The closed items are at the bottom, one line each, with where the evidence
-lives. The long history is in `CHANGELOG.md` and `docs/performance.md`.
+The items marked *done* or *closed* are kept for the record — the numbers in
+them are the ones the decisions rest on. **The open ones are 4, 5 and 7.**
+The closed items are also in the table at the bottom, one line each.
 
-## 1. A fused weight preparation (the straight-through path's blocker)
+## 1. A fused weight preparation — done
 
-`prepare_weight` is a torch chain: **4.34 ms per 25 M parameters**, i.e.
-**638 ms for a 3.7 B model, per step**. The C kernel that does the same work
-(rotate + quantize, per row) takes **0.26 ms** — 16.7×, or **38 ms** for
-3.7 B.
+`prepare_weight` is a torch chain: **4.07 ms per 25 M parameters**, i.e.
+**350 ms for 2.17 B, per step**. The C kernel that does the same work (rotate
++ quantize, per row) takes **0.26 ms** — 15.5x, or **22.6 ms** for 2.17 B.
 
-It is **not the same function**, and that is the whole difficulty: the chain
-rounds the rotated values to bf16 before the abs-max, the C kernel keeps them
-in fp32, so the scale differs by one ULP and 5.7 % of the values differ by one
-unit. Switching would change every model's weights, so it needs a decision and
-a gate of its own, not a quiet swap.
+It is **not the same function**, and that is why it is a *separate* function
+(`prepare_weight_fused`) rather than a quiet swap: the chain rounds the
+rotated values to bf16 before the abs-max, the C kernel keeps them in fp32,
+so the scale differs by up to one bf16 ULP and 5.7 % of the values differ by
+one unit. The INT8 path's error against the bf16 weight is unchanged
+(0.0123 against 0.0122 — the fused one is marginally better), and the round
+trip through the fused dequantizer is exact.
 
-What it buys: the **straight-through** training path, where the parameter is
-bf16 and the forward quantizes it per step. At 638 ms that is a third of a
-step; at 38 ms it is noise.
+Decided: a separate function, its own name, no change to `prepare_weight`.
+Verified in `debug/verify_prepare_fused.py`.
 
-- [ ] decide: a separate `prepare_weight_fused`, or a switch, or a change to
-      the C kernel so the two agree;
-- [ ] measure the INT8 path's error against bf16 with the fused preparation
-      (the expected change is ~1e-4, far below the path's own 0.94 %);
-- [ ] gate it: the row scale and the values are pinned against the chain in
-      float64, as `tests/test_quantize.py` does for the quantizer.
+## 2. The straight-through training path — done
 
-## 2. The straight-through training path
+`TrainableInt8Linear`: the parameter stays bf16, the forward quantizes it
+every step, and the backward returns the bf16 model's `dW = dy^T @ x` (bit
+for bit — the rotation cancels). The forward is the INT8 model's, so the
+baseline has to be re-taken with that storage.
 
-The weight gradient already exists and is exact: `linear_dw(dy, x) = dy^T @ x`
-— the rotation cancels, so the INT8 model's weight gradient is the bf16
-model's, bit for bit (`debug/verify_linear_dw.py`).
+Two backward modes: `"ste"` (the default) computes `dx = dy @ W` with the
+bf16 parameter — no copy, the weight's own 0.9 % error; `"dense"` computes
+the exact `dy @ dequant(w8, s)` at the price of a transient full-precision
+copy (2 bytes/param, 4.3 GB for a 2.17 B base, which does not fit beside the
+activations on a 12.2 GB card).
 
-What is missing is the module: a parameter that stays bf16, a forward that
-quantizes it per step, and a backward that returns `dW`. It is the last piece
-of the INT8 story and it depends on item 1.
-
-- [ ] the module, with the capture rules of `Int8Linear` (no dequant inside a
-      graph; the per-step quantization *is* capturable, but its cost is
-      per-step);
-- [ ] the memory arithmetic: 2 bytes/param for the parameter, 1 for the
-      quantized copy, and the optimizer state on top.
+The forward is capture-safe: the quantization is a device-side kernel with no
+host synchronization, so a captured step re-quantizes the *current* weight on
+every replay — verified in `debug/verify_trainable_int8.py`.
 
 ## 3. A 64-element ConvRot group — closed by measurement
 
@@ -122,6 +117,8 @@ shapes, and at parity with bf16 at the big M.
 | the fused row-quantizer | 4.17 → 0.27 ms, 9 launches → 1; the one kernel that is not bit-exact, and why (hardware division) — `docs/performance.md` |
 | the fused NF4 dequantizer | 20.75 → 0.66 ms (31×), bit-exact, no scratch |
 | the fused weight dequantizer | 215 → 63 ms for 2.17 B parameters, bit-identical |
+| the fused weight *preparation* | `prepare_weight_fused`: 15.5× the chain (22.6 ms against 350 ms for 2.17 B, per step), the error unchanged — `debug/verify_prepare_fused.py` |
+| the straight-through INT8 linear | `TrainableInt8Linear`: a bf16 parameter quantized every forward, `dW` the bf16 model's bit for bit, capture-safe — `debug/verify_trainable_int8.py` |
 | the SDXL parameter map and the speed at SDXL's shapes | 86 % of the parameters are INT8-eligible; the INT8 path is 2.5× faster on the FFN's down-projection and 1.5× slower on its up-projection (the int32 accumulator) — `debug/probe_sdxl_shapes.py`, `docs/sdxl.md` |
 | SDXL's activation in the fused FFN | `geglu_erf` and `gelu_erf`, bit-identical to torch's chains (the erf-GELU proved over every bf16 value); 1.2-1.5× faster than the unfused INT8 chain — `debug/verify_ffn_geglu.py` |
 | a 64-element ConvRot group | closed by measurement: the layers it would reach are 1.8 % of SDXL, not 15 % |

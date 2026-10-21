@@ -79,6 +79,50 @@ The library is resolved from `$XPU_KERNELS_LIB` (or the legacy
 `$XPU_INT8_LIB`), then `lib/libxpuint8.so` or `build/libxpuint8.so` next to
 the repo, then `sys.prefix`.
 
+### The trainable (straight-through) linear
+
+```python
+mod = xpu_kernels.TrainableInt8Linear.from_linear(model.some_linear)
+model.some_linear = mod          # the parameter is a normal nn.Parameter now
+```
+
+The parameter stays bf16 and is quantized on **every forward**: the forward is
+the INT8 model's and the backward is the bf16 model's — the quantization is
+treated as the identity, which is what makes the parameter learnable. The
+weight gradient is `dy^T @ x`, bit for bit the bf16 model's, because the
+ConvRot rotation cancels in the contraction.
+
+The re-quantization is the cost this exists to make affordable:
+`prepare_weight_fused` is **15.5× faster** than the torch chain (0.26 ms
+against 4.07 ms for 25 M parameters — 22.6 ms against 350 ms for SDXL's 2.17 B,
+per step).
+
+`backward="ste"` (the default) computes `dx = dy @ W` with `W` the bf16
+parameter: no copy of the weight, and the error is the weight's own (0.9 %).
+`backward="dense"` computes the *exact* gradient of the forward,
+`dy @ dequant(w8, s)`, at the price of a transient full-precision copy of the
+weight — 2 bytes per parameter, which for a 2.17 B base is 4.3 GB.
+
+The forward is **capture-safe**: the quantization is a device-side kernel with
+no host synchronization, so a captured step re-quantizes the *current* weight
+on every replay — which is what a training step needs
+(`debug/verify_trainable_int8.py`).
+
+### The fused weight preparation
+
+```python
+w8, w_scale = xpu_kernels.prepare_weight_fused(w)   # one kernel, 15.5x faster
+```
+
+The same result as `prepare_weight` *up to the last bit*: the C kernel keeps
+the rotated values in fp32 where the chain rounds them to bf16 first, so the
+row's scale differs by up to one bf16 ULP and 5.7 % of the values differ by
+one unit. The INT8 path's error against the bf16 weight is unchanged
+(0.0122 against 0.0123), and the weight is otherwise the same.
+
+It is a separate function on purpose: swapping it into `prepare_weight` would
+change every stored weight in the wild.
+
 ## The backward
 
 For `y = x @ W^T` the vjp is `dx = dy @ W` — no transpose, no bias. With an

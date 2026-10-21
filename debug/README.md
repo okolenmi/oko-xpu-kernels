@@ -37,6 +37,8 @@ change:
 | `verify_published_wheel.sh` | the **published** wheel renders the recorded PNG md5 — the download, the install, the gate, and the server restart |
 | `verify_situ.py`, `verify_ffn_fusion.py`, `verify_qkv_rope_fuse.py` | the fused paths against the unfused chains |
 | `verify_ffn_geglu.py` | SDXL's GEGLU: the fused FFN against the chain a model writes, the half order, and the capture |
+| `verify_prepare_fused.py` | the fused weight preparation against the torch chain: how different the weights are, whether the error changes, and the speed |
+| `verify_trainable_int8.py` | the straight-through linear: the forward, the weight gradient, the two backward modes, and the capture |
 | `verify_quant_lib.py` | the Triton quantizer against the torch chain, within the gate's budget |
 
 ## The probes (the ones that measure)

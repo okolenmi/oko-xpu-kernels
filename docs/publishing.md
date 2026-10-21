@@ -1,9 +1,10 @@
 # Publishing
 
 The short version: bump `pyproject.toml` and `python/xpu_kernels/__init__.py`,
-tag `vX.Y.Z`, push the tag. `.github/workflows/release.yml` builds both
-artifacts, uploads them to PyPI, and attaches the same artifacts to the GitHub
-Release. Nothing else is allowed to publish.
+tag `vX.Y.Z`, push the tag, and then dispatch the release workflow by hand
+with that tag and `publish: true`. It builds both artifacts, uploads them to
+PyPI, and attaches the same artifacts to the GitHub Release. Nothing else is
+allowed to publish, and a push publishes nothing.
 
 ## One-time setup
 
@@ -88,20 +89,13 @@ set to `yes`.
 
 ## Releasing
 
-Rehearse first. The workflow has a `workflow_dispatch` trigger that builds
-both artifacts and publishes nothing (the publish jobs are gated on
-`github.ref_type == 'tag'`):
+**A release is a deliberate act.** Nothing is published by a push: the
+workflow is dispatched by hand, with the tag to release and an explicit yes/no
+for PyPI. A version is for something worth versioning, not for every function
+-- the changes that are waiting are in `CHANGELOG.md`.
 
 ```bash
-# Actions -> release -> Run workflow (on main)
-```
-
-That is where a broken oneAPI install shows up, without touching PyPI.
-
-Then, for a real release:
-
-```bash
-# 1. the version, in both places (compared against the tag at publish time)
+# 1. the version, in both places (the workflow compares the tag with it)
 $EDITOR pyproject.toml python/xpu_kernels/__init__.py
 
 # 2. locally, before tagging -- an upload cannot be replaced
@@ -110,11 +104,23 @@ python -m twine check dist/*
 python -m pip install --no-deps --target /tmp/chk dist/*.whl
 PYTHONPATH=/tmp/chk python -c 'import xpu_kernels; print(xpu_kernels.available())'
 
-# 3. ship
-git commit -am "0.2.1"
-git tag -a v0.2.1 -m "0.2.1, built with oneAPI 2025.3.2"
-git push origin main v0.2.1
+# 3. tag it
+git commit -am "0.3.0"
+git tag -a v0.3.0 -m "0.3.0, built with oneAPI 2025.3.2"
+git push origin main v0.3.0
 ```
+
+Then **Actions -> release -> Run workflow**:
+
+| input | value |
+|---|---|
+| `tag` | `v0.3.0` (the tag must already exist) |
+| `publish` | `false` to build and check only, `true` to upload to PyPI |
+
+The `publish: false` run is the rehearsal: it builds both artifacts, checks
+the platform tag against the `.so`, and attaches the files to the GitHub
+Release, without touching PyPI. That is where a broken oneAPI install shows
+up. The `publish: true` run does the same and uploads.
 
 The tag message is where the toolchain goes. The version cannot carry it: PyPI
 rejects local version identifiers (`0.2.1+oneapi2025.3`) because PEP 440
@@ -179,8 +185,7 @@ binary without an index.
 
 ## Dry run
 
-`workflow_dispatch` is deliberately not wired to publish: a manual run from a
-branch would exercise the OIDC claims with the wrong ref. The rehearsal above
-builds and checks everything and stops there. TestPyPI would need a second
-pending publisher on <https://test.pypi.org>; not worth it for a package whose
-failure mode is "the upload was rejected", which is loud and free.
+The `publish: false` run is the rehearsal: it builds and checks everything and
+uploads nothing. TestPyPI would need a second pending publisher on
+<https://test.pypi.org>; not worth it for a package whose failure mode is "the
+upload was rejected", which is loud and free.

@@ -1,12 +1,22 @@
 name: release
 
-# Publishing, and only publishing: a tag push is the one act that ships. Nothing
-# here runs on a branch push, so a release cannot go out by accident.
+# A release is a deliberate act, so nothing here is automatic.
+#
+# The workflow is dispatched by hand, with the tag to release and an explicit
+# yes/no for PyPI:
+#
+#     Actions -> release -> Run workflow
+#         tag:     v0.2.0
+#         publish: true
+#
+# A push does not publish anything.  The package version moves when there is
+# something worth a version, not every time a function is added -- the changes
+# that are waiting are in CHANGELOG.md.
 #
 # PyPI is configured as a *trusted publisher*, not with an API token: the upload
-# job asks GitHub for an OIDC token and PyPI checks its claims. That check is an
-# exact string match on four fields, and a mismatch fails with "the publisher
-# was not found" rather than anything readable. They are:
+# job asks GitHub for an OIDC token and PyPI checks its claims.  That check is
+# an exact string match on four fields, and a mismatch fails with "the
+# publisher was not found" rather than anything readable.  They are:
 #
 #   project     xpu-kernels
 #   owner       okolenmi
@@ -19,39 +29,39 @@ name: release
 #   * wheel -- carries libxpuint8.so; needs a oneAPI 2025.x runtime to load
 #
 # The wheel is what makes `pip install xpu-kernels` actually compute, so it goes
-# to PyPI as well as to the GitHub Release. It is tagged linux_x86_64, so other
-# platforms simply fall back to the sdist. The version stays plain `0.2.0`
-# because PyPI must not accept local versions (PEP 440) -- the toolchain lives
-# in the tag and the release notes instead.
-#
-# The jobs run on a pinned image rather than ubuntu-latest, and that is not a
-# detail: the wheel carries an ELF, and a wheel built against a newer glibc
-# does not load on an older one.  The wheel job builds on ubuntu-22.04
-# (glibc 2.35) because that is what the manylinux_2_35_x86_64 tag claims, and
-# it checks the .so against that number.  ubuntu-latest migrates to Ubuntu
-# 26.04 (glibc 2.4x) as of 2026-10-19, which would make the tag a lie.
+# to PyPI as well as to the GitHub Release.  It is tagged manylinux, so other
+# platforms simply fall back to the sdist.  The version stays plain because
+# PyPI must not accept local versions (PEP 440) -- the toolchain lives in the
+# tag and the release notes instead.
 #
 # The wheel is built here, on a GitHub-hosted runner, and not on a self-hosted
 # one: the .so needs a DPC++ compiler, and that compiler is a downloadable apt
 # package, so the alternative was a runner daemon sitting on the maintainer's
 # desktop (and a job that would otherwise queue forever -- there is no such
-# runner registered). The toolchain version is pinned to the one this
+# runner registered).  The toolchain version is pinned to the one this
 # repository was verified with (2025.3.2), because the .so links libsvml and
 # friends: a consumer with a different oneAPI patch release may not have the
-# symbols. The pin is asserted below, so a toolchain that drifts fails the
+# symbols.  The pin is asserted below, so a toolchain that drifts fails the
 # release instead of publishing a .so that cannot load.
 
 on:
-  push:
-    tags: ["v*"]
-  # A rehearsal: builds both artifacts, publishes nothing. The publish jobs are
-  # gated on `github.ref_type == 'tag'`, so a manual run cannot upload.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to release (it must already exist, and must match the package version)"
+        required: true
+        type: string
+      publish:
+        description: "Upload to PyPI -- leave off to build and check only"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 env:
+  TAG: ${{ inputs.tag }}
   ONEAPI_VERSION: 2025.3.2-832
   # The platform tag of the wheel.  PyPI refuses the plain "linux_x86_64" that
   # bdist_wheel produces ("unsupported platform tag"), so the tag is a
@@ -65,6 +75,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-python@v6
         with:
@@ -81,14 +93,13 @@ jobs:
           python -m twine check dist/*
 
       # A tag that disagrees with pyproject.toml would publish one version and
-      # label it another. This runs before anything is uploaded.
+      # label it another.  This runs before anything is uploaded.
       - name: The tag is the version
-        if: github.ref_type == 'tag'
         run: |
           python - <<'PY'
           import os, tomllib
           version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
-          tag = os.environ["GITHUB_REF_NAME"]
+          tag = os.environ["TAG"]
           if tag.startswith("v"):
               tag = tag[1:]
           assert tag == version, f"tag {tag} != pyproject version {version}"
@@ -107,6 +118,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-python@v6
         with:
@@ -204,13 +217,13 @@ jobs:
 
   publish-sdist:
     needs: [sdist]
-    if: github.ref_type == 'tag'
+    if: inputs.publish
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write       # what trusted publishing exchanges for an upload
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v6
         with:
           name: dist-sdist
           path: dist
@@ -225,13 +238,13 @@ jobs:
 
   publish-wheel:
     needs: [sdist, wheel]
-    if: github.ref_type == 'tag'
+    if: inputs.publish
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v6
         with:
           name: dist-wheel
           path: dist
@@ -243,18 +256,18 @@ jobs:
           skip-existing: true
 
   github-release:
-    needs: [publish-sdist, publish-wheel]
-    if: always() && github.ref_type == 'tag' && needs.publish-sdist.result == 'success'
+    needs: [publish-sdist]
+    if: always() && needs.publish-sdist.result != 'cancelled'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v6
         with:
           name: dist-sdist
           path: dist/sdist
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v6
         continue-on-error: true      # a failed wheel job must not lose the sdist
         with:
           name: dist-wheel
@@ -277,7 +290,7 @@ jobs:
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
-          tag="$GITHUB_REF_NAME"
+          tag="$TAG"
 
           code=$(curl -sS -o /tmp/release.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \

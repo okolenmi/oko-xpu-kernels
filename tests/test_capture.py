@@ -56,10 +56,22 @@ def test_is_capturing_is_false_and_never_raises():
 
 # -- the report ------------------------------------------------------------
 
-def test_status_is_empty_when_the_kernels_are_active():
-    # the Triton kernels verify on CPU as well, so this is the honest baseline:
-    # nothing to report
-    assert capture.capture_status(need=("rms_rope", "rms_adaln")) == []
+def test_status_is_empty_exactly_when_the_kernels_are_verified():
+    # The gates compare a kernel against comfy_kitchen's implementation, which
+    # is not installed everywhere: in CI (and in the trainer's environment) the
+    # gate is closed for want of a reference, and the status must say so.
+    # The contract is the *iff*, not the emptiness.
+    problems = capture.capture_status(need=("rms_rope", "rms_adaln"))
+    gates = triton.gates()
+    verified = [name for name in ("rms_rope", "rms_adaln")
+                if gates[name].verified]
+    if len(verified) == 2:
+        assert problems == []
+    else:
+        assert problems
+        for name in ("rms_rope", "rms_adaln"):
+            if name not in verified:
+                assert any(name in p for p in problems)
 
 
 def test_status_reports_a_disabled_kernel():

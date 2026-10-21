@@ -22,6 +22,7 @@ written up in `docs/` so they do not have to be rediscovered.
 
 | doc | contents |
 |---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | what has changed since the published version, and what is waiting for a number |
 | [`docs/architecture.md`](docs/architecture.md) | how the rotation maps onto the hardware, the register-residency constraint, DPAS layout |
 | [`docs/performance.md`](docs/performance.md) | all measurements, device ceilings, stage tables, **the fair BF16 comparison** |
 | [`docs/experiments.md`](docs/experiments.md) | what was tried, including the dead ends, so they are not repeated |

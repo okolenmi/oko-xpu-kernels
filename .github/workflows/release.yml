@@ -260,8 +260,12 @@ jobs:
           name: dist-wheel
           path: dist/wheel
 
-      # The same bytes PyPI just took, attached to the tag, so a consumer can
-      # pin one file by URL without an index in between.
+      # The artifacts, rebuilt and attached to the tag, so a consumer can pin
+      # one file by URL without an index in between.  "Rebuilt" is the honest
+      # word: this job compiles the .so from scratch every time, and an archive
+      # carries timestamps, so the file on the release is not byte-identical
+      # to the one on PyPI.  The payload is -- two builds of the same .so on
+      # the same image with the same compiler produce the same bytes.
       #
       # The GitHub API is called directly rather than through `gh`: the CLI has
       # to work out the repository from the checkout, and a failed release is

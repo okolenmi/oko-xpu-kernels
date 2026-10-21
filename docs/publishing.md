@@ -2,7 +2,7 @@
 
 The short version: bump `pyproject.toml` and `python/xpu_kernels/__init__.py`,
 tag `vX.Y.Z`, push the tag. `.github/workflows/release.yml` builds both
-artifacts, uploads them to PyPI, and attaches the same bytes to the GitHub
+artifacts, uploads them to PyPI, and attaches the same artifacts to the GitHub
 Release. Nothing else is allowed to publish.
 
 ## One-time setup

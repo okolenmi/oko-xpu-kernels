@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 
+from .._capture import is_capturing
 from ._lib import (
     ACTIVATIONS,
     _err,
@@ -520,9 +521,23 @@ class Int8Linear(torch.nn.Module):
         memory, and a training loop only needs it when it takes a backward.  So
         ``.to()`` does not move it either -- call with ``refresh=True`` after
         re-quantizing ``w8``/``w_scale`` or moving the module.
+
+        This must happen **before** a device-graph capture, and the package
+        refuses to do it inside one: the dequant is a full-precision copy of
+        the weight (~0.4 s for a 3.7 B model), and a captured kernel is
+        replayed on every step.  Call ``xpu_kernels.prepare_for_capture(model)``
+        once, outside the capture.
         """
         cached = getattr(self, "_dense", None)
         if cached is None or refresh:
+            if is_capturing():
+                raise RuntimeError(
+                    "Int8Linear.dense_weight() materializes a second, "
+                    "full-precision copy of the weight; inside a device-graph "
+                    "capture it would be captured and re-computed on every "
+                    "replay. Call it before capturing -- "
+                    "xpu_kernels.prepare_for_capture(model) does it for a whole "
+                    "model.")
             cached = dequant_weight(self.w8, self.w_scale)
             self._dense = cached
         return cached

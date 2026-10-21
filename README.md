@@ -182,6 +182,30 @@ scale on `dy`). Measured at M=4096: **it is 3.6x slower** than the bf16 path
 faster GEMM saves) and 40 % noisier, so treat it as a *memory* option
 (2x less weight memory), not a speed one.
 
+### Capturing a step
+
+A device graph replays whatever was inside it, every step, forever. Two things
+in this package must not happen inside one, and both now refuse to:
+
+```python
+import xpu_kernels
+
+xpu_kernels.prepare_for_capture(model, need=("rms_rope", "rms_adaln"))
+xpu_kernels.require_capture_ready(model, need=("rms_rope", "rms_adaln"))
+```
+
+`prepare_for_capture` materializes each `Int8Linear`'s dense (bf16) weight --
+a full-precision copy of every quantized weight, ~0.4 s for a 3.7 B model --
+and latches the fused kernels' verdicts, so that neither happens inside the
+capture. `Int8Linear.dense_weight()` raises if the stream is capturing (the
+copy would be captured and re-computed on every replay), and the fused
+kernels' self-test refuses to run there (it synchronizes, which is illegal
+during a capture). `capture_status()` returns the same information as a list
+instead of raising.
+
+`Int8Linear.dx` captures and replays **bit-identically to eager**
+(`debug/verify_capture_guards.py`).
+
 Not here yet: `dW = dy^T @ x` (only needed for full fine-tuning) -- see
 [`docs/todo.md`](docs/todo.md), which also has the graph-capture checklist.
 

@@ -100,16 +100,41 @@ Still open:
 - [x] the same capture verification for `adaln`, including both modulation
       gradients and the partials buffer its backward allocates inside the
       capture: bit-identical replay. Host cost 632 -> 40 us per stage.
-- [ ] the INT8 side needs no capture test of its own: `linear_dx` is one
-      `torch.matmul` and `linear_dx_int8` is `_int_mm` plus elementwise torch,
-      all of which are torch's business inside a graph. What *is* ours is
-      `dequant_weight`, which runs once before capture and must not be inside
-      one -- it allocates a second copy of the weight.
-- [ ] decide the fallback policy: `reference.rms_rope_backward` allocates ~10
-      tensors and is not what anyone wants inside a capture. The gate is latched
-      per process, so the practical answer is "check `status()` at startup, fail
-      loudly if a kernel you intend to capture is inactive" -- a one-line check
-      the trainer can put in its init.
+- [x] the INT8 side, verified on the card
+      (`debug/verify_capture_guards.py`): `Int8Linear.dx` captures and replays
+      **bit-identically to eager** (one `torch.matmul` against the
+      dequantized weight), and `linear_dx_int8` is `_int_mm` plus elementwise
+      torch, which is torch's business inside a graph.
+- [x] `dequant_weight` must not run inside a capture, and now it *cannot*:
+      `Int8Linear.dense_weight()` raises if the current stream is capturing.
+      The reason is money, not correctness -- the dequant is a full-precision
+      copy of the weight (~0.4 s for a 3.7 B model), and a captured kernel is
+      replayed on every step.
+- [x] the fallback policy, decided and implemented: a captured step that
+      silently fell back to the eager chain is slower than an eager step and
+      looks like a regression nobody can explain, so the package now says so.
+      `xpu_kernels.prepare_for_capture(model, need=...)` materializes the
+      dense weights and latches the gates' verdicts;
+      `require_capture_ready(...)` is the one-line check for the trainer's
+      init and raises with the reasons. The gate itself refuses to probe
+      inside a capture (the probe synchronizes), so the failure is a sentence
+      about the gate rather than a synchronisation error from deep inside a
+      capture. All of it is in `xpu_kernels/capture.py`, CPU-tested
+      (`tests/test_capture.py`) and verified on the card.
+- [ ] **the fused entry points do not consult their own gate.** `usable()` is
+      where the gate is asked, and the caller is expected to call it; a caller
+      that skips the question gets an *unverified* kernel, silently, with no
+      error at all (found while verifying the guards:
+      `debug/verify_capture_guards.py`). It is a hole in the package's central
+      promise -- "a fused kernel only runs if it has been proved" -- and it is
+      not closed yet because closing it means the fused functions must fall
+      back to the in-package reference when the gate is closed, and that
+      reference is not necessarily bit-identical to the caller's own fallback
+      (ComfyUI's `comfy_kitchen`): it would change ComfyUI's numbers in the
+      one case where the gate is closed, which is exactly the case ComfyUI
+      handles by not calling the kernel at all. The safe form is a separate
+      entry point that *is* the verified path, plus a deprecation of the
+      unguarded one.
 - [ ] a captured *whole step* is the trainer's integration work, not this
       library's; the library's part is the per-kernel guarantee above.
 

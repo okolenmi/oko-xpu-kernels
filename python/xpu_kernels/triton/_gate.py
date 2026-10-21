@@ -35,6 +35,8 @@ from typing import Callable, Mapping
 
 import torch
 
+from .._capture import is_capturing
+
 log = logging.getLogger(__name__)
 
 __all__ = ["ACCELERATORS", "Gate", "bit_equal_count", "probe_device",
@@ -190,6 +192,18 @@ class Gate:
             return False
         if self._ok is not None:
             return self._ok
+        if is_capturing():
+            # The probe synchronizes and reads values back, which is illegal
+            # during a device-graph capture -- and a capture that contains a
+            # sync fails with a message about the sync, not about the kernel
+            # that needed it.  The verdict has to be latched before the
+            # capture starts; that is what prepare_for_capture() is for.
+            raise RuntimeError(
+                f"{self.name}: the self-test cannot run inside a device-graph "
+                f"capture -- it synchronizes and reads values back. Call the "
+                f"kernel once before capturing, or call "
+                f"xpu_kernels.prepare_for_capture(), so the verdict is latched "
+                f"before the capture starts.")
         self._ok = False
         try:
             ref = self.reference or self.default_reference()
@@ -247,6 +261,16 @@ class Gate:
         verdict = "active" if self._ok else "inactive"
         warps = f", num_warps={self.num_warps}" if self.num_warps else ""
         return f"{verdict}: {self._why}{warps}"
+
+    @property
+    def verified(self) -> bool | None:
+        """The latched verdict: ``True``/``False``, or ``None`` if this kernel
+        has not been verified yet in this process.
+
+        ``None`` is the interesting value: it means the kernel would *probe* on
+        its next call, and a probe cannot run inside a device-graph capture.
+        """
+        return self._ok
 
     def reset(self) -> None:
         """Forget the verdict (tests only; production latches it)."""

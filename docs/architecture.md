@@ -227,3 +227,41 @@ The two rules that follow from this, and that are easy to get wrong:
    as a pair with its forward (one probe, both outputs), with a float64
    gradcheck where an algebraic identity is involved. See
    `docs/adding-a-kernel.md`.
+
+## Capturing a step
+
+A device-graph capture freezes a region of the step and replays it. The
+package's contribution to that is narrow and mostly about *not* being in the
+way: the kernels are plain launches into the current stream, so they capture
+like anything else.
+
+Three things can go wrong inside a capture, and each of them is silent or
+expensive rather than fatal. The package now refuses all three, because a
+trainer that captures a step gets no second chance to notice.
+
+* **The self-test.** Each fused kernel verifies itself once per process
+  against a reference, and that probe synchronizes and reads values back --
+  illegal during a capture. The gate therefore refuses to probe inside one
+  (`triton/_gate.py`), and the fix is to let the verdict latch before the
+  capture starts.
+* **The fallback.** If the gate is closed, the eager chain runs instead.
+  That is correct, and it is what nobody wants inside a graph: the rope
+  backward allocates about ten tensors, and in a capture those come from the
+  graph's private pool and are replayed with the graph.
+* **The dequantized weight.** `Int8Linear.dx` needs the weight in bf16, which
+  is a second, full-precision copy of every quantized weight (~0.4 s for a
+  3.7 B model). Materializing it inside the capture is not a correctness bug --
+  the copy is deterministic -- but it is re-computed on *every replay*.
+  `Int8Linear.dense_weight()` refuses to do it there.
+
+`xpu_kernels/capture.py` is the interface: `prepare_for_capture(model, need=...)`
+does the work outside the capture, `require_capture_ready(...)` is the check to
+call before capturing, and `capture_status(...)` returns the same information
+as a list. The contract is verified on CPU (`tests/test_capture.py`) and on the
+card (`debug/verify_capture_guards.py`), which also captures `Int8Linear.dx`
+and replays it bit-identically to eager.
+
+One hole is left open, and it is recorded in `docs/todo.md`: the fused entry
+points do not consult their own gate. `usable()` is where the gate is asked,
+and the *caller* is expected to ask it -- a caller that skips the question gets
+an unverified kernel, silently.

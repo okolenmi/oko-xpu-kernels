@@ -142,10 +142,29 @@ those numbers trustworthy, and it transfers as-is:
 - INT8 in the training graph: `dL/dx` **is** available now —
   `dequant_weight(w8, w_scale)` once, then `linear_dx(dy, w)` (or
   `Int8Linear.dx(dy)`). It is exact against autograd of the same GEMM and 0.9 %
-  from the unquantized weight, which is the INT8 weight, not the backward. Still
-  missing: `dW` (full fine-tuning only) and the faster int8-GEMM variant that
-  keeps the weight quantized; `docs/todo.md` has both plus the graph-capture
-  checklist.
+  from the unquantized weight, which is the INT8 weight, not the backward. It
+  is also **capturable**: `debug/verify_capture_guards.py` captures
+  `Int8Linear.dx` and replays it bit-identically to eager. What is left is
+  `dW` (full fine-tuning only) and the faster int8-GEMM variant that keeps the
+  weight quantized; `docs/todo.md` has both.
+
+  **The one line to put in your init**, because a captured step that silently
+  fell back to the eager chain is slower than an eager step and looks like a
+  regression nobody can explain:
+
+  ```python
+  import xpu_kernels
+  xpu_kernels.prepare_for_capture(model, need=("rms_rope", "rms_adaln"))
+  xpu_kernels.require_capture_ready(model, need=("rms_rope", "rms_adaln"))
+  ```
+
+  `prepare_for_capture` materializes each `Int8Linear`'s dense (bf16) weight
+  — a full-precision copy of every quantized weight, ~0.4 s for a 3.7 B model —
+  and latches the fused kernels' verdicts, so neither happens inside the
+  capture. The package now *refuses* both: `dense_weight()` raises if the
+  stream is capturing, and the gate refuses to run its self-test there (the
+  probe synchronizes). `require_capture_ready` is the same check as an
+  exception. `capture_status()` returns the same information as a list.
 - The graph-capture and `addcmul_` findings — MossImage-specific.
 - Prompt/text encoding: closed here as "fast enough", no result worth porting.
 - The ComfyUI memory-accounting patch: their code is already correct.

@@ -46,15 +46,22 @@ from .int8 import (
     selftest,
     unsupported_reason,
 )
+from .capture import (
+    capture_status,
+    is_capturing,
+    prepare_for_capture,
+    require_capture_ready,
+)
 from . import int8, triton
 
 __version__ = "0.2.0"
 
 __all__ = [
-    "Int8Linear", "available", "dequant", "dequant_act_quantize",
-    "dequant_slice", "dequant_weight", "device_name", "expand_scale",
-    "ffn_situ", "linear", "linear_acc", "linear_dx", "linear_dx_int8", "load",
-    "prepare_weight", "quantize", "quantize_act", "quantize_row", "rotate",
-    "selftest", "unsupported_reason",
+    "Int8Linear", "available", "capture_status", "dequant",
+    "dequant_act_quantize", "dequant_slice", "dequant_weight", "device_name",
+    "expand_scale", "ffn_situ", "is_capturing", "linear", "linear_acc",
+    "linear_dx", "linear_dx_int8", "load", "prepare_for_capture",
+    "prepare_weight", "quantize", "quantize_act", "quantize_row",
+    "require_capture_ready", "rotate", "selftest", "unsupported_reason",
     "int8", "triton",
 ]

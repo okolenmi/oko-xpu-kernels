@@ -23,6 +23,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <utility>
+#include <vector>
 
 using namespace sycl;
 using BF = sycl::ext::oneapi::bfloat16;
@@ -598,9 +601,49 @@ int main(int argc, char **argv) {
     double r8 = bench("18 eight groups per lane (64 th)", [&] {
         run_regs<8>(q, acc, out, sc, xs, ws, M, K);
     });
-    // mode 15 (sycl::reduce_over_group over the 512-wide group) is NOT timed:
-    // it intermittently segfaults the host process on this runtime. See docs.
+    // Mode 15 replaces the local-memory row max with one
+    // sycl::reduce_over_group over the whole work-group. It used to segfault
+    // this process (twice, intermittently) and was removed from the sweep.
+    // Re-tested 2026-10-21: thousands of launches, no crash, and it is the
+    // fastest row-max form here -- so it is back, opt-in, together with a
+    // bit-exactness check against mode 0. A regression shows up as a crash or
+    // a diff in this probe, never in production.
+    //
+    //   PROBE_REDUCE=1 ./bin/probe_ffn_situ 3973 8192 device
     double p = 0.0;
+    if (std::getenv("PROBE_REDUCE")) {
+        std::vector<int8_t> ref(M * K), got(M * K);
+        run<0>(q, acc, out, sc, xs, ws, M, K);
+        q.memcpy(ref.data(), out, M * K).wait();
+        run_reduce<1>(q, acc, out, sc, xs, ws, M, K);
+        q.memcpy(got.data(), out, M * K).wait();
+        size_t diff = 0;
+        for (size_t i = 0; i < M * K; ++i) diff += ref[i] != got[i];
+        std::printf("\n  row-max forms: %zu / %zu output bytes differ\n", diff, M * K);
+
+        // Interleaved pairs: the two variants alternate inside the same second,
+        // so desktop-clock drift cannot bias the ratio.
+        auto timeit = [&](auto fn, int reps) {
+            for (int i = 0; i < 3; ++i) fn();
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < reps; ++i) fn();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+        };
+        std::vector<double> ratios;
+        for (int r = 0; r < 15; ++r) {
+            const double t0 = timeit([&] { run<0>(q, acc, out, sc, xs, ws, M, K); }, 20);
+            const double t15 = timeit([&] { run_reduce<1>(q, acc, out, sc, xs, ws, M, K); }, 20);
+            ratios.push_back(t15 / t0);
+            std::printf("  pair %2d: mode0 %.4f ms   mode15 %.4f ms\n", r, t0, t15);
+        }
+        std::sort(ratios.begin(), ratios.end());
+        std::printf("  mode15 / mode0 = %.3f (median, range %.3f - %.3f)\n",
+                    ratios[ratios.size() / 2], ratios.front(), ratios.back());
+        std::fflush(stdout);
+        p = bench("15 reduce_over_group row-max",
+                  [&] { run_reduce<1>(q, acc, out, sc, xs, ws, M, K); });
+    }
 
     std::printf("\n  situ (tanh/exp chain)      = %+.4f ms\n", a - b);
     std::printf("  row-max + barrier + store  = %+.4f ms  (2 vs 0)\n", c - a);
@@ -618,6 +661,7 @@ int main(int argc, char **argv) {
     std::printf("  two groups per lane        = %+.4f ms  (13 vs 16)\n", n - r2);
     std::printf("  four groups per lane       = %+.4f ms  (13 vs 17)\n", n - r4);
     std::printf("  eight groups per lane      = %+.4f ms  (13 vs 18)\n", n - r8);
-    std::printf("  reduce_over_group row max  = not usable (host segfault)\n");
+    if (std::getenv("PROBE_REDUCE"))
+        std::printf("  reduce_over_group row max  = %.4f ms (mode 15, opt-in)\n", p);
     return 0;
 }

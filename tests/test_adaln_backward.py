@@ -35,7 +35,9 @@ def _rand(shape, seed=0, scale=0.5):
 
 
 def _max_abs(a, b):
-    return float((a - b).abs().max())
+    # detach: some callers pass tensors that require grad, and float() on one
+    # is only a warning -- but a warning in the suite hides the next one
+    return float((a.detach() - b.detach()).abs().max())
 
 
 @pytest.mark.parametrize("mod_shape", SHAPES)

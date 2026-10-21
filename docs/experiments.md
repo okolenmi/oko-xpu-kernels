@@ -98,6 +98,12 @@ serialisation, not the reduce.
 At **88% of the floor**. The scalar loop is already vectorised; the "obvious"
 bit trick is 2x worse. No headroom.
 
+The same kernel's *row max* is a different story: the barrier + serial
+local-memory loop that gates every store costs 24 % of the FFN epilogue, and one
+`sycl::reduce_over_group` gets 16 % of the kernel back (bit-identical output,
+interleaved) -- not shipped because the construct once killed the host process.
+`docs/performance.md`, "The FFN epilogue's row max".
+
 ---
 
 ## 4. Pipeline-level

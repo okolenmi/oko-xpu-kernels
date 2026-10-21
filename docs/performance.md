@@ -358,6 +358,51 @@ Progression: **0.765 → 0.52 ms**, from
 
 ---
 
+## The FFN epilogue's row max: 16 % of the kernel, not taken
+
+The situ/quantize epilogue has to know the row max before it can store a single
+byte, and the row spans a whole work-group (`K/256` sub-groups x 16 lanes).
+Three ways to get it, all in `debug/native/probe_ffn_situ.cpp`
+(M=3973, K=8192, 292.9 MB of traffic):
+
+| row-max form | time | notes |
+|---|---|---|
+| write sub-group maxes to local memory, barrier, serial loop (production) | 0.925 ms | |
+| ... the same kernel with the row max removed entirely (mode 2, wrong result) | 0.720 ms | the reduction costs **0.223 ms = 24 %** |
+| `sycl::reduce_over_group(it.get_group(), vm, sycl::maximum<>())` (mode 15) | 0.774 ms | 0.052 ms above the no-row-max floor |
+
+Interleaved A/B (mode 0 and mode 15 alternating inside the same second, 15
+pairs x 20 launches, best-of-nothing): **mode15 / mode0 = 0.836**, range
+0.831-0.845, identical under the 2025.3 toolchain (0.833, 0.830-0.840). The
+int8 output is **bit-identical**, 0 of 32 546 816 bytes differ -- `fmax` over
+finite values does not care about order, and the row max is exactly the same
+value, so the resulting scale is too.
+
+**Not shipped, and the reason is not the 0.6 %.** 42 calls per step x 0.925 ms
+is ~39 ms/step, so the win is ~6.4 ms of ~1050 (0.6 %), below a step-level
+slope's noise floor. Against that: this construct used to kill the process
+(`SIGSEGV`/`SIGBUS`, no SYCL exception, twice, which is why it was removed from
+the probe). A gate cannot catch that -- the failure is the process dying, not a
+wrong number. So the production kernels keep the butterfly + local-memory form.
+
+What changed on 2026-10-21: it no longer crashes. The isolated reproducer
+(`debug/native/reproduce_reduce_over_group.cpp`: 8 work-group sizes x 4
+reduction ops x 200 launches x 5 processes, both toolchains, Level Zero) and the
+full kernel above ran without a fault -- ~35 000 reductions of real work-group
+widths (the epilogue itself uses 512), no crash and no wrong result. That is a
+statement about driver `1.17.39758` and this machine, not a fix claim -- no
+changelog entry was found and the crash was never filed upstream. The probe
+therefore keeps the variant behind `PROBE_REDUCE=1` with a bit-exactness check
+against mode 0, so the next driver bump can re-test it in one command:
+
+    PROBE_REDUCE=1 ./debug/native/bin/probe_ffn_situ 3973 8192 device
+
+The activation quantizer (`kernels/xpuint8.cpp`, second `lmax` block) has the
+same row max and would presumably behave the same; it was not measured, so do
+not add the ~2 ms it might be worth to the 6.4 above.
+
+---
+
 ## The hand-written GEMM is L2-bound, not DPAS-bound
 
 `debug/probe_gemm_shapes.py`. v3 reaches 43 TOPS = 12.5% of the 344 TOPS DPAS

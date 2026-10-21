@@ -218,6 +218,21 @@ package does not have:
       their shape as a constant today). Low value until someone else needs to
       reproduce a number.
 
+## 6. Opportunities measured, not taken
+
+- [ ] **`reduce_over_group` row max in the FFN epilogue: 16 % of the kernel,
+      ~6.4 ms/step, not shipped.** The construct used to kill the host process
+      (twice); a re-test on 2026-10-21 no longer reproduces it (~35 000 launches,
+      both toolchains) and the variant is bit-identical and 0.836x the
+      production time interleaved. It stays out because a gate cannot catch a
+      `SIGSEGV`: the process dies instead of returning a wrong number, and 0.6 %
+      of a step does not buy that risk. The probe keeps it behind
+      `PROBE_REDUCE=1`, so the decision can be revisited in one command after a
+      driver bump: `PROBE_REDUCE=1 ./debug/native/bin/probe_ffn_situ 3973 8192 device`.
+      Revisit if the driver that "fixed" it gets a changelog or a filed issue
+      (this is worth reporting: a compiler/runtime bug that silently vanished).
+      The activation quantizer has the same row max and was not measured.
+
 ## Dead ends, recorded so they are not retried
 
 - Attention: every XPU SDPA backend is the same oneDNN kernel.

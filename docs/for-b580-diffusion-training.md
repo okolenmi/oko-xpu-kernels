@@ -102,7 +102,7 @@ kernel-internal effect, not a launch).
 | `use_deterministic_algorithms(True)` switches on `fill_uninitialized_memory` | 2174 fill kernels, 92 ms/forward here | if reproducibility is ever turned on for a training run, clear `fill_uninitialized_memory` around the step: the fills write memory that is overwritten before it is read, and the output stays byte-identical |
 | `total_memory - reserved` counts *other processes'* VRAM as free | 12 216 MB reported vs 3469 MB actual | ComfyUI's OOM cause. Their `next/engine/driver_memory.py` already uses `mem_get_info`, so nothing to fix — just do not reintroduce the proxy in planning |
 | the L0 submission thread burns a full core in `sched_yield` | `perf` profile, 88.8% of samples | harmless when launch-bound (the device is idle anyway) and irrelevant once graphed; it is not a bug to chase |
-| `sycl::reduce_over_group` can segfault on the host | reproduced twice, minimal case | avoid it in any new kernel; the butterfly over `select_from_group` is the portable form (used in `xpuint8.cpp`) |
+| `sycl::reduce_over_group` used to segfault the host | twice (SIGSEGV/SIGBUS, no exception, then nothing in ~35 000 launches on driver 1.17.39758, both toolchains) | re-tested 2026-10-21 with `debug/native/reproduce_reduce_over_group.cpp`; it is **16 % faster** than the butterfly row max and bit-identical, but still do not ship it -- the failure mode is a killed process, which no gate can catch. Re-test after every driver/compiler bump (`PROBE_REDUCE=1`, `docs/performance.md`) |
 
 ## 5. Measurement doctrine that saved this project from itself
 

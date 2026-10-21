@@ -32,6 +32,9 @@ build_one "$HERE/probe_tanh_exact.cpp"          probe_tanh_exact
 build_one "$HERE/probe_lane_utilisation.cpp"    probe_lane_utilisation
 build_one "$HERE/probe_bf16_rotate.cpp"         probe_bf16_rotate
 build_one "$HERE/probe_load_store_width.cpp"    probe_load_store_width
+# Candidate for an upstream report: sycl::reduce_over_group() kills the host
+# process on this runtime. Kept buildable so it can be re-tested after a bump.
+build_one "$HERE/reproduce_reduce_over_group.cpp" reproduce_reduce_over_group
 
 # GEMM probes: correctness-verified against a CPU reference, used to show that
 # the hand-written GEMM is L2-bandwidth bound rather than DPAS bound.
@@ -45,10 +48,23 @@ fi
 # dequant epilogue into the GEMM" lever -- so it is built only if the
 # dependency has been fetched.
 DNNL_ROOT="${DNNL_ROOT:-$HOME/.local/oneapi-dnnl-2025.3}"
+# libdnnl.so is built against libsycl.so.8, so it only links with the 2025.3
+# compiler. With 2026.0 the link fails on ~20 undefined sycl::_V1 symbols --
+# which used to abort this script (set -e) before the rejected probes were built.
+DNNL_ICPX="${DNNL_ICPX:-$HOME/.local/oneapi-2025.3/2025.3/bin/icpx}"
 if [[ -d "$DNNL_ROOT/include" && -d "$DNNL_ROOT/lib" ]]; then
-    "$ICPX" -O3 -fsycl -std=c++17 "$HERE/probe_dnnl_fused.cpp" -o "$OUT/probe_dnnl_fused" \
+    if [[ ! -x "$DNNL_ICPX" ]]; then
+        echo "  skipping probe_dnnl_fused: libdnnl needs the 2025.3 compiler" \
+             "(set DNNL_ICPX; not found at $DNNL_ICPX)"
+        DNNL_ICPX=""
+    fi
+fi
+if [[ -n "${DNNL_ICPX:-}" && -d "$DNNL_ROOT/include" && -d "$DNNL_ROOT/lib" ]]; then
+    "$DNNL_ICPX" -O3 -fsycl -std=c++17 "$HERE/probe_dnnl_fused.cpp" -o "$OUT/probe_dnnl_fused" \
         -I"$DNNL_ROOT/include" -L"$DNNL_ROOT/lib" -ldnnl -Wl,-rpath,"$DNNL_ROOT/lib"
     echo "  built $OUT/probe_dnnl_fused"
+elif [[ -z "${DNNL_ICPX:-}" ]]; then
+    :  # already explained above
 else
     echo "  skipping probe_dnnl_fused (no oneDNN at $DNNL_ROOT; see docs)"
 fi

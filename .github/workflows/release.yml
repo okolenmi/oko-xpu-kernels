@@ -223,7 +223,7 @@ jobs:
     permissions:
       id-token: write       # what trusted publishing exchanges for an upload
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: dist-sdist
           path: dist
@@ -244,7 +244,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: dist-wheel
           path: dist
@@ -256,18 +256,22 @@ jobs:
           skip-existing: true
 
   github-release:
-    needs: [publish-sdist]
+    # Both publishes, not just the sdist's: they are what wait for the builds,
+    # and the artifacts only exist once those are done.  With only
+    # publish-sdist in `needs`, this job started while the wheel was still
+    # building, and the wheel's artifact was not there yet.
+    needs: [publish-sdist, publish-wheel]
     if: always() && needs.publish-sdist.result != 'cancelled'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: dist-sdist
           path: dist/sdist
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         continue-on-error: true      # a failed wheel job must not lose the sdist
         with:
           name: dist-wheel

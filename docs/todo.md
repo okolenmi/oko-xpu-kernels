@@ -340,6 +340,40 @@ Two notes for the next person:
 
 ## 6. Opportunities measured, not taken
 
+- [ ] **the rotate's register residency -- the headline's next step.** The
+      rotate must hold 256 floats (16 zmm) live across load -> row abs-max ->
+      quantize, which costs 3.1x versus an interleaved access pattern: it runs
+      at 138 GB/s instead of 600. The one shape that has not been implemented is
+      a group split across 4 lanes with a single cross-lane axis (a 512-bit
+      cross-lane exchange needs 16 `select_from_group` calls, so the verdict is
+      expected to be the same as the shared-memory version -- but it is the
+      only shape left). **If the rotate reaches its 0.27 ms structural floor,
+      INT8 goes from parity with BF16 to ~35 % faster** (`docs/performance.md`,
+      "What is left"). This is the most valuable thing left inside the
+      library: it is the difference between "INT8 matches bf16" and "INT8
+      beats bf16 by a third", and it is a self-contained piece of ESIMD work
+      with a measured target and a known floor.
+- [x] **a fused NF4 dequantizer** (trainer-facing). `xpu_kernels.triton.nf4`:
+      the QLoRA storage format (16 normal quantiles, a per-block absmax, two
+      4-bit indices per byte) dequantized in one kernel. 100 M parameters:
+      **20.75 ms -> 0.66 ms (31.5x)**, 2.6 bytes of traffic per parameter
+      against the chain's ~40, and **no scratch at all** -- the chain holds
+      ~16 bytes per parameter live (the int64 index tensor alone is 8), so its
+      peak can exceed the bf16 weight the format was meant to replace. It is
+      **bit-exact** against the chain, in fp32 and at the production bf16 --
+      unlike the int8 row-quantizer, this arithmetic has no division and no
+      rounding mode to get wrong. It is also capture-safe (one allocation, the
+      output). The vision document, with the memory arithmetic and the
+      comparison against the int8 base, is in the trainer's tree
+      (`docs/nf4-storage-vision.md`).
+      Still open there: the *double quantization* (the absmax values quantized
+      a second time) is a separate small pass, and the trainer's own
+      `materialize()` is the reference the kernel is compared against.
+- [ ] **the residual add of a pre-norm block, folded into the norm's
+      epilogue.** The last open shape in the bf16 path: one launch and one
+      read-write pass per add (~84 launches and ~6 ms of device time per step
+      in a 42-block model, in a step that is host-bound). Training-safe --
+      the add's backward is the identity.
 - [ ] **`reduce_over_group` row max in the FFN epilogue: 16 % of the kernel,
       ~6.4 ms/step, not shipped.** The construct used to kill the host process
       (twice); a re-test on 2026-10-21 no longer reproduces it (~35 000 launches,

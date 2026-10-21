@@ -489,6 +489,41 @@ rusticl/Mesa) give identical performance, so JIT choice is not a factor.
 
 ---
 
+## The NF4 dequantizer
+
+`xpu_kernels.triton.nf4.dequant_nf4` -- the frozen-base storage format
+(QLoRA's NF4: 16 normal quantiles, a per-block absmax, two 4-bit indices per
+byte) dequantized in one kernel instead of a torch chain.
+
+The chain is the obvious one -- unpack, gather the code, multiply by the
+block's scale -- and it is expensive, because it materializes the unpacked
+indices, casts them to int64 for the gather, and holds the gathered codes and
+the scaled product at the same time.
+
+| 100 M parameters, B580 | time | traffic | scratch |
+|---|---|---|---|
+| torch chain | 20.75 ms | ~40 bytes/parameter (~4 GB) | ~16 bytes/parameter |
+| **fused kernel** | **0.66 ms** (31.5x) | 2.6 bytes/parameter (256 MB) | none |
+
+389 GB/s for the fused version -- a gather-heavy kernel, so not at the card's
+468 GB/s read floor, but four times the chain's effective rate with sixteen
+times less traffic.
+
+**Bit-exact**, which the int8 row-quantizer could not be: the arithmetic is a
+table lookup, a multiply and a cast, with no division and no rounding mode to
+get wrong. The gate compares the kernel against the chain bit for bit, in fp32
+and at the production bf16 (`tests/test_nf4.py` pins the format itself: the
+codebook's definition, the nibble order, the block layout -- so a weight
+stored by one implementation is readable by the other).
+
+The scratch matters as much as the time: the chain's peak can exceed the
+bf16 weight the format was meant to replace, and it allocates inside a forward
+pass, which inside a device-graph capture means the allocation is replayed on
+every step. The fused kernel's only allocation is its output.
+
+The trainer's side of this is in `docs/nf4-storage-vision.md` in the
+trainer's tree.
+
 ## The bf16 path: what is left, measured
 
 The question "can bf16 be made faster?" has an answer for each candidate, and

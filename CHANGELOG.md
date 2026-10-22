@@ -130,6 +130,29 @@
   *current* weight on every replay — which is the property that makes it
   usable inside a graph at all (`debug/verify_trainable_int8.py`).
 
+* **The XPU capture is implemented for inference, and it wins where the
+  trainer's does not.** `comfy/xpu_graph.py` in the ComfyUI tree captures the
+  diffusion forward behind `--xpu-graphs`, and keeps an entry only where the
+  replay *measures* faster. On the real sampler with cfg 7, SDXL at 512×512:
+  **116.6 / 111.7 → 82.6 / 82.0 ms per step (1.37×, interleaved A/B)**; the
+  forward alone is 2.34× (108.3 → 46.4 ms). At 1024×1024 the capture is
+  refused — the math attention's activation peak is 1455 MB against 1438 MB
+  free — and the step time is unchanged.
+
+  This is the launch-bound rule of `docs/sdxl.md` applied to inference: CFG
+  batches cond and uncond into one batch-2 call, so the device time doubles
+  while the host time does not, and the per-call gain falls from 2.3× to
+  1.40×. The gates (the speed, the memory, the weight signature, the
+  attention's numerics) are in `ComfyUI/docs/xpu_graphs.md`; the measurements
+  are in `docs/performance.md`.
+
+  Four things had to be true on this stack, and each was false first: a
+  capture does not execute (the captured output is pool memory until a
+  replay), the flash attention cannot be recorded at all, the math backend
+  must be warm before it is captured (a cold capture was 10.4 off), and each
+  graph has to own its pool (a shared handle makes the second capture fail
+  with an allocator assertion).
+
 ## 0.3.0
 
 *Released after 0.2.0, which shipped the INT8 path, the two Triton kernels and

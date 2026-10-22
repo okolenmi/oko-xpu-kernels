@@ -332,6 +332,42 @@ attention*, and it is a loss at 1024×1024. Making the flash attention
 capturable is what would make the graph a win everywhere — a runtime
 limitation, and worth reporting upstream.
 
+### The capture, implemented and measured end to end
+
+`comfy/xpu_graph.py` in the ComfyUI tree implements it behind `--xpu-graphs`
+(the design and every gate are in `ComfyUI/docs/xpu_graphs.md`). It captures the
+diffusion forward only, keeps an entry only where the replay measures at least
+10 % faster, and otherwise falls back to eager. Two real runs of the real
+sampler, SDXL (`divA.safetensors`, 2.57 B parameters), euler/normal, cfg 7,
+8 steps at 512×512, interleaved A/B:
+
+| | the sampling loop |
+|---|---|
+| eager | 116.6 / 111.7 ms per step |
+| `--xpu-graphs` | 82.6 / 82.0 ms per step |
+
+**1.37x end to end.** The per-call gain is 1.40x, not the 2.3x of the forward:
+CFG runs cond and uncond as one batch-2 call, which doubles the device time and
+leaves the host where it was. The loop is then closer to balanced, which is the
+same rule as batch 3 in the trainer — a graph pays in proportion to how idle the
+device is.
+
+At 1024×1024 the implementation refuses the capture and the step time is
+unchanged (263.0 against 259.9 ms/step), for two independent reasons: the math
+attention's activation peak is 1455 MB against 1438 MB free (the card already
+holds a 4.9 GB model), and the device is busy enough there that a replay is not
+faster.
+
+The pool is the cost: ~123 MB at 512×512, ~1.5 GB at 1024×1024 with the math
+attention. Each graph owns its pool, because a shared
+`torch.xpu.graph_pool_handle()` makes the second capture fail (see
+`ComfyUI/docs/upstream_findings.md`).
+
+The output is not bit-identical, because the captured region runs the math
+attention: the decoded 512×512 images differ by a mean of 0.25/255 (at most
+16/255, on 0.62 % of the pixels by more than 2 levels). That is the same
+substitution `EFFICIENT_ATTENTION` already makes on XPU.
+
 ---
 
 ## INT8 backward: `dL/dx = dy @ W`

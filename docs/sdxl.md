@@ -240,6 +240,17 @@ minimum over the steps of one shape:
   Without it every step's shape is new, the graph's three-sighting warm-up
   never completes, each new shape costs 4-5 s to compile and capture, and the
   graph is captured and **never replayed**.
+* **The same capture is implemented for inference, and there it wins.** The
+  trainer's problem is device-bound training; ComfyUI's 512×512 inference is
+  launch-bound, and `comfy/xpu_graph.py` (`--xpu-graphs`, see
+  `ComfyUI/docs/xpu_graphs.md`) captures only the diffusion forward, measures
+  every shape and keeps an entry only where the replay is at least 10 % faster.
+  On the real sampler with cfg 7 the step goes from 116.6/111.7 to 82.6/82.0 ms
+  (**1.37×**, interleaved A/B, 8 steps). The per-call gain is 1.40×, not the
+  2.3× of the batch-1 forward: CFG batches cond and uncond into one batch-2
+  call, so the device time doubles while the host time does not. At 1024×1024
+  the capture is refused (the math attention's 1455 MB peak against 1438 MB
+  free) and the step time is unchanged.
 
 ### The host direction: finished inside the capture, not outside it
 

@@ -15,7 +15,25 @@ kernels than work):
      flash forward (it should be exact: flash in both paths);
   2. can the chain's segments be captured into ONE shared pool, or does each
      graph need its own (the shared-pool capture failure seen in ComfyUI);
-  3. the wall time of each design against the eager flash forward.
+  3. the wall time of each design against the eager flash forward;
+  4. the real piecewise design: segments captured with *manual*
+     capture_begin/capture_end (not the `with` context manager), a dedicated
+     stream, one shared pool across the whole chain, and eager flash at each
+     boundary -- the shape the ComfyUI integration needs.
+
+Empirical rules found while building arm 5:
+
+  * the chain replay must run on the *capture* stream: replaying on another
+    stream while eager islands run spread across streams produced a wrong
+    result (max diff larger than the output's own magnitude) -- the replay is
+    wrapped in the capture stream and this holds;
+  * a shared pool survives (a) capturing the next graph before the earlier
+    ones have ever replayed and (b) capturing a third graph after the earlier
+    graphs have replayed many times -- so the shared-pool capture failure seen
+    in ComfyUI whole-model capture depends on the state *around* the captures
+    (its empty_cache or a pinned result), not on sharing itself;
+  * with the correct stream the whole chain is bit-exact against the eager
+    flash forward (per-stage worst diff 0).
 
     LEVEL_ZERO_V1_SDK_PATH=/home/okolenmi/.local/levelzero \
         python debug/probe_piecewise_capture.py [rounds]
@@ -84,6 +102,75 @@ def main():
 
     out_eager = chain_eager(x)
     t_eager = timed(lambda: chain_eager(x), rounds)
+    # -- 5: the real piecewise design: manual capture_begin/end on a dedicated
+    #       stream, many segments, one shared pool, eager flash at each boundary
+    def manual_chain(rounds2):
+        nseg = 6
+        segs = [seg() for _ in range(nseg)]
+        stream = torch.xpu.Stream()
+        pool_ = {"p": torch.xpu.graph_pool_handle()}
+        graphs, islands, state = [], [], {"open": False}
+        x0 = x.clone()
+
+        def close():
+            if state["open"]:
+                graphs[-1].capture_end()
+                state["open"] = False
+
+        try:
+            with torch.xpu.stream(stream):
+                g0 = torch.xpu.XPUGraph()
+                g0.capture_begin(pool=pool_["p"])
+                graphs.append(g0)
+                state["open"] = True
+                h = sg0_out = segs[0](x0)
+                for k in range(1, nseg):
+                    close()
+                    islands += [h, sdpa_out(h)]   # pool-in, static-out
+                    g = torch.xpu.XPUGraph()
+                    g.capture_begin(pool=pool_["p"])
+                    graphs.append(g)
+                    state["open"] = True
+                    h = segs[k](islands[-1])
+                close()
+                torch.xpu.synchronize()
+        except RuntimeError as exc:
+            print(f"  manual capture chain: FAILED ({str(exc).splitlines()[0][:70]})")
+            return
+
+        outs = islands[1::2]
+
+        manual_ref = []
+        hr = x
+        for sg in segs:
+            hr = sg(hr)
+            manual_ref.append(hr.clone())
+            hr = sdpa_out(hr)
+        torch.xpu.synchronize()
+
+        def replay(h0):
+            nonlocal stage_diff
+            with torch.xpu.stream(stream):
+                x0.copy_(h0)
+                graphs[0].replay()
+                for k in range(len(outs)):
+                    outs[k].copy_(sdpa_out(islands[2 * k]))   # eager flash on pool values
+                    graphs[k + 1].replay()
+                for k in range(len(outs)):
+                    got = (islands[2 * (k + 1)] if k + 1 < len(outs) else h).float()
+                    want = manual_ref[k + 1].float()
+                    stage_diff = max(stage_diff, (got - want).abs().max().item())
+                torch.xpu.synchronize()
+            return h, stage_diff
+        stage_diff = 0.0
+        out_manual, stage_diff = replay(x)
+        t_man = timed(lambda: replay(x), rounds2)
+        print(f"  manual piecewise, {len(graphs)} graphs, one pool, eager flash at "
+              f"{nseg - 1} boundaries: {t_man:5.2f} ms ({t_eager / t_man:.2f}x); "
+              f"the worst per-stage diff {stage_diff:.9f}")
+
+    manual_chain(rounds)
+
     print(f"  eager (flash, all kernels launched):{t_eager:8.2f} ms")
 
     # -- 1+2: piecewise, each graph owning its pool ---------------------------

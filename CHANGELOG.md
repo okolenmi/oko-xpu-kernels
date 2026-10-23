@@ -153,6 +153,21 @@
   graph has to own its pool (a shared handle makes the second capture fail
   with an allocator assertion).
 
+* **The batch scaling of the trainer's step is measured, and nothing in it is
+  super-linear.** `debug/probe_step_batch_scaling.py` runs the reduced step
+  (frozen base, the MSE backward, the checkpointing on, 512×512) at batch
+  1-6 with the batches interleaved in one process, and profiles one step per
+  batch. The wall is flat at 375-388 ms through batch 3 — the host's launch
+  floor (~5 300 kernels at ~70 µs) — and only at batch 4 does the device work
+  (418 ms, profiled) cross it: 451.7 ms at batch 4, 670.7 ms at batch 6, ~112
+  ms/sample. The device sum scales 1.79× for the 2× batch; the kernel table
+  says the attention is 11 % of the device time at batch 4 (~3 % of the host
+  time at batch 1), the fills/pointwise 29 % (2.2-2.6× over linear), the
+  convolutions 19 %, the GEMMs 35 % (1.50× — the bigger batch makes them
+  *more* efficient). The section in `docs/performance.md` explains why the
+  graph's payoff reverses with the batch: it removes the host floor, and past
+  batch 3 that floor is no longer the wall.
+
 ## 0.3.0
 
 *Released after 0.2.0, which shipped the INT8 path, the two Triton kernels and

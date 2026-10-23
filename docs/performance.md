@@ -368,6 +368,59 @@ attention: the decoded 512×512 images differ by a mean of 0.25/255 (at most
 16/255, on 0.62 % of the pixels by more than 2 levels). That is the same
 substitution `EFFICIENT_ATTENTION` already makes on XPU.
 
+### The batch scaling of the trainer's step: the wall is a floor, then a slope
+
+The same reduced step (frozen base, the MSE backward, the checkpointing on,
+512×512), batches **interleaved in one process**, followed by one profiled step
+per batch (`debug/probe_step_batch_scaling.py`):
+
+| batch | the wall |
+|---|---|
+| 1 | 375.3 ms |
+| 2 | 387.7 ms |
+| 3 | 385.9 ms |
+| 4 | 451.7 ms |
+| 6 | 670.7 ms |
+
+From batch 1 to 3 the wall is **flat: it is the host's launch floor** (~5 300
+kernel calls at ~70 µs each). The device work through those three batches grows
+from ~120 ms toward ~292 ms and stays hidden behind it — the device is idle
+over half the time, which is where a graph gets 1.5-2×. At batch 4 the device
+(418 ms of profiled kernel time) crosses the floor and the wall becomes the
+device time, linear in the batch. Per sample the step *improves*: 375 → 194 →
+129 → 113 → 112 ms/sample at batch 4-6.
+
+The device-sum scaling is 1.79× for the 2× batch — **nothing is super-linear**;
+the kernels get *more* efficient, not less (`gemm_kernel` is 1.50×, the largest
+single block; 2 199 calls). What rises above the line is small and specific:
+
+| kernel row | device at batch 4 | share | scaling (ideal 2.00×) |
+|---|---|---|---|
+| `gemm_kernel` (the GEMMs) | 145 ms | 35 % | 1.50× |
+| fills, elementwise, `cat` copies | ~120 ms | 29 % | 2.2-2.6× |
+| `gen_conv` (the convolutions) | 78.5 ms | 19 % | 2.27× |
+| flash attention, forward and backward | 48 ms | 11 % | 2.03-3.29× |
+| norms, group-norm, upsample, the rest | ~26 ms | 6 % | 1.4-2.0× |
+
+**The attention is the smallest big bucket.** At 512×512 batch 4 it is 11 % of
+the device time; at the launch-bound batches it is ~3 % of the *host* time
+(140 launches of ~5 300). Making it capturable removes at most 11 % of the step
+—and only at the batches where a graph does not pay anyway.
+
+So the earlier batch-3 finding and this one are the same fact seen from either
+end: the graph pays where the wall is the host's floor, and once the device
+crosses that floor the graph has nothing left to remove. The remaining problem
+at the device-bound end is *what* the device time is made of — and there the
+biggest fixable shares are the fills/pointwise (29 %, partly upstream's
+`fill_uninitialized_memory`, partly the `cat`/`chunk` ops of the UNet's own
+GEGLU) and the convolutions (19 %, the INT8 conv is todo item 4).
+
+This probe reproduces the trainer's batch-1 wall (375 against 359 ms) but not
+its batch-4 (452 against 1134 ms), because the real step carries what this one
+does not — trainable adapters, a real loss, and, above all, the *padded* batch
+shapes (`batch_area`/`pack`), whose padding is real compute. Any batch-4
+conclusion must be taken on the real step, not on this reduced one.
+
 ---
 
 ## INT8 backward: `dL/dx = dy @ W`

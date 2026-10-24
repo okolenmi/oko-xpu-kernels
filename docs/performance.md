@@ -359,14 +359,72 @@ holds a 4.9 GB model), and the device is busy enough there that a replay is not
 faster.
 
 The pool is the cost: ~123 MB at 512×512, ~1.5 GB at 1024×1024 with the math
-attention. Each graph owns its pool, because a shared
-`torch.xpu.graph_pool_handle()` makes the second capture fail (see
-`ComfyUI/docs/upstream_findings.md`).
+attention. Each entry owns one pool. Separate independently-captured forwards
+sharing a `torch.xpu.graph_pool_handle()` has failed on this stack; *within*
+one forward's capture the sharing is fine (see the piecewise capture below).
 
-The output is not bit-identical, because the captured region runs the math
-attention: the decoded 512×512 images differ by a mean of 0.25/255 (at most
-16/255, on 0.62 % of the pixels by more than 2 levels). That is the same
-substitution `EFFICIENT_ATTENTION` already makes on XPU.
+The output is not bit-identical with the whole-model capture, because the
+captured region runs the math attention: the decoded 512×512 images differ by a
+mean of 0.25/255 (at most 16/255, on 0.62 % of the pixels by more than 2
+levels). That is the same substitution `EFFICIENT_ATTENTION` already makes on
+XPU.
+
+### The piecewise capture: the same forward, minus the launches
+
+The whole-model capture's compromise was always the attention. The answer now
+shipped is not to record the attention at all: `comfy/xpu_graph.py` splits the
+forward *at the attention calls* -- a seam in
+`comfy/ldm/modules/attention.py` (`attention_sdpa`) -- and captures the
+segments between them one after another with manual `capture_begin` /
+`capture_end` into one shared pool, on a dedicated stream. The flash attention
+runs eagerly, genuinely flash, at every boundary, so the captured kernels are
+exactly the eager path's kernels: nothing is substituted, and the chain is
+bit-exact. Rules 5-7 and the memory discipline below come out of two committed
+probes, `debug/probe_piecewise_capture.py` (the mechanics on a toy) and
+`debug/probe_comfy_xpu_graph.py` (the real SDXL UNet, bit-exact, 2.69x
+43.2 ms against eager 116.1 ms, flag-off overhead −0.5 %).
+
+Measured end to end, SDXL, euler/normal, cfg 7, 8 steps at 512×512 (separate
+processes, one eager and one graphed run; the deltas are some forty times the
+few-ms noise, though the interleaved discipline above does not apply to a
+measurement whose capture happens once in the warm-up):
+
+| | the sampling loop |
+|---|---|
+| eager | 132.2 ms per step |
+| `--xpu-graphs` (piecewise) | 85.9 ms per step |
+
+**1.54x end to end** (the whole-model capture keeps its 1.37x, and its replay
+loses to the piecewise chain's 43-51 ms by the math attention's ~25 % device
+time). The SDXL forward at 512×512 has **140 attention sites**, so the chain
+replays 141 graphs per step, one eager flash call per site between them, on the
+capture's stream, with `wait_stream` handing the result back to the caller.
+
+Memory was where the naive version died. All three of these are measured on the
+real forward:
+
+- **The eager cache starves the capture.** The warm-up leaves the eager path's
+  blocks in the allocator's cache, which `mem_get_info` counts as used: the
+  first attempt started the capture with ~450 MB of driver-free against a
+  12 GB card with a 5 GB model in it, and spent that, segment by segment,
+  down to zero. With `empty_cache()` before capture the same point starts
+  with ~3.5 GB free.
+- **An OOM inside a capture does not return an error.** The driver kills the
+  device context (`UR_RESULT_ERROR_DEVICE_LOST`); every subsequent XPU call in
+  the process fails, including the eager fallback. The room gate therefore
+  measures the free VRAM *after* `empty_cache()` and demands the eager
+  activation peak twice over; during a chain capture a floor guard aborts
+  between `capture_end` and the next `capture_begin` when the free VRAM drops
+  under one more segment's worst case plus 1 GB -- aborting *between*
+  captures is clean, and the whole-model capture gets the declined attempt's
+  memory back.
+- **The chain's resident memory is the whole forward's retained activations,**
+  not just the pool peak: every boundary retains the island's output and the
+  captured q/k/v pool blocks (their addresses are what the next segment's
+  replay reads). That is what the card holds for the entry's lifetime, and it
+  is why the gate refuses 1024×1024 ($1455$ MB peak, the same number the
+  whole-model capture measured, against 2215 MB free -- refused, disabled, no
+  device loss, 260.2 ms/step eager thereafter).
 
 ### The batch scaling of the trainer's step: the wall is a floor, then a slope
 

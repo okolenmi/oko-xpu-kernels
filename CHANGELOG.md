@@ -149,9 +149,34 @@
   Four things had to be true on this stack, and each was false first: a
   capture does not execute (the captured output is pool memory until a
   replay), the flash attention cannot be recorded at all, the math backend
-  must be warm before it is captured (a cold capture was 10.4 off), and each
-  graph has to own its pool (a shared handle makes the second capture fail
-  with an allocator assertion).
+  must be warm before it is captured (a cold capture was 10.4 off), and the
+  pools are what the allocator asserts over — a chain of captures shares one
+  `pool=` handle fine (see the piecewise entry below), but an independently
+  captured second forward against the same handle fails with `use_count > 0`
+  (the failing case was the capture-time state around the captures, not the
+  sharing alone), so each *entry* keeps its own pool.
+
+* **Graph execution — piecewise capture, verified and shipped in ComfyUI.**
+  The whole-model capture's compromise was always the attention, so the
+  shipped strategy now does not record the attention at all:
+  `comfy/xpu_graph.py` splits the forward *at the attention calls* — a seam in
+  `comfy/ldm/modules/attention.py` — and captures the segments between them
+  with manual `capture_begin`/`capture_end` into one shared pool, on a
+  dedicated stream; the flash attention runs eagerly, genuinely flash, at
+  every boundary, so the captured kernels are exactly the eager path's kernels
+  and the chain is bit-exact. Two committed probes carry the mechanics
+  (`debug/probe_piecewise_capture.py`, `debug/probe_comfy_xpu_graph.py`:
+  model-level **2.69×**, 43.2 ms against eager 116.1 ms). End to end, SDXL,
+  euler/normal, cfg 7, 8 steps at 512×512 (separate processes): **132.2 → 85.9
+  ms per step, 1.54×** against the whole-model capture's 1.37×; the SDXL
+  forward has 140 attention sites, and the chain replays 141 graphs per step
+  with one eager flash call at each site. The memory discipline is new and
+  measured (`docs/performance.md`):: the eager cache must be given back before
+  capture (the first attempt starved with ~450 MB free and the driver does
+  not return an OOM from inside a capture — it kills the device), a floor
+  guard aborts a chain between captures, and the entries hold the whole
+  forward's retained activations (140 sites' q/k/v plus the islands), which
+  is what keeps 1024×1024 refused (260.2 ms/step eager, no device loss).
 
 * **The batch scaling of the trainer's step is measured, and nothing in it is
   super-linear.** `debug/probe_step_batch_scaling.py` runs the reduced step

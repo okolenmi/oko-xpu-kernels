@@ -101,14 +101,8 @@ U16 even_mask() {
 // store).  Rounding here and not at the store is what makes this bit-exact
 // with the chain.
 F16 load_dequant_reg(const int8_t *p, float scale) {
-    const vec<uint32_t, 4> u = reinterpret_cast<const vec<uint32_t, 4> *>(p)[0];
-    F16 v;
-    for (int t = 0; t < 16; t++) {
-        const uint32_t byte = (u[t >> 2] >> (8 * (t & 3))) & 0xFFu;
-        const int32_t s = static_cast<int32_t>(static_cast<int8_t>(byte));
-        v[t] = static_cast<float>(BF(static_cast<float>(s) * scale));
-    }
-    return v;
+    const F16 v = reinterpret_cast<const vec<int8_t, 16> *>(p)[0].convert<float>() * scale;
+    return v.convert<BF>().convert<float>();
 }
 
 F16 load_reg(const uint16_t *p) {
@@ -645,49 +639,46 @@ void launch_rotate_bf16(queue &q, const uint16_t *x, BF *xr, size_t M, size_t K,
 // This is the backward's weight-only path (dequant_weight), and the torch
 // chain it replaces moves about 15 bytes per parameter -- an fp32 copy of the
 // whole weight, then a bf16 copy, then the rotated one.  This moves 3: the
-// int8 in, the bf16 out.  For a 2.17 B parameter model that is ~220 ms per
-// call reduced to ~20, which is the difference between a training step that
-// can afford the dequant and one that cannot.
-template <int G>
+// int8 in, the bf16 out.
+//
+// One sub-group per 256-element group, 16 elements per lane.  The rotation's
+// axes 0 and 1 are the digits of the position inside a lane's 16 elements, axes
+// 2 and 3 the digits of the lane: a transpose through local memory turns the
+// lane digits into register digits, so every step is 16 live values per lane
+// (a lane-per-group form needs all 256 and spills).  The arithmetic and its
+// order are those of the lane-per-group kernel, so the output is the same bit
+// for bit.
 void launch_dequant_weight(queue &q, const int8_t *w8, const float *w_scale, BF *out,
-                            size_t N, size_t K, bool wait) {
-    const size_t n_groups = K / GS;
+                           size_t N, size_t K, bool wait) {
+    constexpr size_t SGS = 4;  // sub-groups per work-group
+    const size_t n_groups = K / GS, total = N * n_groups;
+    const size_t work_groups = (total + SGS - 1) / SGS;
     const F16 c0 = h4_col(0, false), c1 = h4_col(1, false), c2 = h4_col(2, false),
               c3 = h4_col(3, false);
     const F16 d0 = h4_col(0, true), d1 = h4_col(1, true), d2 = h4_col(2, true),
               d3 = h4_col(3, true);
 
     auto event = q.submit([&](handler &h) {
-        h.parallel_for(nd_range<1>(range<1>(N * SUBG), range<1>(SUBG)),
-                       [=](nd_item<1> it) {
-                           const size_t row = it.get_global_id(0) >> 4;
-                           const size_t lane = it.get_local_id(0) & 15;
-                           const int8_t *src = w8 + row * K;
-                           BF *dst = out + row * K;
-                           const float scale = w_scale[row];
+        local_accessor<float, 1> stage(range<1>(SGS * GS), h);
+        h.parallel_for(nd_range<1>(range<1>(work_groups * SGS * SUBG), range<1>(SGS * SUBG)),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                           auto sg = it.get_sub_group();
+                           const size_t lane = sg.get_local_linear_id();
+                           const size_t base = sg.get_group_linear_id() * GS;
+                           const size_t grp = it.get_group(0) * SGS + sg.get_group_linear_id();
+                           // the same for every lane of a sub-group, and only sub-group barriers follow
+                           if (grp >= total) return;
 
-                           for (int g = 0; g < G; ++g) {
-                               const size_t grp = static_cast<size_t>(g) * SUBG + lane;
-                               if (grp >= n_groups) continue;
-                               const int8_t *p = src + grp * GS;
-
-                               F16 W[NREG];
-                               for (int b = 0; b < NREG; b += 4) {
-                                   for (int j = 0; j < 4; j++)
-                                       W[b + j] = load_dequant_reg(p + (b + j) * 16, scale);
-                                   for (int j = 0; j < 4; j++)
-                                       W[b + j] = inreg(W[b + j], c0, c1, c2, c3, d0, d1, d2, d3);
-                                   bfly4(W[b], W[b + 1], W[b + 2], W[b + 3]);
-                               }
-                               for (int c = 0; c < 4; c++)
-                                   bfly4(W[c], W[c + 4], W[c + 8], W[c + 12]);
-                               BF *d = dst + grp * GS;
-                               for (int w = 0; w < NREG; w++) {
-                                   BF16 r;
-                                   for (int t = 0; t < 16; t++) r[t] = BF(W[w][t]);
-                                   reinterpret_cast<BF16 *>(d + w * 16)[0] = r;
-                               }
-                           }
+                           F16 v = load_dequant_reg(w8 + grp * GS + lane * 16, w_scale[grp / n_groups]);
+                           v = inreg(v, c0, c1, c2, c3, d0, d1, d2, d3);
+                           for (int t = 0; t < 16; t++) stage[base + lane * 16 + t] = v[t];
+                           group_barrier(sg);
+                           F16 u;
+                           for (int m = 0; m < 16; m++) u[m] = stage[base + lane + 16 * m];
+                           u = inreg(u, c0, c1, c2, c3, d0, d1, d2, d3);
+                           // the 16 lanes together write 32 contiguous bytes per step
+                           BF *d = out + grp * GS;
+                           for (int m = 0; m < 16; m++) d[lane + 16 * m] = BF(u[m]);
                        });
     });
     if (wait) event.wait();
@@ -950,25 +941,9 @@ int xpuint8_dequant_weight(const void *w8, const float *w_scale, void *out, int6
         set_error("K must be divisible by the ConvRot group size (256)");
         return 3;
     }
-    const size_t gpl = (static_cast<size_t>(K) / GS + SUBG - 1) / SUBG;
     try {
-        switch (gpl) {
-        case 1: launch_dequant_weight<1>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, true); break;
-        case 2: launch_dequant_weight<2>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, true); break;
-        case 3: launch_dequant_weight<3>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, true); break;
-        case 4: launch_dequant_weight<4>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, true); break;
-        case 6: launch_dequant_weight<6>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, true); break;
-        case 12: launch_dequant_weight<12>(*g_queue, static_cast<const int8_t *>(w8), w_scale,
-                                           static_cast<BF *>(out), N, K, true); break;
-        default:
-            set_error("unsupported group count per sub-group");
-            return 4;
-        }
+        launch_dequant_weight(*g_queue, static_cast<const int8_t *>(w8), w_scale,
+                              static_cast<BF *>(out), N, K, true);
     } catch (const exception &e) {
         set_error(std::string("dequant_weight: ") + e.what());
         return 5;
@@ -990,26 +965,10 @@ int xpuint8_dequant_weight_stream(const void *sycl_queue, const void *w8,
         set_error("K must be divisible by the ConvRot group size (256)");
         return 3;
     }
-    const size_t gpl = (static_cast<size_t>(K) / GS + SUBG - 1) / SUBG;
     try {
         auto &q = *static_cast<queue *>(const_cast<void *>(sycl_queue));
-        switch (gpl) {
-        case 1: launch_dequant_weight<1>(q, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, false); break;
-        case 2: launch_dequant_weight<2>(q, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, false); break;
-        case 3: launch_dequant_weight<3>(q, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, false); break;
-        case 4: launch_dequant_weight<4>(q, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, false); break;
-        case 6: launch_dequant_weight<6>(q, static_cast<const int8_t *>(w8), w_scale,
-                                         static_cast<BF *>(out), N, K, false); break;
-        case 12: launch_dequant_weight<12>(q, static_cast<const int8_t *>(w8), w_scale,
-                                           static_cast<BF *>(out), N, K, false); break;
-        default:
-            set_error("unsupported group count per sub-group");
-            return 4;
-        }
+        launch_dequant_weight(q, static_cast<const int8_t *>(w8), w_scale,
+                              static_cast<BF *>(out), N, K, false);
     } catch (const exception &e) {
         set_error(std::string("dequant_weight: ") + e.what());
         return 5;

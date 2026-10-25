@@ -18,6 +18,8 @@
  *      16 contiguous bf16 per lane.  16 live registers per lane instead of 256 floats
  *   9  as 8, writing the result straight from the second layout (a lane writes element lane + 16 m of the group: the 16 lanes
  *      together still write 32 contiguous bytes per step)
+ *  10  as 6 with an explicit work-group of 64 and sub-group of 16 (mode 6 leaves both to the runtime): at 10240x1280 mode 9
+ *      beats mode 6, so "the floor of any form" was not one there
  *
  * Modes 4, 5, 8 and 9 must be bit-identical to 0 (printed); the rest compute something else on purpose.
  *
@@ -96,6 +98,18 @@ static void run(queue &q, const int8_t *w8, const float *ws, BF *out, size_t N, 
                 F16 v = load_plain(w8 + at);
                 if (MODE == 6) v = v * ws[row];
                 store_vec(out + at, v);
+            });
+        }).wait();
+        return;
+    }
+    if constexpr (MODE == 10) {
+        const size_t items = N * K / 16;
+        q.submit([&](handler &h) {
+            h.parallel_for(nd_range<1>(range<1>((items + 63) / 64 * 64), range<1>(64)),
+                           [=](nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t i = it.get_global_id(0);
+                if (i >= items) return;
+                store_vec(out + i * 16, load_plain(w8 + i * 16) * ws[i * 16 / K]);
             });
         }).wait();
         return;
@@ -205,5 +219,6 @@ int main(int argc, char **argv) {
     std::printf("      -> %s\n", same());
     bench("9 as 8, store from the transposed layout", [&] { run<9>(q, w8, ws, out, N, K); });
     std::printf("      -> %s\n", same());
+    bench("10 as 6, explicit work-group 64, sub-group 16", [&] { run<10>(q, w8, ws, out, N, K); });
     return 0;
 }

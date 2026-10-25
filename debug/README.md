@@ -38,6 +38,8 @@ change:
 | `verify_situ.py`, `verify_ffn_fusion.py`, `verify_qkv_rope_fuse.py` | the fused paths against the unfused chains |
 | `verify_ffn_geglu.py` | SDXL's GEGLU: the fused FFN against the chain a model writes, the half order, and the capture |
 | `probe_geglu_erf.py` | Triton's gelu against torch's over every bf16 gate value: where the last-bit differences are |
+| `bench_dequant_triton.py` | the two-pass weight dequantizer (Triton scale + oneDNN product) against the SYCL one at SDXL's shapes |
+| `probe_triton_dot.py` | a ladder from a plain bf16 `tl.dot` to the dequantizer's arithmetic: where Triton's matrix product on this card falls off |
 | `bench_geglu.py` | the fused GEGLU forward and backward separately against the chain and the copy floor, and a sweep of BLOCK and num_warps |
 | `verify_geglu.py` | the fused bf16 GEGLU (`triton.geglu`): differing values against the chain in both directions, chain vs fused time, bandwidth floor |
 | `verify_prepare_fused.py` | the fused weight preparation against the torch chain: how different the weights are, whether the error changes, and the speed |

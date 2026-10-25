@@ -103,7 +103,8 @@ def report(name, fn):
         ms = bench(fn, n=10)
         print(f"{name:62s} {ms:9.3f} ms {tflops(ms):7.1f} TFLOPS")
     except Exception as exc:  # noqa: BLE001 - a rung that does not build is a result
-        print(f"{name:62s}   failed: {str(exc).splitlines()[0][:70]}")
+        lines = [l for l in str(exc).splitlines() if "error" in l.lower()] or str(exc).splitlines()
+        print(f"{name:62s}   failed: {lines[-1].strip()[:90]}")
 
 
 report("torch.mm (oneDNN), bf16 A", lambda: torch.mm(a16, rot))

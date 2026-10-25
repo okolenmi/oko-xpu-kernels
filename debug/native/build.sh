@@ -15,13 +15,29 @@ if [[ -d /home/okolenmi/.local/oneapi/opt/intel/oneapi/compiler/2026.0/lib ]]; t
     export LD_LIBRARY_PATH="/home/okolenmi/.local/oneapi/opt/intel/oneapi/compiler/2026.0/lib:/home/okolenmi/.local/oneapi/opt/intel/oneapi/umf/1.1/lib:/home/okolenmi/.local/oneapi/opt/intel/oneapi/tbb/2023.0/lib/intel64/gcc4.8:${LD_LIBRARY_PATH:-}"
 fi
 
-mkdir -p "$OUT"
+# icpx is not on PATH here: look where the oneAPI trees of this machine live. 2026.0 first, because the runtime path above is
+# the 2026.0 one and a compiler must run against its own runtime.
+if ! command -v "$ICPX" >/dev/null 2>&1; then
+    for candidate in "$HOME/.local/oneapi/opt/intel/oneapi/compiler/2026.0/bin/icpx" "$HOME/.local/oneapi-2025.3/2025.3/bin/icpx"; do
+        if [[ -x "$candidate" ]]; then ICPX="$candidate"; break; fi
+    done
+fi
+command -v "$ICPX" >/dev/null 2>&1 || { echo "icpx not found: set ICPX=/path/to/icpx" >&2; exit 1; }
 
 build_one() {
     local src="$1" name="$2"
     "$ICPX" -O3 -fsycl -std=c++17 "$src" -o "$OUT/$name"
     echo "  built $OUT/$name"
 }
+
+mkdir -p "$OUT"
+
+# `./build.sh probe_dequant_weight [...]` builds only the named probes
+if [[ $# -gt 0 ]]; then
+    for name in "$@"; do build_one "$HERE/$name.cpp" "$name"; done
+    exit 0
+fi
+
 
 echo "building native probes -> $OUT"
 build_one "$HERE/probe_bandwidth.cpp"           probe_bandwidth

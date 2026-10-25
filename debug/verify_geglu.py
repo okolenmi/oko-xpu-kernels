@@ -33,6 +33,7 @@ for inner in (5120, 2560):
         out.backward(dy)
         return out, leaf.grad
 
+    assert G.usable(h), "the gates are closed: " + str({k: g.describe() for k, g in G.gates().items()})
     out_c, dh_c = chain_pass()
     out_f, dh_f = fused_pass()
     fwd_bad = int((out_c.view(torch.int16) != out_f.view(torch.int16)).sum())

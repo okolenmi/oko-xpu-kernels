@@ -170,6 +170,7 @@ def usable(h) -> bool:
         return False
     if h.shape[-1] == 0 or h.shape[-1] % 2:
         return False
+    _BACKWARD.ok()  # latch it here too: a first verification cannot happen inside a device-graph capture
     return _FORWARD.ok()
 
 
@@ -200,8 +201,10 @@ def _probe_backward(ref):
         h = _inputs(rows, inner, device, 1)
         gen = torch.Generator(device=device).manual_seed(2)
         dy = torch.randn((rows, inner), generator=gen, device=device).to(torch.bfloat16)
-        leaf = h.clone().requires_grad_(True)
-        (want,) = torch.autograd.grad(ref(leaf), leaf, dy)
+        # grad mode is off when the first call arrives from inside an autograd Function's forward
+        with torch.enable_grad():
+            leaf = h.clone().requires_grad_(True)
+            (want,) = torch.autograd.grad(ref(leaf), leaf, dy)
         pairs[f"backward {inner}"] = (_backward(dy, h), want)
     return pairs
 

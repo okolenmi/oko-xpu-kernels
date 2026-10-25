@@ -137,6 +137,17 @@ bisecting it. Always go through `debug/common.load_lib()`.
 
 ---
 
+## 5b. The weight dequantizer as a matrix product (DEAD)
+
+The idea: the dequantizer has no row abs-max, so the group rotation need not be a butterfly in one lane's 16 registers; as a
+256x256 product `a @ R` (R = the library's rotation applied to the identity) it goes to the matrix unit, in Triton. It was
+bit-identical to the SYCL kernel (0 of 13 M values differ, gate worst error 0) and **30-400 times slower**: 22-170 ms where the
+SYCL kernel takes 0.05-0.34 ms (1280x1280 to 10240x1280). The best of the launch sweep was 7.8 ms at 1280x5120 (rows 32, cols
+64, 8 warps); most configurations either did not build ("total scratch space exceeds HW supported limit": the `[rows, 256]`
+operand and the accumulator spill) or ran at 50-100 ms, and a 256-column tile needs 256 KB of shared memory, the whole of it.
+The 2.17 G parameters would be 2-3 s a step. Do not retry the single 256-wide product in Triton; the two-factor form
+(`H16 W H16`) was not tried and needs a 3-D transpose the backend would have to lower well.
+
 ## 6. Still untried
 
 Nothing, for the rotate: the last open shape (splitting a group across 4

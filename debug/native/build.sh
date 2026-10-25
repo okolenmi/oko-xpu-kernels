@@ -34,6 +34,7 @@ build_one "$HERE/probe_lane_utilisation.cpp"    probe_lane_utilisation
 build_one "$HERE/probe_bf16_rotate.cpp"         probe_bf16_rotate
 build_one "$HERE/probe_load_store_width.cpp"    probe_load_store_width
 build_one "$HERE/probe_cross_lane.cpp"         probe_cross_lane
+build_one "$HERE/probe_dequant_weight.cpp"      probe_dequant_weight
 # Candidate for an upstream report: sycl::reduce_over_group() kills the host
 # process on this runtime. Kept buildable so it can be re-tested after a bump.
 build_one "$HERE/reproduce_reduce_over_group.cpp" reproduce_reduce_over_group

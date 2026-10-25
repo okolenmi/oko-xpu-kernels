@@ -2,11 +2,6 @@
 
 ## Unreleased
 
-* **A Triton weight dequantizer** (`xpu_kernels.triton.dequant`): the same function as `dequant_weight`, with the rotation of
-  each 256-element group done as a matrix product on the matrix unit instead of a butterfly in one lane's registers (the
-  SYCL kernel runs at ~80 GB/s of a 397 GB/s ceiling; the activation rotate's floor does not apply here because there is no
-  abs-max). Not bit-identical (accumulation order); gated within 1e-3. Unmeasured: `debug/bench_dequant_triton.py`.
-
 * **A fused bf16 GEGLU** (`xpu_kernels.triton.geglu`): SDXL's feed-forward activation `h[.., :I] * gelu(h[.., I:])` as one pass
   forward and one backward (the backward writes both halves of `dh`, so the `cat` that autograd's `chunk` adds does not run), with
   the chain's own intermediate roundings. Two gates: the forward bit for bit, the backward within a relative budget. In the

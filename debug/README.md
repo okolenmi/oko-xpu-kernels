@@ -38,7 +38,6 @@ change:
 | `verify_situ.py`, `verify_ffn_fusion.py`, `verify_qkv_rope_fuse.py` | the fused paths against the unfused chains |
 | `verify_ffn_geglu.py` | SDXL's GEGLU: the fused FFN against the chain a model writes, the half order, and the capture |
 | `probe_geglu_erf.py` | Triton's gelu against torch's over every bf16 gate value: where the last-bit differences are |
-| `bench_dequant_triton.py` | the Triton weight dequantizer against the SYCL one at SDXL's shapes, with a sweep of rows, columns and warps |
 | `bench_geglu.py` | the fused GEGLU forward and backward separately against the chain and the copy floor, and a sweep of BLOCK and num_warps |
 | `verify_geglu.py` | the fused bf16 GEGLU (`triton.geglu`): differing values against the chain in both directions, chain vs fused time, bandwidth floor |
 | `verify_prepare_fused.py` | the fused weight preparation against the torch chain: how different the weights are, whether the error changes, and the speed |
@@ -117,3 +116,4 @@ call a library function taking `void*` without setting `argtypes`, a 64-bit
 `tensor.data_ptr()` is silently truncated, the kernel writes through garbage,
 and the failure surfaces as `UR_RESULT_ERROR_DEVICE_LOST` — not as an argument
 error. Always go through `common.load_lib()`, which declares everything.
+

@@ -137,19 +137,33 @@ bisecting it. Always go through `debug/common.load_lib()`.
 
 ---
 
-## 5b. The weight dequantizer as a matrix product (UNRESOLVED: slow for a reason not yet found)
+## 5b. The weight dequantizer as a matrix product: Triton's `tl.dot` is 20-100x below oneDNN here, `torch.mm` is not
 
 The idea: the dequantizer has no row abs-max, so the group rotation need not be a butterfly in one lane's 16 registers; as a
-256x256 product `a @ R` (R = the library's rotation applied to the identity) it goes to the matrix unit, in Triton. It was
-bit-identical to the SYCL kernel (0 of 13 M values differ) and **30-400 times slower**: 22-170 ms where the SYCL kernel takes
-0.05-0.34 ms (1280x1280 to 10240x1280); the best launch configuration was 7.8 ms at 1280x5120. Most configurations did not
-build ("total scratch space exceeds HW supported limit"; a 256-column tile asked for the whole 256 KB of shared memory).
+256x256 product `a @ R` (R = the library's rotation applied to the identity) it goes to the matrix unit. The first version did it
+inside one Triton kernel and was **30-400 times slower** than the SYCL kernel (22-170 ms against 0.05-0.34 ms; most launch
+configurations did not build: "total scratch space exceeds HW supported limit").
 
-That is not a limit of the matrix unit: the product is 3.4 GFLOP for 1280x5120 (0.07 ms at 50 TFLOPS), so ~1000x off means
-something is pathological, most likely the compiler spilling the operand to scratch memory or converting its layout through
-memory. The first version loaded int8, widened, scaled and rounded in registers and fed the *whole* 256-wide operand to one
-`tl.dot`. `debug/probe_triton_dot.py` is a ladder that adds those one at a time from a plain bf16 product (and times oneDNN's
-`torch.mm` on the same operands); the rung where the time falls off names the cause.
+`debug/probe_triton_dot.py` (1280x5120, a [25600, 256] x [256, 256] product, 3.36 GFLOP) found it is `tl.dot` itself, not the
+dequantization around it:
+
+| | time | TFLOPS |
+|---|---|---|
+| `torch.mm` (oneDNN) | 0.062-0.083 ms | 41-54 |
+| Triton, plain pointers, bf16 A, tile 64x64, 8 warps | 6.1 ms | 0.5 |
+| the same, tile 128x64 or 4 warps | 11.8-12.4 ms | 0.3 |
+| Triton, block pointers, tile 64x64, 8 warps | 1.57 ms | 2.1 |
+| + int8 operand widened in registers | 7.7 ms | 0.4 |
+| + row scale and bf16 rounding | 7.4 ms | 0.5 |
+| the first version (whole 256-wide operand, one product) | 51 ms | 0.1 |
+
+The int8 widening and the scale cost nothing measurable; the Triton matrix product is two orders of magnitude below the
+vendor library on this card with these tile sizes (small; larger tiles and more warps were not tried). **Do not build a kernel
+on `tl.dot` here without a tuned configuration that reaches tens of TFLOPS first.**
+
+What works: a Triton elementwise pass (dequantize and round to bf16, 0.03 ms at 1280x5120, 225 GB/s) followed by `torch.mm`
+(0.055 ms): `xpu_kernels.triton.dequant`, bit-identical to the SYCL kernel on every value tested (0 of 13 M), 1.3-5.1x faster in
+device time at SDXL's shapes (`debug/bench_dequant_triton.py`).
 
 ## 6. Still untried
 

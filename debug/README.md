@@ -13,8 +13,8 @@ export SYCL_ROOT=/home/okolenmi/.local/oneapi-2025.3/2025.3
 ```
 
 `debug/native/build.sh` puts the DPC++ runtime on `LD_LIBRARY_PATH` itself,
-since there is no root and no system-wide install. A standalone probe run by
-hand needs:
+since there is no root and no system-wide install. A standalone probe is
+best run through `debug/native/run.sh <probe> [args]`, which sets the same path; by hand it needs:
 
 ```bash
 export LD_LIBRARY_PATH=$SYCL_ROOT/lib:$SYCL_ROOT/lib/x64

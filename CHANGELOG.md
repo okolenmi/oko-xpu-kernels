@@ -4,7 +4,8 @@
 
 * **A two-pass weight dequantizer** (`xpu_kernels.triton.dequant`): a Triton scale-and-round pass followed by one `torch.mm` with
   the library's own rotation matrix, in place of the SYCL kernel's per-lane butterfly (57-150 GB/s of a 397 GB/s ceiling).
-  Not bit-identical (accumulation order), gated within 1e-3. Unmeasured: `debug/bench_dequant_triton.py`.
+  Gated within 1e-3 against the SYCL kernel but bit-identical on every value tested; device time 1.3-5.1x lower at SDXL's shapes
+  (1280x5120: 0.529 -> 0.104 ms). `debug/bench_dequant_triton.py`, and why not a single Triton kernel: `docs/experiments.md` 5b.
 
 * **A fused bf16 GEGLU** (`xpu_kernels.triton.geglu`): SDXL's feed-forward activation `h[.., :I] * gelu(h[.., I:])` as one pass
   forward and one backward (the backward writes both halves of `dh`, so the `cat` that autograd's `chunk` adds does not run), with

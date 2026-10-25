@@ -50,6 +50,28 @@ def bench(fn, n=20, warmup=5, reps=3):
     return best
 
 
+def device_ms(fn, n=20):
+    """Mean *device* time per call from the profiler's kernel events: what a captured graph replays, host launch cost excluded.
+
+    ``bench`` is wall time with the device synchronized at the end, which for kernels shorter than the host's launch cost
+    (~50 us from Python, more for Triton) measures the launching, not the kernel.
+    """
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+    for _ in range(3):
+        fn()
+    torch.xpu.synchronize()
+    with profile(activities=[ProfilerActivity.XPU]) as prof:
+        for _ in range(n):
+            fn()
+        torch.xpu.synchronize()
+    total = 0.0
+    for event in prof.key_averages():
+        t = getattr(event, "self_device_time_total", None)
+        total += t if t is not None else getattr(event, "self_xpu_time_total", 0.0)
+    return total / n / 1000.0
+
+
 def native(name, extra_args=()):
     """Build (if needed) and run a probe from debug/native, return its stdout."""
     import subprocess

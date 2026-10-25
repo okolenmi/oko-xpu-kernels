@@ -24,9 +24,17 @@ if ! command -v "$ICPX" >/dev/null 2>&1; then
 fi
 command -v "$ICPX" >/dev/null 2>&1 || { echo "icpx not found: set ICPX=/path/to/icpx" >&2; exit 1; }
 
+# The binaries find their SYCL runtime without LD_LIBRARY_PATH: the compiler's own lib directory goes into the rpath.
+COMPILER_LIB="$(cd "$(dirname "$(command -v "$ICPX")")/../lib" 2>/dev/null && pwd || true)"
+RPATH=()
+[[ -n "$COMPILER_LIB" ]] && RPATH=("-Wl,-rpath,$COMPILER_LIB")
+for extra in /home/okolenmi/.local/oneapi/opt/intel/oneapi/umf/1.1/lib "$HOME/.local/oneapi/opt/intel/oneapi/umf/1.1/lib"; do
+    [[ -d "$extra" ]] && RPATH+=("-Wl,-rpath,$extra")
+done
+
 build_one() {
     local src="$1" name="$2"
-    "$ICPX" -O3 -fsycl -std=c++17 "$src" -o "$OUT/$name"
+    "$ICPX" -O3 -fsycl -std=c++17 "$src" -o "$OUT/$name" "${RPATH[@]}"
     echo "  built $OUT/$name"
 }
 

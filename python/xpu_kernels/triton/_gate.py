@@ -240,7 +240,7 @@ class Gate:
                 # Triton compiles a launcher stub per new argument signature, and that needs the Level Zero headers;
                 # the compiler's own output is pages of unrelated warnings
                 detail = ("Triton cannot find level_zero/ze_api.h to compile this kernel's launcher; point "
-                          "LEVEL_ZERO_V1_SDK_PATH at a Level Zero SDK (or install its headers) and run again")
+                          "LEVEL_ZERO_V1_SDK_PATH at a Level Zero SDK (the library looks in ~/.local/levelzero) or install its headers")
             self._why = f"probe failed: {detail}"
             log.warning("%s: self-test failed (%s)", self.name, detail)
             return False

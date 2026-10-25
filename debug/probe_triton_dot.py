@@ -18,6 +18,10 @@ falls off a cliff names the cause:
 import sys
 
 import torch
+from xpu_kernels import _levelzero
+
+_levelzero.ensure_headers()  # before the first Triton compile
+
 import triton
 import triton.language as tl
 
@@ -103,7 +107,7 @@ def report(name, fn):
         ms = bench(fn, n=10)
         print(f"{name:62s} {ms:9.3f} ms {tflops(ms):7.1f} TFLOPS")
     except Exception as exc:  # noqa: BLE001 - a rung that does not build is a result
-        lines = [l for l in str(exc).splitlines() if "error" in l.lower()] or str(exc).splitlines()
+        lines = [l for l in str(exc).splitlines() if "error:" in l.lower()] or str(exc).splitlines()
         print(f"{name:62s}   failed: {lines[-1].strip()[:90]}")
 
 

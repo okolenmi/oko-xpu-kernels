@@ -35,7 +35,11 @@ unverified kernel -- and the backward falls back to the torch gradient, which
 
 from __future__ import annotations
 
-from . import adaln, dequant, geglu, nf4, quantize, rope
+from .. import _levelzero
+
+_levelzero.ensure_headers()  # Triton compiles a launcher per kernel and needs these headers; before the first compile, not after
+
+from . import adaln, dequant, geglu, nf4, quantize, rope  # noqa: E402
 from ._gate import Gate
 
 __all__ = ["Gate", "adaln", "dequant", "gates", "geglu", "nf4", "quantize", "rope",

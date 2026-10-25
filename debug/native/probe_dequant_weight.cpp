@@ -13,8 +13,13 @@
  *   5  as 4, and the bf16 store as one vector convert
  *   6  a coalesced elementwise dequantizer (16 contiguous parameters per work-item, no rotation): the floor of any form
  *   7  as 6 without the scale (the pure int8 -> bf16 widening)
+ *   8  one sub-group per 256-group instead of one lane per group: a lane loads 16 contiguous int8 and rotates axes 0,1 in
+ *      registers, the sub-group transposes through local memory, rotates axes 2,3 in registers, transposes back and writes
+ *      16 contiguous bf16 per lane.  16 live registers per lane instead of 256 floats
+ *   9  as 8, writing the result straight from the second layout (a lane writes element lane + 16 m of the group: the 16 lanes
+ *      together still write 32 contiguous bytes per step)
  *
- * Modes 4 and 5 must be bit-identical to 0 (printed); the rest compute something else on purpose.
+ * Modes 4, 5, 8 and 9 must be bit-identical to 0 (printed); the rest compute something else on purpose.
  *
  *   ./build.sh && ./bin/probe_dequant_weight 1280 5120      # N K  (default 1280 5120)
  */
@@ -83,7 +88,7 @@ static void run(queue &q, const int8_t *w8, const float *ws, BF *out, size_t N, 
     const size_t ng = K / GS, gpl = (ng + SUBG - 1) / SUBG;
     const F16 c0 = h4_col(0, 0), c1 = h4_col(1, 0), c2 = h4_col(2, 0), c3 = h4_col(3, 0);
     const F16 d0 = h4_col(0, 1), d1 = h4_col(1, 1), d2 = h4_col(2, 1), d3 = h4_col(3, 1);
-    if constexpr (MODE >= 6) {
+    if constexpr (MODE == 6 || MODE == 7) {
         const size_t items = N * K / 16;
         q.submit([&](handler &h) {
             h.parallel_for(range<1>(items), [=](id<1> i) {
@@ -91,6 +96,39 @@ static void run(queue &q, const int8_t *w8, const float *ws, BF *out, size_t N, 
                 F16 v = load_plain(w8 + at);
                 if (MODE == 6) v = v * ws[row];
                 store_vec(out + at, v);
+            });
+        }).wait();
+        return;
+    }
+    if constexpr (MODE == 8 || MODE == 9) {
+        constexpr size_t SGS = 4;  // sub-groups per work-group
+        const size_t total = N * ng, wgs = (total + SGS - 1) / SGS;
+        q.submit([&](handler &h) {
+            local_accessor<float, 1> stage(range<1>(SGS * GS), h);
+            h.parallel_for(nd_range<1>(range<1>(wgs * SGS * SUBG), range<1>(SGS * SUBG)),
+                           [=](nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const size_t lane = sg.get_local_linear_id(), base = sg.get_group_linear_id() * GS;
+                const size_t grp = it.get_group(0) * SGS + sg.get_group_linear_id();
+                if (grp >= total) return;  // uniform over the sub-group: only sub-group barriers follow
+                F16 v = load_vec(w8 + grp * GS + lane * 16, ws[grp / ng]);
+                v = inreg(v, c0, c1, c2, c3, d0, d1, d2, d3);                      // axes 0 and 1
+                for (int t = 0; t < 16; t++) stage[base + lane * 16 + t] = v[t];
+                group_barrier(sg);
+                F16 u;
+                for (int m = 0; m < 16; m++) u[m] = stage[base + lane + 16 * m];
+                u = inreg(u, c0, c1, c2, c3, d0, d1, d2, d3);                      // axes 2 and 3
+                BF *d = out + grp * GS;
+                if (MODE == 9) {
+                    for (int m = 0; m < 16; m++) d[lane + 16 * m] = BF(u[m]);
+                } else {
+                    group_barrier(sg);
+                    for (int m = 0; m < 16; m++) stage[base + lane + 16 * m] = static_cast<float>(BF(u[m]));
+                    group_barrier(sg);
+                    F16 r;
+                    for (int t = 0; t < 16; t++) r[t] = stage[base + lane * 16 + t];
+                    store_vec(d + lane * 16, r);
+                }
             });
         }).wait();
         return;
@@ -163,5 +201,9 @@ int main(int argc, char **argv) {
     std::printf("      -> %s\n", same());
     bench("6 coalesced elementwise (the floor of any form)", [&] { run<6>(q, w8, ws, out, N, K); });
     bench("7 coalesced widening only", [&] { run<7>(q, w8, ws, out, N, K); });
+    bench("8 sub-group per group, local-memory transpose", [&] { run<8>(q, w8, ws, out, N, K); });
+    std::printf("      -> %s\n", same());
+    bench("9 as 8, store from the transposed layout", [&] { run<9>(q, w8, ws, out, N, K); });
+    std::printf("      -> %s\n", same());
     return 0;
 }

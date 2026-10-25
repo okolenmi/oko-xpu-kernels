@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+* **A fused bf16 GEGLU** (`xpu_kernels.triton.geglu`): SDXL's feed-forward activation `h[.., :I] * gelu(h[.., I:])` as one pass
+  forward and one backward (the backward writes both halves of `dh`, so the `cat` that autograd's `chunk` adds does not run), with
+  the chain's own intermediate roundings. Two gates: the forward bit for bit, the backward within a relative budget. In the
+  training project's profile the eager chain was ~50 ms of a 466 ms step. Not yet measured on the card:
+  `debug/verify_geglu.py`.
+
 *Documentation and measurement only — no behaviour change.*
 
 * **The docs were audited and rewritten.** The README was a front door with an

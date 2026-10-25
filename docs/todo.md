@@ -4,7 +4,7 @@ Ranked by what unblocks the most. Every item names the evidence that would
 close it; "done" means measured, not implemented.
 
 The items marked *done* or *closed* are kept for the record — the numbers in
-them are the ones the decisions rest on. **The open ones are 4, 5 and 7.**
+them are the ones the decisions rest on. **The open ones are 4, 5, 7 and 8.**
 The closed items are also in the table at the bottom, one line each.
 
 ## 1. A fused weight preparation — done
@@ -110,7 +110,36 @@ shapes, and at parity with bf16 at the big M.
       uses, not measured, presumably worth ~2 ms/step. Not taken because the
       construct once killed the host process (see the closed list).
 
-## Closed
+## 8. Found in the training project's step profile (batch 4, 512 px, graph replay)
+
+The training project profiled its own step with every kernel tied to the operator and module that launched it, and the order
+of what is left is different from the one above. Evidence is in that project's `perf-bundle`; per step, native bf16 base:
+
+| what | device time | status here |
+|---|---|---|
+| the GEGLU chain (gelu, mul, and in backward gelu_backward, 2 mul, `cat`) | ~50 ms of 466 | **`triton.geglu`, written, needs the card** (`debug/verify_geglu.py`) |
+| the weight dequantizer, int8 base, dense `dx` | **82 ms** of ~645 (659 calls, 1.78 G + 0.39 G parameters) | open, below |
+| the dequant epilogue (int32 -> bf16) | 40 ms, 1265 calls | at 88 % of its floor (docs/experiments.md 3) |
+| rotate + quantize of the activation | 26 ms, 1272 calls | closed (the rotate's floor) |
+| residual `add` (bf16, 13.8 us a call) | 22 ms, 1623 calls | item 4, but measured at 4x the 6 ms estimated there |
+
+**The weight dequantizer is the open one.** 82 ms for 2.17 G parameters moves 6.5 GB: 80 GB/s, against the 397 GB/s copy
+ceiling measured on the same card in the same run (16 ms). `performance.md` already says "headroom, the shape of that work is
+the same as the rotate's, and the rotate's is closed", but the two differ where it matters: the rotate cannot split a group
+across lanes because the row's abs-max would cross sub-groups (`probe_cross_lane.cpp`); **the dequantizer has no abs-max**, so
+the 256-element group *can* be spread over lanes and the 16 live registers per lane (the 3.1x of `rotate_floor_analysis.cpp`)
+are not forced. Two routes, to be decided by a probe, not by taste: (a) the same transform with the group split across 4
+lanes; (b) `dx = rotate(dy @ dequant(W_rot))` -- dequantize *without* the inverse rotation (pure bandwidth, ~16 ms) and
+rotate `dx` instead, which wins where `M < ~0.76 N` (batch-1, the 1280-wide levels) and loses at batch 4. (b) needs
+`rotate_bf16` on `dx`, which exists.
+
+**A correction to two claims elsewhere in these docs.** `performance.md` ("the attention: closed -- every XPU SDPA backend is
+the same oneDNN kernel") and `adding-a-kernel.md` ("what not to add: a fused attention") predate torch 2.12.1+xpu. Its profile
+shows three different attention kernels: oneDNN's `micro_sdpa`, a cutlass-sycl flash forward (`XeFMHAFwdKernel`) and flash
+backward (`MhaBackwardName`, 288 us a call, 30-40 ms of a step). The flash kernels use work-group scratch memory, which a device
+graph cannot capture, so a captured step runs the math attention instead; the trainer measured the math backend at +36 % of
+device time at its shapes (`sdxl.md`, section 5). The "nothing to win" conclusion holds for eager; for a *captured* step a
+capturable fused attention is the one kernel that could still be worth writing.
 
 | item | the evidence |
 |---|---|

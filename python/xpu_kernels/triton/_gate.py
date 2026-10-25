@@ -235,8 +235,14 @@ class Gate:
                     worst = max(worst, relative_error(got, want))
                     total += got.numel()
         except Exception as exc:  # noqa: BLE001 - a broken probe is not a pass
-            self._why = f"probe failed: {exc}"
-            log.warning("%s: self-test failed (%s)", self.name, exc)
+            detail = str(exc)
+            if "ze_api.h" in detail:
+                # Triton compiles a launcher stub per new argument signature, and that needs the Level Zero headers;
+                # the compiler's own output is pages of unrelated warnings
+                detail = ("Triton cannot find level_zero/ze_api.h to compile this kernel's launcher; point "
+                          "LEVEL_ZERO_V1_SDK_PATH at a Level Zero SDK (or install its headers) and run again")
+            self._why = f"probe failed: {detail}"
+            log.warning("%s: self-test failed (%s)", self.name, detail)
             return False
         if bad:
             self._why = f"mismatch: {bad}/{total} values differ"

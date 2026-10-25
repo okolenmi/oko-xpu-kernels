@@ -11,10 +11,13 @@ The arithmetic is the chain's, step for step, including the roundings it does be
 activation dtype before the multiply, and the backward rounds ``dy * x`` before ``gelu_backward`` sees it.  Skipping those
 roundings would be faster to write and would be a different function.
 
-Two gates, because the two halves have different contracts.  The forward is compared bit for bit: it is the same formula
-over the same operands.  The backward is compared with a small relative budget, like the other backward kernels, because
-``exp`` is the one function whose last bit the backend does not promise to agree on.  If the backward gate is closed the
-forward still runs and the backward is autograd of the eager chain, recomputed from ``h``.
+Two gates, one per direction, both with a relative budget.  The arithmetic is the chain's, but Triton's ``erf`` is not
+torch's to the last bit, and ``gelu`` amplifies that where the result is smallest: for a gate below about -3 it is
+``0.5 x (1 + erf(.))`` with ``erf`` within a few ULP of -1, so a last-bit difference in ``erf`` can move the rounded bf16
+result by one unit.  Those are the tiny values of the output (0.2 % of the probe's, none of the large ones), which is why the
+budget is on the relative L2 error of the whole tensor and a wrong formula, off by ~1e-1, cannot hide in it.  Making it bit
+exact needs the SYCL ``erf`` that torch itself uses (``debug/probe_geglu_erf.py`` measures the difference).  If the backward
+gate is closed the forward still runs and the backward is autograd of the eager chain, recomputed from ``h``.
 
 ``XPU_KERNELS_NO_GEGLU=1`` switches both off.
 """
@@ -207,7 +210,11 @@ def _probe_backward(ref):
 #: a few elements is ~1e-4.
 REL = 2e-3
 
-_FORWARD = Gate("geglu", _probe_forward, default_reference=lambda: chain, env="XPU_KERNELS_NO_GEGLU", num_warps=NUM_WARPS)
+#: The forward's relative budget: far tails differ by a bf16 unit in values ~1e-3 of the typical one, ~1e-6 of the L2 norm.
+REL_FORWARD = 1e-4
+
+_FORWARD = Gate("geglu", _probe_forward, default_reference=lambda: chain, env="XPU_KERNELS_NO_GEGLU", num_warps=NUM_WARPS,
+                rel=REL_FORWARD)
 _BACKWARD = Gate("geglu_backward", _probe_backward, default_reference=lambda: chain, env="XPU_KERNELS_NO_GEGLU",
                  num_warps=NUM_WARPS, rel=REL)
 

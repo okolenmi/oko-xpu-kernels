@@ -5,8 +5,11 @@
 * **A fused bf16 GEGLU** (`xpu_kernels.triton.geglu`): SDXL's feed-forward activation `h[.., :I] * gelu(h[.., I:])` as one pass
   forward and one backward (the backward writes both halves of `dh`, so the `cat` that autograd's `chunk` adds does not run), with
   the chain's own intermediate roundings. Two gates: the forward bit for bit, the backward within a relative budget. In the
-  training project's profile the eager chain was ~50 ms of a 466 ms step. Not yet measured on the card:
-  `debug/verify_geglu.py`.
+  training project's profile the eager chain was ~50 ms of a 466 ms step. Measured on the B580 (16384 rows, inner 5120): forward
+  1.277 ms against a 1.268 ms bandwidth floor (chain 2.116), backward 2.109 ms against 2.113 (chain 6.957), forward + backward
+  **2.11x** the chain; at inner 2560 the same ratios. Both gates are active: the forward is within 4e-7 relative, differing from torch
+  in 0.2 % of values, all in the erf tail below a gate of -3 where `gelu` is ~1e-3 or smaller (`debug/probe_geglu_erf.py`: 6 of 65 280
+  bf16 gate values). 1024 columns and 4 warps is the best of the sweep (`debug/bench_geglu.py`).
 
 *Documentation and measurement only — no behaviour change.*
 

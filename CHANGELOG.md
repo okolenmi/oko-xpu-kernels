@@ -189,16 +189,23 @@
   and the chain is bit-exact. Two committed probes carry the mechanics
   (`debug/probe_piecewise_capture.py`, `debug/probe_comfy_xpu_graph.py`:
   model-level **2.69×**, 43.2 ms against eager 116.1 ms). End to end, SDXL,
-  euler/normal, cfg 7, 8 steps at 512×512 (separate processes): **132.2 → 85.9
-  ms per step, 1.54×** against the whole-model capture's 1.37×; the SDXL
+  euler/normal, cfg 7, 8 steps at 512×512 (three interleaved pairs): **116.0 /
+  109.7 / 109.6 → 68.9 / 68.9 / 68.8 ms per step, 1.59×** against the
+  whole-model capture's 1.37×; the SDXL
   forward has 140 attention sites, and the chain replays 141 graphs per step
   with one eager flash call at each site. The memory discipline is new and
-  measured (`docs/performance.md`):: the eager cache must be given back before
+  measured (`docs/performance.md`): the eager cache must be given back before
   capture (the first attempt starved with ~450 MB free and the driver does
   not return an OOM from inside a capture — it kills the device), a floor
-  guard aborts a chain between captures, and the entries hold the whole
-  forward's retained activations (140 sites' q/k/v plus the islands), which
-  is what keeps 1024×1024 refused (260.2 ms/step eager, no device loss).
+  guard aborts a chain between captures with the same bound the pre-gate
+  checks (the flash eager peak plus 1 GB), and the entries hold **four
+  tensors per attention site** — q, k, v and the island, **1.6-1.9 GB at
+  512×512** against a 72 MB eager peak.  At 1024×1024 that arithmetic
+  (~6.5-7.5 GB against 2 320-2 439 MB free) means the chain is attempted and
+  then aborted cleanly by the guard (`ran out of room after site 82 (... 1318
+  MB free against a floor of 1339 MB)`), the whole-model fallback is refused
+  by its own constant (2 910 MB), and the step stays eager at 238-257
+  ms/step with no device loss.
 
 * **The batch scaling of the trainer's step is measured, and nothing in it is
   super-linear.** `debug/probe_step_batch_scaling.py` runs the reduced step

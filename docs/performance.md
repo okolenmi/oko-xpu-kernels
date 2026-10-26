@@ -391,10 +391,11 @@ measurement whose capture happens once in the warm-up):
 
 | | the sampling loop |
 |---|---|
-| eager | 132.2 ms per step |
-| `--xpu-graphs` (piecewise) | 85.9 ms per step |
+| eager | 109.6-116.0 ms per step |
+| `--xpu-graphs` (piecewise) | 68.8-68.9 ms per step |
 
-**1.54x end to end** (the whole-model capture keeps its 1.37x, and its replay
+**1.59x end to end** (three interleaved pairs, the whole-model capture keeps
+its 1.37x from an earlier session, and its replay
 loses to the piecewise chain's 43-51 ms by the math attention's ~25 % device
 time). The SDXL forward at 512×512 has **140 attention sites**, so the chain
 replays 141 graphs per step, one eager flash call per site between them, on the
@@ -411,20 +412,26 @@ real forward:
   with ~3.5 GB free.
 - **An OOM inside a capture does not return an error.** The driver kills the
   device context (`UR_RESULT_ERROR_DEVICE_LOST`); every subsequent XPU call in
-  the process fails, including the eager fallback. The room gate therefore
-  measures the free VRAM *after* `empty_cache()` and demands the eager
-  activation peak twice over; during a chain capture a floor guard aborts
-  between `capture_end` and the next `capture_begin` when the free VRAM drops
-  under one more segment's worst case plus 1 GB -- aborting *between*
-  captures is clean, and the whole-model capture gets the declined attempt's
-  memory back.
-- **The chain's resident memory is the whole forward's retained activations,**
-  not just the pool peak: every boundary retains the island's output and the
-  captured q/k/v pool blocks (their addresses are what the next segment's
-  replay reads). That is what the card holds for the entry's lifetime, and it
-  is why the gate refuses 1024×1024 ($1455$ MB peak, the same number the
-  whole-model capture measured, against 2215 MB free -- refused, disabled, no
-  device loss, 260.2 ms/step eager thereafter).
+  the process fails, including the eager fallback. The piecewise attempt's
+  pre-gate is therefore the same bound its guard enforces -- the flash eager
+  activation peak plus 1 GB -- so the first segment cannot OOM, though the
+  chain's own residency can still eat the margin: at 1024×1024 the capture was
+  attempted and the guard aborted it *between* segments (`ran out of room
+  after site 82 (1318 MB free against a floor of 1339 MB)`), which is clean --
+  no device loss, and the whole-model fallback then ran on a live device. The
+  whole-model attempt cannot be aborted mid-recording, so it keeps the older
+  constant of twice the peak it captures under.
+- **The chain's resident memory is four tensors per attention site.**  Every
+  boundary retains q, k, v (pool blocks whose addresses the next segment's
+  replay reads) and the island (the eager output).  Measured at 512×512:
+  **1.6-1.9 GB** for the 141-graph chain against a 72 MB eager activation
+  peak -- the 140 sites' tensors dominate, not the intermediates.  Releasing
+  an entry returns only ~350 MB (`empty_cache()` does not give back the graph
+  pool's arena on this stack), so a re-capture reuses it and adds ~250 MB.
+  That is why 1024×1024 cannot finish a chain: four tensors times four times
+  the tokens would be ~6.5-7.5 GB against 2 320-2 439 MB free, and the
+  whole-model fallback is refused by its own constant (2 910 MB) and measured
+  no faster anyway (260 against 263 ms/step).
 
 ### The batch scaling of the trainer's step: the wall is a floor, then a slope
 

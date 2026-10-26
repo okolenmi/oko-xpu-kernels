@@ -356,7 +356,8 @@ At 1024×1024 the implementation refuses the capture and the step time is
 unchanged (263.0 against 259.9 ms/step), for two independent reasons: the math
 attention's activation peak is 1455 MB against 1438 MB free (the card already
 holds a 4.9 GB model), and the device is busy enough there that a replay is not
-faster.
+faster.  (That was the whole-model era; the piecewise section below has the
+fuller account, in which the chain is attempted and the guard aborts it.)
 
 The pool is the cost: ~123 MB at 512×512, ~1.5 GB at 1024×1024 with the math
 attention. Each entry owns one pool. Separate independently-captured forwards

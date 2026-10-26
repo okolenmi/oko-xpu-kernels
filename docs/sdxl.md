@@ -246,11 +246,16 @@ minimum over the steps of one shape:
   `ComfyUI/docs/xpu_graphs.md`) captures only the diffusion forward, measures
   every shape and keeps an entry only where the replay is at least 10 % faster.
   On the real sampler with cfg 7 the step goes from 116.6/111.7 to 82.6/82.0 ms
-  (**1.37×**, interleaved A/B, 8 steps). The per-call gain is 1.40×, not the
-  2.3× of the batch-1 forward: CFG batches cond and uncond into one batch-2
-  call, so the device time doubles while the host time does not. At 1024×1024
-  the capture is refused (the math attention's 1455 MB peak against 1438 MB
-  free) and the step time is unchanged.
+  (**1.37×**, interleaved A/B, 8 steps) with the whole-model capture, and the
+  piecewise chain that now ships does **1.59×** (109.7 → 68.9 ms/step, three
+  interleaved pairs) because it keeps the eager flash attention between
+  segments and is bit-exact. The per-call gain is 1.40×, not the 2.3× of the
+  batch-1 forward: CFG batches cond and uncond into one batch-2 call, so the
+  device time doubles while the host time does not. At 1024×1024 the chain is
+  attempted and the guard aborts it between segments (site 82 of 140, 1 318 MB
+  free against a floor of 1 339 MB) and the whole capture is refused, so the
+  step time is unchanged -- the chain's four tensors per site would be
+  ~6.5-7.5 GB there.
 
 ### The host direction: finished inside the capture, not outside it
 

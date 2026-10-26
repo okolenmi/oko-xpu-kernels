@@ -12,9 +12,6 @@ are meant to be *bit-identical* to it, not merely close:
 ``adaln.rms_adaln(x, scale, shift, eps=1e-6)``
     RMSNorm + adaLN modulation (``x * rsqrt(mean(x^2)+eps) * (1+scale) + shift``).
 
-``dequant.dequant_weight(w8, scale)``
-    The INT8 weight dequantizer as a Triton scale-and-round pass plus one oneDNN product for the group rotation.
-
 ``geglu.geglu(h)``
     SDXL's feed-forward activation ``h[.., :I] * gelu(h[.., I:])``, forward and backward in one pass each.
 
@@ -39,13 +36,13 @@ from .. import _levelzero
 
 _levelzero.ensure_headers()  # Triton compiles a launcher per kernel and needs these headers; before the first compile, not after
 
-from . import adaln, dequant, geglu, nf4, quantize, rope  # noqa: E402
+from . import adaln, geglu, nf4, quantize, rope  # noqa: E402
 from ._gate import Gate
 
-__all__ = ["Gate", "adaln", "dequant", "gates", "geglu", "nf4", "quantize", "rope",
+__all__ = ["Gate", "adaln", "gates", "geglu", "nf4", "quantize", "rope",
            "set_reference", "status"]
 
-_MODULES = (rope, adaln, quantize, nf4, geglu, dequant)
+_MODULES = (rope, adaln, quantize, nf4, geglu)
 
 
 def gates():
@@ -59,14 +56,14 @@ def gates():
 def set_reference(module, fn=None):
     """Set (or clear) the reference implementation for one kernel module.
 
-    ``module`` is ``rope``, ``adaln``, ``quantize``, ``nf4``, ``geglu``, ``dequant``, or their name as a
+    ``module`` is ``rope``, ``adaln``, ``quantize``, ``nf4``, ``geglu``, or their name as a
     string;
     ``fn`` is the implementation that module falls back to, so the gate compares
     like with like.  Without a reference the kernels stay inactive.
     """
     if isinstance(module, str):
         module = {"rope": rope, "adaln": adaln, "quantize": quantize,
-                  "nf4": nf4, "geglu": geglu, "dequant": dequant}[module]
+                  "nf4": nf4, "geglu": geglu}[module]
     module.set_reference(fn)
 
 

@@ -123,7 +123,7 @@ of what is left is different from the one above. Evidence is in that project's `
 | rotate + quantize of the activation | 26 ms, 1272 calls | closed (the rotate's floor) |
 | residual `add` (bf16, 13.8 us a call) | 22 ms, 1623 calls | item 4, but measured at 4x the 6 ms estimated there |
 
-**The weight dequantizer is the open one** (a two-pass form, Triton elementwise scale plus one `torch.mm` by the rotation matrix, already beats the SYCL kernel 1.3-5.1x and is in the library: `docs/experiments.md` 5b; `debug/native/probe_dequant_weight.cpp` takes the SYCL kernel apart; its modes 8 and 9 test one sub-group per group with a local-memory transpose, the route that would beat the two-pass form). 82 ms for 2.17 G parameters moves 6.5 GB: 80 GB/s, against the 397 GB/s copy
+**The weight dequantizer is the open one** (done: rewritten as one sub-group per group with a local-memory transpose, 0.034 ms at 1280x5120, `docs/experiments.md` 5b; the analysis below is the history). 82 ms for 2.17 G parameters moves 6.5 GB: 80 GB/s, against the 397 GB/s copy
 ceiling measured on the same card in the same run (16 ms). `performance.md` already says "headroom, the shape of that work is
 the same as the rotate's, and the rotate's is closed", but the two differ where it matters: the rotate cannot split a group
 across lanes because the row's abs-max would cross sub-groups (`probe_cross_lane.cpp`); **the dequantizer has no abs-max**, so

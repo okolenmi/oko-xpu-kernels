@@ -161,9 +161,12 @@ The int8 widening and the scale cost nothing measurable; the Triton matrix produ
 vendor library on this card with these tile sizes (small; larger tiles and more warps were not tried). **Do not build a kernel
 on `tl.dot` here without a tuned configuration that reaches tens of TFLOPS first.**
 
-What works: a Triton elementwise pass (dequantize and round to bf16, 0.03 ms at 1280x5120, 225 GB/s) followed by `torch.mm`
-(0.055 ms): `xpu_kernels.triton.dequant`, bit-identical to the SYCL kernel on every value tested (0 of 13 M), 1.3-5.1x faster in
-device time at SDXL's shapes (`debug/bench_dequant_triton.py`).
+A Triton elementwise pass followed by `torch.mm` did beat the old SYCL kernel 1.3-5.1x (bit-identical), but it was a detour: the
+old kernel was slow because a lane held a whole 256-element group (256 live floats, spilled) and loaded and stored scalars
+strided across lanes. One sub-group per group with a local-memory transpose (`debug/native/probe_dequant_weight.cpp` modes 8, 9)
+is bit-identical and runs 0.034 ms at 1280x5120 and 0.109 ms at 10240x1280 in the library, 0.33-0.82x the time of the two-pass
+form's 0.103 and 0.240 ms; the two-pass module was removed. The probe's "floor" mode 6 was itself slow at 10240x1280 only because
+the runtime picked the work-group size: with an explicit 64 (mode 10) it takes 0.086 ms against 0.153 ms.
 
 ## 6. Still untried
 

@@ -6,13 +6,8 @@
   the rotation's lane digits turned into register digits by a transpose through local memory. The old kernel kept a whole group
   (256 floats) in each lane and loaded and stored scalars strided across lanes. Probe (`debug/native/probe_dequant_weight.cpp`
   mode 9, bit-identical to the old kernel) on the B580: 1280x5120 0.454 -> 0.039 ms (11.7x), 10240x1280 0.472 -> 0.092 ms (5.1x);
-  it also lifts the old limit on the number of groups per row. The Triton two-pass form below (0.104 ms) is slower than this and
-  stays only until the rewritten kernel is confirmed on hardware.
-
-* **A two-pass weight dequantizer** (`xpu_kernels.triton.dequant`): a Triton scale-and-round pass followed by one `torch.mm` with
-  the library's own rotation matrix, in place of the SYCL kernel's per-lane butterfly (57-150 GB/s of a 397 GB/s ceiling).
-  Gated within 1e-3 against the SYCL kernel but bit-identical on every value tested; device time 1.3-5.1x lower at SDXL's shapes
-  (1280x5120: 0.529 -> 0.104 ms). `debug/bench_dequant_triton.py`, and why not a single Triton kernel: `docs/experiments.md` 5b.
+  it also lifts the old limit on the number of groups per row. In the library, device time at 1280x5120 is 0.034 ms (0.529 before;
+  a Triton scale pass plus `torch.mm` is 0.103) and 0.109 ms at 10240x1280, 0 differing values.
 
 * **A fused bf16 GEGLU** (`xpu_kernels.triton.geglu`): SDXL's feed-forward activation `h[.., :I] * gelu(h[.., I:])` as one pass
   forward and one backward (the backward writes both halves of `dh`, so the `cat` that autograd's `chunk` adds does not run), with

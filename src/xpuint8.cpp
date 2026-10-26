@@ -18,6 +18,7 @@ using sycl::device;
 using sycl::exception;
 using sycl::handler;
 using sycl::id;
+using sycl::local_accessor;
 using sycl::nd_item;
 using sycl::nd_range;
 using sycl::queue;
@@ -672,7 +673,7 @@ void launch_dequant_weight(queue &q, const int8_t *w8, const float *w_scale, BF 
                            F16 v = load_dequant_reg(w8 + grp * GS + lane * 16, w_scale[grp / n_groups]);
                            v = inreg(v, c0, c1, c2, c3, d0, d1, d2, d3);
                            for (int t = 0; t < 16; t++) stage[base + lane * 16 + t] = v[t];
-                           group_barrier(sg);
+                           sycl::group_barrier(sg);
                            F16 u;
                            for (int m = 0; m < 16; m++) u[m] = stage[base + lane + 16 * m];
                            u = inreg(u, c0, c1, c2, c3, d0, d1, d2, d3);

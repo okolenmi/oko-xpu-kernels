@@ -470,14 +470,33 @@ comfy_kitchen *eager* backend already lists here), the 19.2 % elementwise block
 list), and the 7.1 ms `conv_reorder` inside the conv block. The 16.5 % attention
 block is already the flash kernel.
 
-The VAE is the other half of a 1024×1024 image and it is the memory ceiling.
-A fresh process that loads only the VAE decodes one 1024×1024 latent in
-**5 954 ms** on the default fp32 path -- after the sdpa attempt OOMs and
-ComfyUI falls back to sliced attention -- and a second decode OOMs outright
-(`debug/probe_comfy_xpu_vae_1024.py`). Against 259 ms per UNet step, a 20-step
-image is ~5.2 s of denoising and ~6 s of decode: at this shape the VAE is the
-larger single block, and the fp16 (`--fp16-vae`) and tiled paths are the ones
-worth measuring next.
+The VAE is post-processing, and the card has to hold it on its own.  Evicting
+the UNet first -- which ComfyUI's `VAE.decode` does itself through
+`load_models_gpu(..., memory_required=...)` -- takes free memory from 3 408 to
+9 800 MB, and the untiled decode *still* OOMs at 1024×1024 even in fp16: it
+dies inside a conv, not attention, so what overflows is the decoder's own
+workspace, not the 2.3-4.6 GB the estimate predicts.  On the default fp32 path
+that OOM lands in sliced attention and costs 5 954 ms.
+
+Tiling is what makes the shape fit, and it is also the fast path
+(`VAEDecodeTiled`, tile_size 512, `debug/probe_comfy_xpu_vae_1024.py`):
+
+| variant | steady | peak alloc | first decode of a session |
+|---|---|---|---|
+| fp16 VAE, tiled 512 | 1 078-1 165 ms | 619 MB | 4.7-4.8 s |
+| fp32 VAE, tiled 512 | 4 695-4 719 ms | 1 227 MB | 6.0 s |
+
+The fp16 image differs from fp32 by max 0.0126 and mean 0.00015 in [0,1] units
+(p99.9 0.0021), under one 8-bit step everywhere.  So a 1024×1024 image is
+~5.2 s of denoising plus ~1.1 s of decode once the node is `VAEDecodeTiled` and
+the VAE runs in fp16 -- against ~6 s for the default path, which OOMs on the
+second decode.
+
+The driver OOM also had to be *classified*: Level Zero raises
+`UR_RESULT_ERROR_OUT_OF_RESOURCES` as a plain `RuntimeError`, so
+`model_management.is_oom` never treated it as retryable and the decode died
+instead of tiling.  It now matches both Level Zero codes; the fallback was
+verified with a simulated driver error rather than by OOMing the card again.
 
 ### The batch scaling of the trainer's step: the wall is a floor, then a slope
 

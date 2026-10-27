@@ -260,9 +260,10 @@ minimum over the steps of one shape:
   flash islands put ~10 ms of host back. Memory is not what stops it: the chain
   reaches ~3.2 GB and the whole pool is ~1 950 MB. The measured frontier is
   512×512 1.59×, 768×768 ~1.05×, 1024×1024 ~1.0×. At 1024×1024 the decode is
-  the other half: 5 954 ms for the default fp32 VAE (sliced after an sdpa OOM)
-  against ~5.2 s of 20-step sampling, so that shape's ceiling is the VAE, not
-  the denoiser.
+  post-processing and needs its own room: untiled it does not fit at all (it
+  OOMs even in fp16 with the UNet evicted), and tiled at 512 it is 1.1 s in
+  fp16 / 4.7 s in fp32 at 619 MB / 1 227 MB peak, so a 20-step image is ~5.2 s
+  of sampling plus ~1.1 s of decode.
 
 ### The host direction: finished inside the capture, not outside it
 

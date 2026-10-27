@@ -1,18 +1,33 @@
-"""How much of a 1024x1024 image is the VAE, and not the denoiser?
+"""The VAE decode as a generation actually runs it: after the denoiser is gone.
 
-A fresh process that loads only the VAE (the UNet is never touched, so it never
-reaches the card) and decodes a 1024x1024 latent through the same `VAE.decode`
-the `VAEDecode` node calls.  The latent's content does not change the cost.
+The VAE is post-processing.  By the time `VAEDecode` runs, the UNet should not
+be on the card, and ComfyUI's own `VAE.decode` evicts it to RAM when it needs
+the room (`load_models_gpu(..., memory_required=...)`).  This probe reproduces
+that sequence: sample a latent with the real model, drop the probe's reference,
+let model management evict the UNet, then decode and time it.
 
-Measured on the B580: the default fp32 path sits *at* the memory ceiling.  The
-first decode OOMs on sdpa, ComfyUI switches to sliced attention, and it lands in
-5 954 ms; a second decode OOMs outright.  The fp16 (`--fp16-vae`) and tiled
-paths are the ones a real 1024x1024 run should use, and are not measured here.
+Two variants a user can pick, both inside the card:
+
+  * fp16 (`--fp16-vae`), tiled (`VAEDecodeTiled`, tile_size 512),
+  * fp32, tiled 512 (no dtype trade-off).
+
+Measured at 1024x1024 on the B580: eviction alone leaves 9 800 MB free, and the
+*untiled* decode still OOMs even in fp16 (in a conv, not attention), so tiling
+is what makes the shape fit.  Tiled 512 is 1 078-1 165 ms in fp16 (619 MB peak)
+and 4 695-4 719 ms in fp32 (1 227 MB peak); the first decode of a session pays
+4.7-6.0 s of kernel compilation on top.  The script also prints the fp16-vs-fp32
+difference (max 0.0126, mean 0.00015 in [0,1] units) so the dtype choice is a
+measured one.
+
+The allocator cache is returned between decodes (`soft_empty_cache`), which is
+what makes a second decode possible at all.  `--untiled` additionally tries the
+path that OOMs, and the process then hangs on teardown: do not run it casually.
 
     LEVEL_ZERO_V1_SDK_PATH=/home/okolenmi/.local/levelzero \
       /home/okolenmi/comfy/venv/bin/python debug/probe_comfy_xpu_vae_1024.py --res 1024
 """
 import argparse
+import gc
 import sys
 import time
 
@@ -21,41 +36,97 @@ sys.path.insert(0, "/home/okolenmi/comfy/ComfyUI")
 parser = argparse.ArgumentParser()
 parser.add_argument("--res", type=int, default=1024)
 parser.add_argument("--ckpt", default="/home/okolenmi/comfy/ComfyUI/models/checkpoints/divA.safetensors")
+parser.add_argument("--runs", type=int, default=2)
+parser.add_argument("--untiled", action="store_true",
+                    help="also try the fp16 untiled path (OOMs at 1024x1024)")
 args = parser.parse_args()
 
 import torch
 
 import comfy.cli_args
 import comfy.model_management as mm
+import comfy.sample
 import comfy.sd
+import comfy.utils
 import folder_paths
 
 comfy.cli_args.args.xpu_graphs = False
 
+
+def free_mb():
+    return torch.xpu.mem_get_info()[0] / 2**20
+
+
 torch.manual_seed(42)
-_, _, vae, _ = comfy.sd.load_checkpoint_guess_config(
-    args.ckpt, output_model=False, output_clip=False, output_vae=True,
-    embedding_directory=folder_paths.get_folder_paths("embeddings"))
+model, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(
+    args.ckpt, output_vae=True, output_clip=True,
+    embedding_directory=folder_paths.get_folder_paths("embeddings"))[:4]
 
-lat = torch.randn((1, 4, args.res // 8, args.res // 8),
-                  device="xpu", dtype=torch.float16)
+cond = clip.encode_from_tokens_scheduled(clip.tokenize("a red fox in a snowy forest, photo"))
+lat = args.res // 8
+noise = torch.randn((1, 4, lat, lat), generator=torch.Generator("cpu").manual_seed(1234))
+print(f"free before the step:          {free_mb():6.0f} MB")
+samples = comfy.sample.sample(model, noise, 1, 7.0, "euler", "normal", cond, cond,
+                              torch.zeros_like(noise), denoise=1.0, seed=1,
+                              disable_pbar=True)
+torch.xpu.synchronize()
+print(f"free with the UNet on the card: {free_mb():6.0f} MB")
+
+# The sequence a generation runs: the denoiser goes away before the VAE node.
+del model, clip, cond, noise
+gc.collect()
+mm.unload_all_models()
+mm.soft_empty_cache()
+print(f"free after eviction to RAM:    {free_mb():6.0f} MB")
 
 
-def timed():
+def decode_once(tile):
     torch.xpu.synchronize()
     t0 = time.perf_counter()
-    image = vae.decode(lat)
+    if tile:
+        img = vae.decode_tiled(samples,
+                               tile_x=tile // vae.downscale_ratio,
+                               tile_y=tile // vae.downscale_ratio,
+                               overlap=64 // vae.downscale_ratio)
+    else:
+        img = vae.decode(samples)
     torch.xpu.synchronize()
-    return (time.perf_counter() - t0) * 1000, image
+    return (time.perf_counter() - t0) * 1000, img
 
 
-ms, image = timed()
-print(f"  warm-up (loads the VAE)       {ms:8.1f} ms")
-runs = []
-for i in range(2):
-    ms, image = timed()
-    runs.append(ms)
-    print(f"  run {i + 1}                         {ms:8.1f} ms")
-print(f"  VAE decode at {args.res}x{args.res}: min {min(runs):.1f} ms")
-print(f"  the image: {tuple(image.shape)} mean {image.float().mean().item():.6f}")
-print(f"  free after: {torch.xpu.mem_get_info()[0] / 2**20:.0f} MB")
+variants = [("fp16, tiled 512", torch.float16, 512),
+            ("fp32, tiled 512", torch.float32, 512)]
+if args.untiled:
+    # The untiled path OOMs at 1024x1024 on this card even in fp16 with ~10 GB
+    # free, and the process hangs on teardown after the driver error.  Kept
+    # behind a flag so nobody runs it by accident.
+    variants.append(("fp16, untiled", torch.float16, 0))
+
+images = {}
+for label, dtype, tile in variants:
+    vae.vae_dtype = dtype
+    vae.first_stage_model.to(dtype=dtype)
+    gc.collect()
+    mm.soft_empty_cache()
+    print(f"\n{label}: free {free_mb():.0f} MB")
+    kept = None
+    for i in range(args.runs + 1):
+        torch.xpu.reset_peak_memory_stats()
+        ms, img = decode_once(tile)
+        peak = torch.xpu.max_memory_allocated() / 2**20
+        tag = "warm-up" if i == 0 else f"run {i}"
+        print(f"  {tag:8s} {ms:8.1f} ms   peak alloc {peak:6.0f} MB   "
+              f"free {free_mb():6.0f} MB")
+        if i == 1:
+            kept = img.float().cpu()
+        del img
+        gc.collect()
+        mm.soft_empty_cache()
+    if kept is not None:
+        images[label] = kept
+
+for a, b in (("fp16, tiled 512", "fp32, tiled 512"),):
+    if a in images and b in images:
+        d = (images[a] - images[b]).abs()
+        print(f"\n{a} vs {b}: max |d| {d.max():.6f}, mean |d| {d.mean():.6f}, "
+              f"p99.9 {d.flatten().kthvalue(int(d.numel() * 0.999)).values:.6f}")

@@ -213,6 +213,24 @@
   conv 20.2 %, elementwise 19.2 %, flash attention 16.5 %), so that shape's
   levers are the kernels, not the capture.
 
+* **At 1024×1024 the decode is the other half, and tiling is what makes it
+  fit.** Evicting the UNet first — which `VAE.decode` does itself through
+  `load_models_gpu(..., memory_required=...)` — leaves 9 800 MB free, and the
+  *untiled* decode still OOMs in fp16, inside a conv: the decoder's workspace,
+  not the 2.3-4.6 GB the estimate predicts, is what overflows. The default fp32
+  path turns that into sliced attention at 5 954 ms. `VAEDecodeTiled` at
+  tile_size 512 is 1 078-1 165 ms in fp16 (619 MB peak) and 4 695-4 719 ms in
+  fp32 (1 227 MB); the fp16 image differs from fp32 by max 0.0126, mean 0.00015
+  in [0,1] units. A 20-step 1024×1024 image is therefore ~5.2 s of denoising
+  plus ~1.1 s of decode. `debug/probe_comfy_xpu_vae_1024.py` reproduces it.
+
+* **A Level Zero device-exhaustion error is now classified as an OOM**
+  (`comfy/model_management.py:is_oom`). The driver reports it as a plain
+  `RuntimeError("... error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)")`, which the
+  CUDA-oriented check missed, so the VAE's tiled fallback never engaged and the
+  run died at the ceiling. Verified with a simulated driver error (falls back
+  and returns the correct image) rather than by OOMing the card again.
+
 * **The batch scaling of the trainer's step is measured, and nothing in it is
   super-linear.** `debug/probe_step_batch_scaling.py` runs the reduced step
   (frozen base, the MSE backward, the checkpointing on, 512×512) at batch

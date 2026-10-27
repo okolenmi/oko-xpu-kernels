@@ -208,7 +208,10 @@
   because at that size a capture removes **6.3 ms** of host issue (eager math
   375.3 ms against a 369.0 ms replay) while the math attention costs 115 ms of
   device time.  The frontier is 512×512 1.59×, 768×768 ~1.05×, 1024×1024
-  ~1.0×: a graph pays only while the eager step is host-bound.
+  ~1.0×: a graph pays only while the eager step is host-bound.  A profiled
+  1024×1024 step is **92.7 % kernel time** in 1 949 launches (gemm 37.9 %,
+  conv 20.2 %, elementwise 19.2 %, flash attention 16.5 %), so that shape's
+  levers are the kernels, not the capture.
 
 * **The batch scaling of the trainer's step is measured, and nothing in it is
   super-linear.** `debug/probe_step_batch_scaling.py` runs the reduced step

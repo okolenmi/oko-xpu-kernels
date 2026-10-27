@@ -441,6 +441,44 @@ real forward:
   best: a graph pays only while the eager step is host-bound, and by 1024×1024
   the device is the step.
 
+### The ComfyUI 1024×1024 step, measured
+
+One profiled eager step at 1024×1024 (batch 2, cfg 7, euler/normal) from
+`debug/probe_comfy_xpu_graph_1024.py`:
+
+| kernel group | ms | share | calls |
+|---|---|---|---|
+| gemm | 90.8 | 37.9 % | 743 |
+| conv (51 convs + 91 reorders) | 48.5 | 20.2 % | 142 |
+| elementwise | 46.0 | 19.2 % | 604 |
+| attention (`micro_sdpa`, flash) | 39.7 | 16.5 % | 140 |
+| normalisation | 10.9 | 4.6 % | 256 |
+| copy / cat | 3.1 | 1.3 % | 66 |
+| **kernel time** | **239.9** | **92.7 %** | **1 949** |
+
+The step is 258.7 ms (min of three 4-step runs). The 18.8 ms that is not kernel
+time is *not* all recoverable: the math-backend A/B above shows a capture
+removes 6.3 ms of it, and the rest is device dependency gaps that a replay
+keeps too. 1 949 kernels is on the order of 100 ms of host issue, which is why
+the 512×512 step (device ~57 ms, step 102-116 ms) is host-bound and this one is
+not.
+
+So the non-capture levers at this shape are the 37.9 % GEMM block (743 calls;
+int8/fp8 weights, and the `int8_linear` / `scaled_mm_mxfp8` capabilities the
+comfy_kitchen *eager* backend already lists here), the 19.2 % elementwise block
+(46 ms; a fused GEGLU, which the trainer's tree has and this backend does not
+list), and the 7.1 ms `conv_reorder` inside the conv block. The 16.5 % attention
+block is already the flash kernel.
+
+The VAE is the other half of a 1024×1024 image and it is the memory ceiling.
+A fresh process that loads only the VAE decodes one 1024×1024 latent in
+**5 954 ms** on the default fp32 path -- after the sdpa attempt OOMs and
+ComfyUI falls back to sliced attention -- and a second decode OOMs outright
+(`debug/probe_comfy_xpu_vae_1024.py`). Against 259 ms per UNet step, a 20-step
+image is ~5.2 s of denoising and ~6 s of decode: at this shape the VAE is the
+larger single block, and the fp16 (`--fp16-vae`) and tiled paths are the ones
+worth measuring next.
+
 ### The batch scaling of the trainer's step: the wall is a floor, then a slope
 
 The same reduced step (frozen base, the MSE backward, the checkpointing on,

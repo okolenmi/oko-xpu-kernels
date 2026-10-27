@@ -259,7 +259,10 @@ minimum over the steps of one shape:
   replay) while the math attention costs 115 ms of device time, and the chain's
   flash islands put ~10 ms of host back. Memory is not what stops it: the chain
   reaches ~3.2 GB and the whole pool is ~1 950 MB. The measured frontier is
-  512×512 1.59×, 768×768 ~1.05×, 1024×1024 ~1.0×.
+  512×512 1.59×, 768×768 ~1.05×, 1024×1024 ~1.0×. At 1024×1024 the decode is
+  the other half: 5 954 ms for the default fp32 VAE (sliced after an sdpa OOM)
+  against ~5.2 s of 20-step sampling, so that shape's ceiling is the VAE, not
+  the denoiser.
 
 ### The host direction: finished inside the capture, not outside it
 

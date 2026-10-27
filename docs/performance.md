@@ -470,37 +470,31 @@ comfy_kitchen *eager* backend already lists here), the 19.2 % elementwise block
 list), and the 7.1 ms `conv_reorder` inside the conv block. The 16.5 % attention
 block is already the flash kernel.
 
-The VAE is post-processing and needs the card to itself, but the requirement is
-simply large, not leaking: the untiled peak is linear in output pixels,
-**11.7-11.9 MB per megapixel** in fp16, the same slope at every size
-(`--scaling` in `debug/probe_comfy_xpu_vae_1024.py`):
+The VAE is post-processing and it is cheap at this shape: a warm 1024×1024
+decode is **289-291 ms and ~2.3-3.0 GB** in fp16 on the untiled path, and
+1 345-1 366 ms / 5 970 MB in fp32.  Tiling is not needed and costs time --
+`VAEDecodeTiled` at 512 is 1 143 ms in fp16 (722 MB) and 4 947 ms in fp32
+(`debug/probe_comfy_xpu_vae_1024.py`, warm, after the UNet is evicted):
 
-| output | untiled peak | untiled steady |
+| variant | steady | peak |
 |---|---|---|
-| 512×512 | 3 112 MB | (includes the first compile) |
-| 768×768 | 6 884 MB | 946 ms |
-| 1024×1024 | 12 332 MB | 2 584-2 924 ms |
+| fp16, untiled | 289-291 ms | ~2.3-3.0 GB |
+| fp32, untiled | 1 345-1 366 ms | 5 970 MB |
+| fp16, tiled 512 | 1 143 ms | 722 MB |
+| fp32, tiled 512 | 4 947 ms | 1 152 MB |
 
-At 1024×1024 that is the whole 12 GB card: the untiled decode only runs by
-having the driver back part of the allocation from host RAM.  Evicting the UNet
-first (which `VAE.decode` already does through `load_models_gpu`) leaves
-9 800 MB and is still short, so the fp16 attempt dies in a conv; nothing is
-leaked.  fp32 doubles the requirement (~24 GB), which is why the default path
-never gets there and lands in sliced attention at 5 954 ms.
+So a 20-step 1024×1024 image is ~5.2 s of denoising plus ~0.3 s of decode, and
+the decode is not where anything needs to be won.  The fp16 image differs from
+fp32 by max 0.018, mean 0.0002 in [0,1] units, under an 8-bit step.
 
-Tiling is both the path that fits and the faster one (`VAEDecodeTiled`,
-tile_size 512, `debug/probe_comfy_xpu_vae_1024.py`):
-
-| variant | steady | peak alloc | first decode of a session |
-|---|---|---|---|
-| fp16 VAE, tiled 512 | 1 078-1 165 ms | 619 MB | 4.7-4.8 s |
-| fp32 VAE, tiled 512 | 4 695-4 719 ms | 1 227 MB | 6.0 s |
-
-The fp16 image differs from fp32 by max 0.0126 and mean 0.00015 in [0,1] units
-(p99.9 0.0021), under one 8-bit step everywhere.  So a 1024×1024 image is
-~5.2 s of denoising plus ~1.1 s of decode once the node is `VAEDecodeTiled` and
-the VAE runs in fp16 -- against 2.6-2.9 s for the untiled fp16 path (which
-needs the whole card) and 5.9 s for the default fp32 one.
+A measurement trap, and the source of three wrong numbers in this document: the
+decode has to run under `torch.inference_mode()`, as ComfyUI's `execution.py`
+does.  Without it the VAE's parameters require grad, the decoder builds an
+autograd graph, and every intermediate is retained: 11.5 KB per output pixel,
+12 GB at 1024×1024 instead of 2.3 GB, four times the time, and an OOM on a
+12 GB card.  Torch's XPU peak counter also does not reset
+(`reset_peak_memory_stats` is a no-op here), so a probe has to read the driver's
+free memory, as this one now does.
 
 The driver OOM also had to be *classified*: Level Zero raises
 `UR_RESULT_ERROR_OUT_OF_RESOURCES` as a plain `RuntimeError`, so

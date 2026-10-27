@@ -213,19 +213,20 @@
   conv 20.2 %, elementwise 19.2 %, flash attention 16.5 %), so that shape's
   levers are the kernels, not the capture.
 
-* **At 1024×1024 the decode is the other half, and tiling is what makes it
-  fit.** Evicting the UNet first — which `VAE.decode` does itself through
-  `load_models_gpu(..., memory_required=...)` — leaves 9 800 MB free, and the
-  *untiled* decode wants **11.8 MB per output megapixel** in fp16 — 3 112 MB at
-  512×512, 6 884 at 768×768, 12 332 at 1024×1024, the same slope at all three,
-  so nothing leaks: at 1024×1024 it is the whole 12 GB card and only runs by
-  spilling to host RAM (2 584-2 924 ms), and fp32 doubles it (~24 GB), which is
-  why the default path lands in sliced attention at 5 954 ms.
-  `VAEDecodeTiled` at tile_size 512 is both smaller and faster: 1 078-1 165 ms
-  in fp16 (619 MB peak), 4 695-4 719 ms in fp32 (1 227 MB); the fp16 image
-  differs from fp32 by max 0.0126, mean 0.00015 in [0,1] units. A 20-step
-  1024×1024 image is therefore ~5.2 s of denoising plus ~1.1 s of decode.
-  `debug/probe_comfy_xpu_vae_1024.py --scaling` reproduces the curve.
+* **At 1024×1024 the decode costs 0.3 s, and three earlier numbers here were
+  wrong because the probe ran without `torch.inference_mode()`.** The VAE's
+  parameters require grad, so a plain call builds an autograd graph that
+  retains every intermediate: 11.5 KB per output pixel, 12 GB at 1024×1024
+  instead of 2.3 GB, four times the time, and an OOM on the card.  ComfyUI's
+  `execution.py` runs inside `inference_mode`, which is why the same decode
+  works there.  Measured warm, with the UNet evicted (which `VAE.decode` does
+  itself): fp16 untiled **289-291 ms / ~2.3-3.0 GB**, fp32 untiled 1 345-1 366
+  ms / 5 970 MB, fp16 tiled 512 1 143 ms / 722 MB, fp32 tiled 4 947 ms.  Tiling
+  only buys memory and costs 4x the time.  The fp16 image differs from fp32 by
+  max 0.018, mean 0.0002 in [0,1] units.  A 20-step image is ~5.2 s of
+  denoising plus ~0.3 s of decode.  Torch's XPU peak counter does not reset
+  either, so `debug/probe_comfy_xpu_vae_1024.py` measures the peak from the
+  driver's free memory.
 
 * **A Level Zero device-exhaustion error is now classified as an OOM**
   (`comfy/model_management.py:is_oom`). The driver reports it as a plain

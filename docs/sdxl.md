@@ -260,10 +260,9 @@ minimum over the steps of one shape:
   flash islands put ~10 ms of host back. Memory is not what stops it: the chain
   reaches ~3.2 GB and the whole pool is ~1 950 MB. The measured frontier is
   512×512 1.59×, 768×768 ~1.05×, 1024×1024 ~1.0×. At 1024×1024 the decode is
-  post-processing and needs its own room: untiled it wants 11.8 MB per
-  megapixel of output (12.3 GB at 1024×1024, the whole card) and takes 2.6-2.9 s;
-  tiled at 512 it is 1.1 s in fp16 / 4.7 s in fp32 at 619 MB / 1 227 MB peak,
-  so a 20-step image is ~5.2 s of sampling plus ~1.1 s of decode.
+  post-processing and cheap: a warm decode is 289-291 ms in fp16 (~2.3-3.0 GB)
+  and 1 345 ms in fp32, untiled; tiling costs 4x the time and only buys memory,
+  so a 20-step image is ~5.2 s of sampling plus ~0.3 s of decode.
 
 ### The host direction: finished inside the capture, not outside it
 

@@ -9,6 +9,14 @@ absolute difference against the same run without graphs, and the graph counters.
         --res 512 --steps 8 --graph 1
 
 Run it twice (--graph 0 and --graph 1) and compare the two printed results.
+
+--whole skips the segmented chain, so the whole-model capture is measured on
+the card's clean memory (at 1024x1024 the aborted chain's arena is not given
+back, which is what refuses the whole capture in the normal order).  --math
+forces the math attention on the eager path too, so the eager time minus the
+whole-capture replay is exactly the host issue the capture removes: at
+1024x1024 that is 375.3 against 369.0 ms, 6.3 ms, which is why the shape stays
+eager.
 """
 import argparse
 import json
@@ -26,6 +34,10 @@ parser.add_argument("--graph", type=int, default=0)
 parser.add_argument("--ckpt", default="/home/okolenmi/comfy/ComfyUI/models/checkpoints/divA.safetensors")
 parser.add_argument("--out", default="")
 parser.add_argument("--no-decode", action="store_true", help="skip the VAE, which needs ~3 GB at 1024")
+parser.add_argument("--whole", action="store_true",
+                    help="skip the segmented chain, so the whole-model capture gets the clean memory")
+parser.add_argument("--math", action="store_true",
+                    help="force the math attention on the eager path too (eager minus the whole-capture replay is the host issue the capture removes)")
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
@@ -40,6 +52,22 @@ import comfy.utils
 import folder_paths
 
 comfy.cli_args.args.xpu_graphs = bool(args.graph)
+
+if args.whole or args.math:
+    import comfy.xpu_graph as _xg
+
+    if args.whole:
+        def _no_chain(self, *a, **k):
+            raise _xg._ChainUnsupported("skipped by --whole")
+        _xg.GraphCache._capture_chain = _no_chain
+    if args.math:
+        _sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        def _math_sdpa(*a, **k):
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                return _sdpa(*a, **k)
+
+        torch.nn.functional.scaled_dot_product_attention = _math_sdpa
 
 torch.manual_seed(42)
 model, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(

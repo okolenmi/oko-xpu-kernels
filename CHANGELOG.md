@@ -198,14 +198,17 @@
   capture (the first attempt starved with ~450 MB free and the driver does
   not return an OOM from inside a capture — it kills the device), a floor
   guard aborts a chain between captures with the same bound the pre-gate
-  checks (the flash eager peak plus 1 GB), and the entries hold **four
-  tensors per attention site** — q, k, v and the island, **1.6-1.9 GB at
-  512×512** against a 72 MB eager peak.  At 1024×1024 that arithmetic
-  (~6.5-7.5 GB against 2 320-2 439 MB free) means the chain is attempted and
-  then aborted cleanly by the guard (`ran out of room after site 82 (... 1318
-  MB free against a floor of 1339 MB)`), the whole-model fallback is refused
-  by its own constant (2 910 MB), and the step stays eager at 238-257
-  ms/step with no device loss.
+  checks (the flash eager peak plus 1 GB), and the memory is **141 private
+  working sets**: **1 918 MB** (13.7 MB per attention site) at 512×512, where
+  the whole-model capture is one recording and holds the largest working set.
+  At 1024×1024 the chain reaches ~3.2 GB (22.6 MB per site) and the guard
+  aborts it cleanly at its 1 GB floor (site 82-92 of 140); the whole-model
+  fallback is refused by its constant (2 910 MB) measured after that dead
+  chain's arena -- alone it needs ~1 950 MB and fits.  The step stays eager
+  because at that size a capture removes **6.3 ms** of host issue (eager math
+  375.3 ms against a 369.0 ms replay) while the math attention costs 115 ms of
+  device time.  The frontier is 512×512 1.59×, 768×768 ~1.05×, 1024×1024
+  ~1.0×: a graph pays only while the eager step is host-bound.
 
 * **The batch scaling of the trainer's step is measured, and nothing in it is
   super-linear.** `debug/probe_step_batch_scaling.py` runs the reduced step

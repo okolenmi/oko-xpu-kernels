@@ -252,10 +252,14 @@ minimum over the steps of one shape:
   segments and is bit-exact. The per-call gain is 1.40×, not the 2.3× of the
   batch-1 forward: CFG batches cond and uncond into one batch-2 call, so the
   device time doubles while the host time does not. At 1024×1024 the chain is
-  attempted and the guard aborts it between segments (site 82 of 140, 1 318 MB
-  free against a floor of 1 339 MB) and the whole capture is refused, so the
-  step time is unchanged -- the chain's four tensors per site would be
-  ~6.5-7.5 GB there.
+  attempted and the guard aborts it between segments (site 82-92 of 140, the
+  1 GB floor) and the whole capture is refused, so the step time is unchanged
+  -- and that is the right answer on speed too: at 1024×1024 a capture removes
+  6.3 ms of host issue (the eager math forward 375.3 ms against its 369.0 ms
+  replay) while the math attention costs 115 ms of device time, and the chain's
+  flash islands put ~10 ms of host back. Memory is not what stops it: the chain
+  reaches ~3.2 GB and the whole pool is ~1 950 MB. The measured frontier is
+  512×512 1.59×, 768×768 ~1.05×, 1024×1024 ~1.0×.
 
 ### The host direction: finished inside the capture, not outside it
 

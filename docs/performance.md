@@ -418,21 +418,28 @@ real forward:
   activation peak plus 1 GB -- so the first segment cannot OOM, though the
   chain's own residency can still eat the margin: at 1024×1024 the capture was
   attempted and the guard aborted it *between* segments (`ran out of room
-  after site 82 (1318 MB free against a floor of 1339 MB)`), which is clean --
+  after site 82 (1318 MB free against a floor of 1339 MB)`; site 92 of 140 in a
+  later session), which is clean --
   no device loss, and the whole-model fallback then ran on a live device. The
   whole-model attempt cannot be aborted mid-recording, so it keeps the older
   constant of twice the peak it captures under.
-- **The chain's resident memory is four tensors per attention site.**  Every
-  boundary retains q, k, v (pool blocks whose addresses the next segment's
-  replay reads) and the island (the eager output).  Measured at 512×512:
-  **1.6-1.9 GB** for the 141-graph chain against a 72 MB eager activation
-  peak -- the 140 sites' tensors dominate, not the intermediates.  Releasing
-  an entry returns only ~350 MB (`empty_cache()` does not give back the graph
-  pool's arena on this stack), so a re-capture reuses it and adds ~250 MB.
-  That is why 1024×1024 cannot finish a chain: four tensors times four times
-  the tokens would be ~6.5-7.5 GB against 2 320-2 439 MB free, and the
-  whole-model fallback is refused by its own constant (2 910 MB) and measured
-  no faster anyway (260 against 263 ms/step).
+- **The chain's memory is 141 private working sets, and resolution decides
+  whether it pays.**  Measured on the real SDXL at batch 2: **1 918 MB at
+  512×512** (13.7 MB per attention site: four retained boundary tensors plus
+  that segment's own private pool) and **22.6 MB per site at 1024×1024**
+  (2 080 MB for the 92 of 140 sites it reaches, ~3.2 GB if it finished).  A
+  graph pool does not share memory *between* graphs, so the chain is the sum of
+  its segments' working sets; releasing an entry returns only ~350 MB
+  (`empty_cache()` does not give back the graph pool's arena on this stack), so
+  a re-capture reuses it and adds ~250 MB.  At 1024×1024 the guard stops the chain at its 1 GB floor, and
+  the whole-model fallback is refused by its constant (2 910 MB) measured
+  *after* that dead chain's arena -- alone it needs ~1 950 MB and fits.  Neither
+  matters for speed: at 1024×1024 the eager math forward is 375.3 ms and its
+  replay 369.0 ms, so a capture removes **6.3 ms** of host issue while the math
+  attention costs 115 ms of device time (0.71×).  The frontier is 512×512
+  1.59×, 768×768 ~1.05× (the chain stops 6-9 sites short), 1024×1024 ~1.02× at
+  best: a graph pays only while the eager step is host-bound, and by 1024×1024
+  the device is the step.
 
 ### The batch scaling of the trainer's step: the wall is a floor, then a slope
 

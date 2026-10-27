@@ -74,6 +74,26 @@ SDXL's shapes it is not free.** It buys 4× less weight memory (3.0 GB on the
 whole pipeline) at a price that is paid in the one big-N projection and in the
 host time — and the capture pays the host part back.
 
+**(d) End to end at batch 2, in ComfyUI, it is slower.** The table above is
+per shape; the whole UNet is a mix of them. `debug/probe_comfy_xpu_int8_1024.py`
+quantizes every weight the kernels accept (662 of 743; K=320 and K=640 cannot
+enter a 256-group rotation) and routes ComfyUI's plain `Linear` forward through
+`convrot_int8_linear` — the dispatch SDXL needs, since it never calls
+`comfy.ops.linear_input_act`:
+
+| weights quantized | 1024×1024 step (batch 2) | vs bf16 |
+|---|---|---|
+| none (bf16) | 232.2 ms | 1.00× |
+| all 662 | 286.1 ms | **0.81×** |
+| the 70 FFN down-projections only | 225.9 ms | 0.99× |
+
+The last row is the interesting one: even restricted to the shape where INT8
+wins per call (K large, N small), the step does not move, because at batch 2
+the GEMMs are compute-bound and the activation quantizer is paid on every call.
+So the INT8 path stays out of the SDXL sampling loop, and the 2 GB of weight
+memory it frees is its only measured benefit at this shape.
+
+
 ## 3. The plan, ranked
 
 **1. The fused FFN, with SDXL's activation — done.** The library now has
@@ -104,6 +124,17 @@ removes that.
 
 What it does *not* fix: the int32 accumulator's traffic on the up-projection
 (finding (b)). The fusion removes the bf16 round trip, not the accumulator.
+
+**1b. The bf16 fused GEGLU is wired into ComfyUI's SDXL path — done.** The
+library's Triton GEGLU (`xpu_kernels.triton.geglu`) now runs in
+`comfy.ldm.modules.attention.GEGLU` for the plain bf16/fp16 UNet, where the
+INT8 FFN above does not apply: one pass over the `[.., 2I]` projection output
+instead of `chunk` + `gelu` + `mul`. Measured at 1024×1024 (batch 2, cfg 7),
+eight interleaved pairs in one process: **median 1.025×** (1.011-1.065), 1.034×
+over 20 steps (237.9 → 230.1 ms/step). It is one ULP from torch in the erf
+tail (0.2 % of values, mean latent difference 0.0017 after 20 steps), skipped
+inside a device-graph capture, and disabled by `attention.FUSED_GEGLU = False`
+or `XPU_KERNELS_NO_GEGLU=1`.
 
 **2. The capture.** Not library work — the trainer's. The library's part is
 done and verified: the INT8 forward, both backwards and the fused FFN

@@ -24,6 +24,20 @@
   in 0.2 % of values, all in the erf tail below a gate of -3 where `gelu` is ~1e-3 or smaller (`debug/probe_geglu_erf.py`: 6 of 65 280
   bf16 gate values). 1024 columns and 4 warps is the best of the sweep (`debug/bench_geglu.py`).
 
+* **ComfyUI's SDXL feed-forward uses the fused GEGLU** (`debug/probe_comfy_xpu_geglu_1024.py`): `comfy.ldm.modules.attention.GEGLU`
+  calls `xpu_kernels.triton.geglu` on the `[.., 2I]` projection output instead of `chunk` + `gelu` + `mul`, behind the module
+  flag `FUSED_GEGLU`, skipped inside a device-graph capture (a capture records whichever path ran first, and the self-test must
+  be latched before it starts), and falling back to the eager chain on any unsupported shape. At 1024×1024 (batch 2, cfg 7,
+  euler/normal, fp16), eight interleaved pairs in one process: **median 1.025×**, 1.011-1.065; a full 20-step run is 237.9 →
+  230.1 ms/step (7.7 ms). The latent after 20 steps differs by mean 0.0017, max 0.16 — one ULP in the erf tail, which is what
+  the flag is for. The 512×512 captured chain is unchanged (70.3 ms/step, 1 chain captured, 15 replays).
+
+* **INT8 does not help SDXL at 1024×1024** (`debug/probe_comfy_xpu_int8_1024.py`): the ConvRot INT8 path, dispatched through
+  ComfyUI's plain `Linear` forward, on all 662 weights the kernels accept is **0.81×** the bf16 step (286.1 against 232.2 ms);
+  restricted to the 70 FFN down-projections it is 0.99×. The per-shape probe says why: the rotate+quantize pass and the int32
+  dequant epilogue are memory-bound, and the bf16 oneDNN GEMM is already at the card's rate at SDXL's shapes (0.05-1.99 ms vs
+  int8's 0.21-3.48). It stays a weight-memory lever (2 070 MB freed), not a speed one at this batch. Nothing is wired in.
+
 *Documentation and measurement only — no behaviour change.*
 
 * **The docs were audited and rewritten.** The README was a front door with an

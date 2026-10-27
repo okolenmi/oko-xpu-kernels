@@ -470,6 +470,81 @@ comfy_kitchen *eager* backend already lists here), the 19.2 % elementwise block
 list), and the 7.1 ms `conv_reorder` inside the conv block. The 16.5 % attention
 block is already the flash kernel.
 
+The two that could be tried from this repository are measured below. The GEMM
+one is negative; the elementwise one is worth ~3 %.
+
+### The two 1024×1024 levers, measured: INT8 is slower, the fused GEGLU pays ~3 %
+
+**INT8 is a memory lever, not a speed one here.** The library has the whole
+path -- `xpu_kernels.int8`, driven from ComfyUI by `comfy/xpu_int8.py` -- but
+ComfyUI wires it into `comfy.ops.linear_input_act`, which SDXL does not call:
+its blocks are plain `operations.Linear`. `debug/probe_comfy_xpu_int8_1024.py`
+quantizes the UNet's weights with `TensorWiseINT8Layout.quantize(convrot=True)`
+and sends the plain `Linear` forward through `convrot_int8_linear`, so what is
+timed is the real kernels, not a dequantize-in-place fallback (that fallback is
+2.7× the bf16 step and would have been mistaken for "int8 is slow"). The
+kernels consume bf16 activations, so the baseline is bf16; at this shape bf16
+and fp16 are the same step (232.2 against fp16's 232-259 across processes).
+
+| weights quantized | step | vs bf16 | driver free |
+|---|---|---|---|
+| none (bf16) | 232.2 ms | 1.00× | 3 506 MB |
+| all 662 supported linears | 286.1 ms | **0.81×** | 4 458 MB |
+| the 70 FFN down-projections only | 225.9 ms | 0.99× | 3 500 MB |
+
+(K=320 and K=640 layers stay bf16 -- 256 is the ConvRot group size, so they
+cannot enter the path at all; that is 81 weights.) The freed weight storage is
+real: 2 070 MB, and it survives as ~1 GB of driver free memory. The step does
+not follow it.
+
+A per-shape probe says why -- `x @ w.T` in bf16 against
+`xpu_kernels.int8.linear` (weight prepared once with `prepare_weight`, so only
+the activation side is paid per call):
+
+| M | K | N | bf16 | int8 linear | of which rotate+quantize | int8 / bf16 |
+|---|---|---|---|---|---|---|
+| 16384 | 1280 | 1280 | 0.664 ms | 1.032 ms | 0.218 ms | 0.64× |
+| 16384 | 1280 | 5120 | 1.988 | 3.477 | 0.219 | 0.57× |
+| 4096 | 2560 | 1280 | 0.250 | 0.382 | 0.105 | 0.66× |
+| 4096 | 1280 | 1280 | 0.142 | 0.276 | 0.055 | 0.52× |
+| 1024 | 1280 | 1280 | 0.049 | 0.211 | 0.052 | 0.23× |
+
+The INT8 GEMM itself is at best at parity with bf16 on this card (0.609 against
+0.664 ms at the largest shape, both bandwidth-bound) and worse at small M; the
+dequant epilogue is the rest -- it moves 6 bytes per output element, the int32
+accumulator in and bf16 out. That is the same finding as `docs/sdxl.md`'s
+per-shape table, now end to end, at batch 2, with the whole UNet quantized.
+**So INT8 stays what it was: a 4× weight-memory saving, not a 1024×1024 speed
+lever**, and the plain-`Linear` dispatch is not wired in.
+
+**The fused GEGLU pays ~3 %.** `comfy.ldm.modules.attention.GEGLU` now calls
+`xpu_kernels.triton.geglu` on the `[.., 2I]` projection output instead of
+`chunk` + `gelu` + `mul` (one pass, one tensor less), behind the module flag
+`FUSED_GEGLU`, skipped inside a device-graph capture and falling back to the
+eager chain on any unsupported shape. Eight interleaved pairs in one process
+(the pairing matters: separate processes on this card differ by up to 10 % at
+the same configuration):
+
+| pair | eager | fused | ratio |
+|---|---|---|---|
+| 1 | 240.6 ms | 237.7 ms | 1.012× |
+| 2 | 241.9 | 236.1 | 1.025× |
+| 3 | 241.9 | 239.3 | 1.011× |
+| 4 | 247.1 | 234.7 | 1.053× |
+| 5 | 238.5 | 231.5 | 1.030× |
+| earlier 3 pairs | | | 1.054×, 1.065×, 0.999× |
+
+median **1.025×**, and 1.034× over a full 20-step run (237.9 → 230.1 ms/step,
+7.7 ms). The latent after 20 steps differs by mean 0.0017 and max 0.16: the
+kernel is one ULP away from torch in the erf tail (0.2 % of values, below a
+gate of −3), which is the price of a different erf and the reason the flag
+exists.
+
+It is deliberately *not* used inside a capture: a capture records whichever
+path ran first, and the library's self-test has to be latched before a capture
+starts. The 512×512 chain is therefore unchanged (70.3 ms/step, 1 chain
+captured, 15 replays).
+
 The VAE is post-processing and it is cheap at this shape: a warm 1024×1024
 decode is **289-291 ms and ~2.3-3.0 GB** in fp16 on the untiled path, and
 1 345-1 366 ms / 5 970 MB in fp32.  Tiling is not needed and costs time --

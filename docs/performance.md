@@ -470,16 +470,26 @@ comfy_kitchen *eager* backend already lists here), the 19.2 % elementwise block
 list), and the 7.1 ms `conv_reorder` inside the conv block. The 16.5 % attention
 block is already the flash kernel.
 
-The VAE is post-processing, and the card has to hold it on its own.  Evicting
-the UNet first -- which ComfyUI's `VAE.decode` does itself through
-`load_models_gpu(..., memory_required=...)` -- takes free memory from 3 408 to
-9 800 MB, and the untiled decode *still* OOMs at 1024×1024 even in fp16: it
-dies inside a conv, not attention, so what overflows is the decoder's own
-workspace, not the 2.3-4.6 GB the estimate predicts.  On the default fp32 path
-that OOM lands in sliced attention and costs 5 954 ms.
+The VAE is post-processing and needs the card to itself, but the requirement is
+simply large, not leaking: the untiled peak is linear in output pixels,
+**11.7-11.9 MB per megapixel** in fp16, the same slope at every size
+(`--scaling` in `debug/probe_comfy_xpu_vae_1024.py`):
 
-Tiling is what makes the shape fit, and it is also the fast path
-(`VAEDecodeTiled`, tile_size 512, `debug/probe_comfy_xpu_vae_1024.py`):
+| output | untiled peak | untiled steady |
+|---|---|---|
+| 512×512 | 3 112 MB | (includes the first compile) |
+| 768×768 | 6 884 MB | 946 ms |
+| 1024×1024 | 12 332 MB | 2 584-2 924 ms |
+
+At 1024×1024 that is the whole 12 GB card: the untiled decode only runs by
+having the driver back part of the allocation from host RAM.  Evicting the UNet
+first (which `VAE.decode` already does through `load_models_gpu`) leaves
+9 800 MB and is still short, so the fp16 attempt dies in a conv; nothing is
+leaked.  fp32 doubles the requirement (~24 GB), which is why the default path
+never gets there and lands in sliced attention at 5 954 ms.
+
+Tiling is both the path that fits and the faster one (`VAEDecodeTiled`,
+tile_size 512, `debug/probe_comfy_xpu_vae_1024.py`):
 
 | variant | steady | peak alloc | first decode of a session |
 |---|---|---|---|
@@ -489,8 +499,8 @@ Tiling is what makes the shape fit, and it is also the fast path
 The fp16 image differs from fp32 by max 0.0126 and mean 0.00015 in [0,1] units
 (p99.9 0.0021), under one 8-bit step everywhere.  So a 1024×1024 image is
 ~5.2 s of denoising plus ~1.1 s of decode once the node is `VAEDecodeTiled` and
-the VAE runs in fp16 -- against ~6 s for the default path, which OOMs on the
-second decode.
+the VAE runs in fp16 -- against 2.6-2.9 s for the untiled fp16 path (which
+needs the whole card) and 5.9 s for the default fp32 one.
 
 The driver OOM also had to be *classified*: Level Zero raises
 `UR_RESULT_ERROR_OUT_OF_RESOURCES` as a plain `RuntimeError`, so

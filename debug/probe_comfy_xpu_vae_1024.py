@@ -11,13 +11,18 @@ Two variants a user can pick, both inside the card:
   * fp16 (`--fp16-vae`), tiled (`VAEDecodeTiled`, tile_size 512),
   * fp32, tiled 512 (no dtype trade-off).
 
-Measured at 1024x1024 on the B580: eviction alone leaves 9 800 MB free, and the
-*untiled* decode still OOMs even in fp16 (in a conv, not attention), so tiling
-is what makes the shape fit.  Tiled 512 is 1 078-1 165 ms in fp16 (619 MB peak)
-and 4 695-4 719 ms in fp32 (1 227 MB peak); the first decode of a session pays
-4.7-6.0 s of kernel compilation on top.  The script also prints the fp16-vs-fp32
-difference (max 0.0126, mean 0.00015 in [0,1] units) so the dtype choice is a
-measured one.
+The untiled peak is linear in output pixels -- 0.0119 MB per pixel in fp16 --
+so there is no leak to find (`--scaling` measures the curve):
+
+    512x512   3 112 MB      768x768   6 884 MB (916 ms)
+    1024x1024 12 332 MB (2 924 ms; above the card's 12.19 GB, so the driver
+                        backs part of it from host RAM)
+
+At 1024x1024 that is the whole card, and it is slower than tiling: tiled 512 is
+1 078-1 165 ms in fp16 (619 MB peak) and 4 695-4 719 ms in fp32 (1 227 MB
+peak).  The first decode of a session pays 4.7-6.0 s of kernel compilation on
+top.  The script prints the fp16-vs-fp32 difference (max 0.0126, mean 0.00015
+in [0,1] units) so the dtype choice is a measured one.
 
 The allocator cache is returned between decodes (`soft_empty_cache`), which is
 what makes a second decode possible at all.  `--untiled` additionally tries the
@@ -38,7 +43,9 @@ parser.add_argument("--res", type=int, default=1024)
 parser.add_argument("--ckpt", default="/home/okolenmi/comfy/ComfyUI/models/checkpoints/divA.safetensors")
 parser.add_argument("--runs", type=int, default=2)
 parser.add_argument("--untiled", action="store_true",
-                    help="also try the fp16 untiled path (OOMs at 1024x1024)")
+                    help="also try the fp16 untiled path (needs ~12 GB at 1024x1024)")
+parser.add_argument("--scaling", action="store_true",
+                    help="measure the untiled peak at 512/768/1024 on an empty card")
 args = parser.parse_args()
 
 import torch
@@ -59,8 +66,28 @@ def free_mb():
 
 torch.manual_seed(42)
 model, clip, vae, _ = comfy.sd.load_checkpoint_guess_config(
-    args.ckpt, output_vae=True, output_clip=True,
+    args.ckpt, output_vae=True, output_clip=not args.scaling,
+    output_model=not args.scaling,
     embedding_directory=folder_paths.get_folder_paths("embeddings"))[:4]
+
+if args.scaling:
+    # Untiled peak against output pixels: linear means no leak, and the slope
+    # is what makes 1024x1024 the whole card.
+    vae.vae_dtype = torch.float16
+    vae.first_stage_model.to(dtype=torch.float16)
+    for res in (512, 768, 1024):
+        latent = torch.randn((1, 4, res // 8, res // 8), device="xpu", dtype=torch.float16)
+        mm.soft_empty_cache()
+        torch.xpu.reset_peak_memory_stats()
+        torch.xpu.synchronize()
+        t0 = time.perf_counter()
+        img = vae.decode(latent)
+        torch.xpu.synchronize()
+        peak = torch.xpu.max_memory_allocated() / 2**20
+        print(f"  {res:5d}  {(time.perf_counter() - t0) * 1000:8.1f} ms   "
+              f"peak {peak:7.0f} MB   {peak * 1e6 / (res * res):6.0f} MB/Mpx")
+        del img, latent
+    sys.exit(0)
 
 cond = clip.encode_from_tokens_scheduled(clip.tokenize("a red fox in a snowy forest, photo"))
 lat = args.res // 8

@@ -216,13 +216,16 @@
 * **At 1024×1024 the decode is the other half, and tiling is what makes it
   fit.** Evicting the UNet first — which `VAE.decode` does itself through
   `load_models_gpu(..., memory_required=...)` — leaves 9 800 MB free, and the
-  *untiled* decode still OOMs in fp16, inside a conv: the decoder's workspace,
-  not the 2.3-4.6 GB the estimate predicts, is what overflows. The default fp32
-  path turns that into sliced attention at 5 954 ms. `VAEDecodeTiled` at
-  tile_size 512 is 1 078-1 165 ms in fp16 (619 MB peak) and 4 695-4 719 ms in
-  fp32 (1 227 MB); the fp16 image differs from fp32 by max 0.0126, mean 0.00015
-  in [0,1] units. A 20-step 1024×1024 image is therefore ~5.2 s of denoising
-  plus ~1.1 s of decode. `debug/probe_comfy_xpu_vae_1024.py` reproduces it.
+  *untiled* decode wants **11.8 MB per output megapixel** in fp16 — 3 112 MB at
+  512×512, 6 884 at 768×768, 12 332 at 1024×1024, the same slope at all three,
+  so nothing leaks: at 1024×1024 it is the whole 12 GB card and only runs by
+  spilling to host RAM (2 584-2 924 ms), and fp32 doubles it (~24 GB), which is
+  why the default path lands in sliced attention at 5 954 ms.
+  `VAEDecodeTiled` at tile_size 512 is both smaller and faster: 1 078-1 165 ms
+  in fp16 (619 MB peak), 4 695-4 719 ms in fp32 (1 227 MB); the fp16 image
+  differs from fp32 by max 0.0126, mean 0.00015 in [0,1] units. A 20-step
+  1024×1024 image is therefore ~5.2 s of denoising plus ~1.1 s of decode.
+  `debug/probe_comfy_xpu_vae_1024.py --scaling` reproduces the curve.
 
 * **A Level Zero device-exhaustion error is now classified as an OOM**
   (`comfy/model_management.py:is_oom`). The driver reports it as a plain

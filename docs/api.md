@@ -239,6 +239,15 @@ w    = kt.nf4.dequant_nf4(codes, absmax) # the NF4 storage format, bit-exact
 A different `num_warps` changes the reduction order and the output; do not
 tune it without re-running the gate.
 
+```python
+y = kt.geglu.geglu(h)                    # SDXL's feed-forward activation, forward and backward
+o = kt.attention.attention(q, k, v)      # [batch, heads, length, head_dim]; differentiable, capturable
+```
+
+`attention` is new and **not yet measured on the card** (`todo.md` 8): its configuration (`XPU_KERNELS_ATTENTION_CONFIG`) is
+swept by `debug/bench_attention.py`, and `usable(q, k, v)` says whether to call it. Its warp count is part of the speed only: the
+backward has no atomics, so a different configuration does not change the order of any sum across programs.
+
 ## The C library
 
 ```c

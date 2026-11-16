@@ -4,7 +4,8 @@ Ranked by what unblocks the most. Every item names the evidence that would
 close it; "done" means measured, not implemented.
 
 The items marked *done* or *closed* are kept for the record — the numbers in
-them are the ones the decisions rest on. **The open ones are 4, 5, 7 and 8.**
+them are the ones the decisions rest on. **The open ones are 4, 5, 7 and 8, and the attention of 8 is
+written and waits for the card.**
 The closed items are also in the table at the bottom, one line each.
 
 ## 1. A fused weight preparation — done
@@ -58,12 +59,17 @@ and a slightly worse int8 weight (the rotation would spread the outliers over
 It stays a decision the *format* can still make: the same question comes back
 for a model whose narrow linears are the majority. See `docs/sdxl.md`.
 
-## 4. The residual add, folded into the norm's epilogue
+## 4. The residual add, folded into the norm's epilogue — low value, not started
 
 The last open shape in the bf16 path: one launch and one read-write pass per
 add — ~84 launches and ~6 ms of device time per step in a 42-block model, in a
 step that is host-bound. Training-safe (the add's backward is the identity),
 and small next to the capture, which removes the launches altogether.
+
+Estimate for SDXL (not measured): of the ~1 600 adds in a step, only the ~210 inside the transformer blocks (three per block, two
+followed by a LayerNorm) sit next to a norm; the rest are ResBlock skips and embeddings. At ~14 us each that is ~3 ms of a 466 ms
+step, and the library has no LayerNorm kernel to fuse into (its norms are RMSNorm). It stays here as the thing to measure first if
+the step's profile changes.
 
 ## 5. An int8 conv path (a project, not an improvement)
 
@@ -117,13 +123,13 @@ of what is left is different from the one above. Evidence is in that project's `
 
 | what | device time | status here |
 |---|---|---|
-| the GEGLU chain (gelu, mul, and in backward gelu_backward, 2 mul, `cat`) | ~50 ms of 466 | **`triton.geglu`, written, needs the card** (`debug/verify_geglu.py`) |
-| the weight dequantizer, int8 base, dense `dx` | **82 ms** of ~645 (659 calls, 1.78 G + 0.39 G parameters) | open, below |
+| the GEGLU chain (gelu, mul, and in backward gelu_backward, 2 mul, `cat`) | ~50 ms of 466 | **done**: `triton.geglu`, 2.11x the chain (CHANGELOG); not a lever on the whole step (`sdxl.md`) |
+| the weight dequantizer, int8 base, dense `dx` | **82 ms** of ~645 (659 calls, 1.78 G + 0.39 G parameters) | **rewritten** (sub-group per group): 11.7x / 5.1x in the probe; the trainer's step needs re-measuring |
 | the dequant epilogue (int32 -> bf16) | 40 ms, 1265 calls | at 88 % of its floor (docs/experiments.md 3) |
 | rotate + quantize of the activation | 26 ms, 1272 calls | closed (the rotate's floor) |
 | residual `add` (bf16, 13.8 us a call) | 22 ms, 1623 calls | item 4, but measured at 4x the 6 ms estimated there |
 
-**The weight dequantizer is the open one** (done: rewritten as one sub-group per group with a local-memory transpose, 0.034 ms at 1280x5120, `docs/experiments.md` 5b; the analysis below is the history). 82 ms for 2.17 G parameters moves 6.5 GB: 80 GB/s, against the 397 GB/s copy
+**The weight dequantizer was the open one** (done: rewritten as one sub-group per group with a local-memory transpose, 0.034 ms at 1280x5120, `docs/experiments.md` 5b; the analysis below is the history). 82 ms for 2.17 G parameters moves 6.5 GB: 80 GB/s, against the 397 GB/s copy
 ceiling measured on the same card in the same run (16 ms). `performance.md` already says "headroom, the shape of that work is
 the same as the rotate's, and the rotate's is closed", but the two differ where it matters: the rotate cannot split a group
 across lanes because the row's abs-max would cross sub-groups (`probe_cross_lane.cpp`); **the dequantizer has no abs-max**, so
@@ -140,6 +146,13 @@ backward (`MhaBackwardName`, 288 us a call, 30-40 ms of a step). The flash kerne
 graph cannot capture, so a captured step runs the math attention instead; the trainer measured the math backend at +36 % of
 device time at its shapes (`sdxl.md`, section 5). The "nothing to win" conclusion holds for eager; for a *captured* step a
 capturable fused attention is the one kernel that could still be worth writing.
+
+**Written, not measured: `xpu_kernels.triton.attention`** (FlashAttention-2 in Triton, forward and a two-kernel deterministic backward;
+`debug/verify_attention_capture.py`, `debug/bench_attention.py`). Its arithmetic is checked on the CPU through Triton's interpreter
+(ragged lengths, the 77-token cross-attention); whether it compiles for the card, captures, and is fast enough is the open question,
+because `tl.dot` was 0.5-2 TFLOPS with small tiles (`experiments.md` 5b). Closing criterion, from the trainer's brief: replay
+bit-identical to eager, at least 2x faster than the math backend, within ~1.3x of flash. If the sweep finds no configuration near that,
+the kernel is dead and recorded as such, like the Triton matrix-product dequantizer.
 
 | item | the evidence |
 |---|---|

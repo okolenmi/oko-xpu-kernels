@@ -15,6 +15,10 @@ are meant to be *bit-identical* to it, not merely close:
 ``geglu.geglu(h)``
     SDXL's feed-forward activation ``h[.., :I] * gelu(h[.., I:])``, forward and backward in one pass each.
 
+``attention.attention(q, k, v)``
+    A flash attention whose device graph can be captured (torch's XPU flash cannot), forward and backward.  New and not yet measured
+    on the card: see the module's docstring.
+
 The rule every kernel here follows, and the reason they are safe to drop into a
 model: each one verifies itself once per process against a reference
 implementation, and the verdict is latched.  A kernel whose gate is closed is
@@ -36,13 +40,13 @@ from .. import _levelzero
 
 _levelzero.ensure_headers()  # Triton compiles a launcher per kernel and needs these headers; before the first compile, not after
 
-from . import adaln, geglu, nf4, quantize, rope  # noqa: E402
+from . import adaln, attention, geglu, nf4, quantize, rope  # noqa: E402
 from ._gate import Gate
 
-__all__ = ["Gate", "adaln", "gates", "geglu", "nf4", "quantize", "rope",
+__all__ = ["Gate", "adaln", "attention", "gates", "geglu", "nf4", "quantize", "rope",
            "set_reference", "status"]
 
-_MODULES = (rope, adaln, quantize, nf4, geglu)
+_MODULES = (rope, adaln, quantize, nf4, geglu, attention)
 
 
 def gates():
@@ -63,7 +67,7 @@ def set_reference(module, fn=None):
     """
     if isinstance(module, str):
         module = {"rope": rope, "adaln": adaln, "quantize": quantize,
-                  "nf4": nf4, "geglu": geglu}[module]
+                  "nf4": nf4, "geglu": geglu, "attention": attention}[module]
     module.set_reference(fn)
 
 

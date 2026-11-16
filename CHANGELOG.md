@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+* **A capturable flash attention in Triton** (`xpu_kernels.triton.attention`): forward and a two-kernel backward (one owns a block of queries,
+  one a block of keys; no atomics), `[batch, heads, length, head_dim]`, head dimensions 16-128, any key and query length (the 77-token
+  cross-attention included), gated against torch's attention. **Not yet run on the card**: its arithmetic is verified on the CPU through
+  Triton's interpreter (`tests/test_attention.py`); `debug/verify_attention_capture.py` checks the gates, the capture and the time against
+  oneDNN's flash and the math backend, and `debug/bench_attention.py` sweeps the launch configuration.
+
 * **The SYCL weight dequantizer, rewritten** (`launch_dequant_weight`): one sub-group per 256-element group, 16 elements per lane,
   the rotation's lane digits turned into register digits by a transpose through local memory. The old kernel kept a whole group
   (256 floats) in each lane and loaded and stored scalars strided across lanes. Probe (`debug/native/probe_dequant_weight.cpp`

@@ -147,12 +147,20 @@ graph cannot capture, so a captured step runs the math attention instead; the tr
 device time at its shapes (`sdxl.md`, section 5). The "nothing to win" conclusion holds for eager; for a *captured* step a
 capturable fused attention is the one kernel that could still be worth writing.
 
-**Written, not measured: `xpu_kernels.triton.attention`** (FlashAttention-2 in Triton, forward and a two-kernel deterministic backward;
-`debug/verify_attention_capture.py`, `debug/bench_attention.py`). Its arithmetic is checked on the CPU through Triton's interpreter
-(ragged lengths, the 77-token cross-attention); whether it compiles for the card, captures, and is fast enough is the open question,
-because `tl.dot` was 0.5-2 TFLOPS with small tiles (`experiments.md` 5b). Closing criterion, from the trainer's brief: replay
-bit-identical to eager, at least 2x faster than the math backend, within ~1.3x of flash. If the sweep finds no configuration near that,
-the kernel is dead and recorded as such, like the Triton matrix-product dequantizer.
+**Measured on the card: `xpu_kernels.triton.attention` closes the question** (FlashAttention-2 in Triton, forward and a two-kernel
+deterministic backward; `debug/verify_attention_capture.py`, `debug/bench_attention.py`, `docs/experiments.md` 5c). The arithmetic was
+already checked on the CPU through Triton's interpreter; on the B580 it also compiles, matches torch's own bf16 attention to the last
+digit (2.1-2.4e-3 against a float32 chain, forward and all three gradients), and captures: forward+backward replayed on new data are
+bit-identical on out/dq/dk/dv. The 5b obstacle was not the kernel: Triton's Intel backend was told the card has no XMX by the Mesa
+rusticl OpenCL platform, so `tl.dot` ran at FMA speed -- 38.631 ms for the 1024x1024 forward against 0.206 ms once
+`TRITON_INTEL_DEVICE_EXTENSIONS` names the extension (187x). End to end at batch 4, forward+backward: self 1024 1.576 ms against
+flash 1.556 and math 6.824; the 10-head cross shape beats flash (0.328 against 0.404); the 20-head 256-token shapes are
+1.42-1.48x flash but 3.2-4.0x math. The closing criterion (replay bit-identical, at least 2x math, within ~1.3x of flash) is met at
+self-1024 and the 10-head cross shape. `usable()` refuses when Triton's target lacks the extension, because FMA loses to the math
+attention this replaces; a direct `attention()` call still runs. Wiring it into the trainer (Stage 3) is the owner's decision; the
+kernel side is ready for it, with one choice to make: the third extension (`cl_intel_bfloat16_conversions`) gives the best
+attention time but makes the rope's bit-exact gate fall back, while the two-extension list still beats the math backend
+everywhere and keeps every gate open (both measured, `docs/experiments.md` 5c).
 
 | item | the evidence |
 |---|---|

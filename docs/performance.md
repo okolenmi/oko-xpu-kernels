@@ -330,7 +330,9 @@ ComfyUI's 512×512 forward (the math's device time 46 ms against the flash's
 36.7 ms). So the capture is worth 2.3x at 512×512 *even with the math
 attention*, and it is a loss at 1024×1024. Making the flash attention
 capturable is what would make the graph a win everywhere — a runtime
-limitation, and worth reporting upstream.
+limitation, and worth reporting upstream. A Triton attention that captures now
+exists and measures at flash parity (`docs/experiments.md` 5c); wiring it into
+this capture is still open (`docs/todo.md` item 8).
 
 ### The capture, implemented and measured end to end
 
@@ -958,7 +960,7 @@ most of them are closed:
 | the norms | **done**: rms_norm+rope and rms_norm+adaLN are fused Triton kernels, 1.5-2x on those stages, and their backwards are fused too (14x on rope fwd+bwd). |
 | the activation's transcendental | **done**: `sycl::tanh` has a data-dependent slow path on this card, and the `expm1` form is bf16-identical for every finite bf16 input. |
 | the GEMMs | **closed**: oneDNN is at the card's int8 rate; a hand-written ESIMD GEMM was 3-4x slower. |
-| the attention | **closed**: every XPU SDPA backend is the same oneDNN kernel. |
+| the attention | **eager closed, captured open**: every XPU SDPA backend is one oneDNN kernel, but the flash one uses launch-time scratch and cannot be recorded, so a captured step runs the math attention. `xpu_kernels.triton.attention` captures and measures at flash speed (docs/experiments.md 5c). |
 | the rest | at the measured memory floor (read 468 GB/s, write 397 GB/s on a 400 MB buffer). |
 
 The one shape still open in the bf16 path is the **residual add** of a

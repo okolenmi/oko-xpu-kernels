@@ -159,7 +159,9 @@ dequantization around it:
 
 The int8 widening and the scale cost nothing measurable; the Triton matrix product is two orders of magnitude below the
 vendor library on this card with these tile sizes (small; larger tiles and more warps were not tried). **Do not build a kernel
-on `tl.dot` here without a tuned configuration that reaches tens of TFLOPS first.**
+on `tl.dot` here without a tuned configuration that reaches tens of TFLOPS first.** That configuration exists and it is not a
+tile size: the matrix units have to be *visible to the compiler*, which on this stack takes an environment variable (5c). After
+that `tl.dot` reaches ~52 TFLOPS.
 
 A Triton elementwise pass followed by `torch.mm` did beat the old SYCL kernel 1.3-5.1x (bit-identical), but it was a detour: the
 old kernel was slow because a lane held a whole 256-element group (256 live floats, spilled) and loaded and stored scalars
@@ -167,6 +169,84 @@ strided across lanes. One sub-group per group with a local-memory transpose (`de
 is bit-identical and runs 0.034 ms at 1280x5120 and 0.109 ms at 10240x1280 in the library, 0.33-0.82x the time of the two-pass
 form's 0.103 and 0.240 ms; the two-pass module was removed. The probe's "floor" mode 6 was itself slow at 10240x1280 only because
 the runtime picked the work-group size: with an explicit 64 (mode 10) it takes 0.086 ms against 0.153 ms.
+
+## 5c. The Triton attention on the B580: the matrix units were hidden behind an OpenCL platform, then 52 TFLOPS
+
+`xpu_kernels.triton.attention` (forward and a deterministic two-kernel backward) was the test case 5b left open. It compiled,
+agreed with torch and captured, but was 20-100x slower than oneDNN, as 5b predicted. The cause was not the kernel: Triton's Intel
+backend asks every OpenCL platform for the device extensions (`triton/backends/intel/extension_utils.c`), and the Mesa rusticl
+platform answers for the same B580 without `cl_intel_subgroup_matrix_multiply_accumulate`. The target then says the card has no
+XMX and `tl.dot` is lowered to FMA. Triton's own environment knob overrides the query, before the first compile:
+
+```
+TRITON_INTEL_DEVICE_EXTENSIONS="cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io cl_intel_bfloat16_conversions"
+```
+
+Same kernel, same shape (forward, 1024x1024, 10 heads, batch 4, device time, min of 3):
+
+| target | time | TFLOPS |
+|---|---|---|
+| no XMX (FMA) | 38.631 ms | 0.28 |
+| XMX | 0.206 ms | 52 |
+
+187x. A direct `attention()` call still runs either way, but `usable()` now refuses when the compiler target lacks the extension:
+the FMA path is far slower than the math attention this exists to replace, and the module logs one warning naming the variable.
+torch is not a second opinion here: `torch.xpu.get_device_capability` reported the extension `False` in some processes and `True` in
+others on this machine, while Triton's target stayed consistent, so only Triton's answer is used.
+
+**Descriptors.** `tl.make_tensor_descriptor` built inside the kernel (with `triton.set_allocator`) is faster than pointer
+arithmetic and than a host `TensorDescriptor`, forward and backward, and it still captures. There is one descriptor per head, so
+rows past `Lq` clip at the head's end instead of running into the next head, which is what the masked pointer stores had to
+handle. 1024x1024, 10 heads, batch 4, one config each:
+
+| load path | forward | dQ | dK/dV |
+|---|---|---|---|
+| pointers | 0.572 | 0.820 | 1.206 |
+| device descriptors | 0.216 | 0.343 | 0.609 |
+
+Re-tuning per kernel then beat those numbers: the backward's two kernels do different work and sharing the forward's tiles is
+bad. dK/dV with the forward's (128, 64) spilled: 15.8 ms, 13x the tuned (16, 64).
+
+**Final configuration** for head dimension 64 (the only one measured, SDXL's): forward `(128, 32, 8 warps, 2 stages)`, dQ
+`(128, 16, 8, 2)`, dK/dV `(16, 64, 8, 2)`. The card's clock state moves the forward's ranking; interleaved with n=100 over ten
+rounds it was (128,32) 0.211-0.288 ms, (64,32) 0.218-0.436, (64,64) 0.340-0.369, so (128,32) is baked in (best sustained, within
+5 % of the best fast). dQ (128,16) and dK/dV (16,64) won in both states.
+
+**End to end** (`debug/verify_attention_capture.py`, batch 4, forward+backward through autograd, min of 3 interleaved rounds, all
+three extensions set):
+
+| shape | this | flash | math | this/flash | math/this |
+|---|---|---|---|---|---|
+| self 1024 (10 heads) | 1.576 | 1.556 | 6.824 | 1.01x | 4.33x |
+| cross 77 (10 heads) | 0.328 | 0.404 | 1.349 | 0.81x | 4.11x |
+| self 256 (20 heads) | 0.307 | 0.208 | 1.213 | 1.48x | 3.95x |
+| cross 77 (20 heads) | 0.155 | 0.110 | 0.500 | 1.42x | 3.22x |
+
+The target was at least 2x the math backend and within ~1.3x of flash: met at self-1024 and both 10-head cross shapes; the
+20-head 256-token shapes are 1.42-1.48x flash but 3.2-4.0x math. Capture and replay on new data are bit-identical for out, dq,
+dk and dv; the errors against a float32 chain equal torch's own bf16 attention to the last digit (2.1-2.4e-3 on all four).
+
+**The third extension has a price.** `cl_intel_bfloat16_conversions` carries most of the last 1.9x (forward, batch 4
+1024x1024: 0.391 ms with `..._matrix_multiply_accumulate ..._2d_block_io`, 0.206 ms with the conversion extension as well), but
+with it set the rope's bit-exact gate finds 33 of 1,572,864 values different in `rms_rope` and 32 in `rms_rope_dequant`,
+deterministically, and falls back to the older fused kernel. That is a bf16-rounding difference between the hardware conversion
+and the emulated one -- the gate doing its job, not a wrong result -- so the full list is not free. With only the two extensions
+the same verify run reads:
+
+| shape | this | flash | math | this/flash | math/this |
+|---|---|---|---|---|---|
+| self 1024 (10 heads) | 1.924 | 1.403 | 6.780 | 1.37x | 3.52x |
+| cross 77 (10 heads) | 0.428 | 0.255 | 1.040 | 1.68x | 2.43x |
+| self 256 (20 heads) | 0.430 | 0.227 | 1.208 | 1.89x | 2.81x |
+| cross 77 (20 heads) | 0.225 | 0.104 | 0.511 | 2.17x | 2.27x |
+
+The at-least-2x-math target still holds everywhere; the within-1.3x-of-flash one only at self-1024. Which list to standardise is
+the owner's call: all three favour the attention, the two-extension list keeps every gate in the library open.
+
+The time readings wander by up to ~1.8x between a cold process and a sustained one. The ratios above come from interleaved
+rounds in one process; the first version of part 4 measured the three paths one after another and printed 1.29x/3.24x where the
+interleaved run printed 1.01x/4.33x, which is why it now interleaves.
+
 
 ## 6. Still untried
 

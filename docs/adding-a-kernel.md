@@ -115,7 +115,10 @@ cannot fall back — so a trainer that captures should assert
 
 * A fused attention or GEMM. On this card every SDPA backend is one oneDNN
   kernel and `torch._int_mm` beats any hand-written GEMM (`docs/performance.md`);
-  a fused op there buys nothing and costs a gate.
+  a fused op there buys nothing and costs a gate. The exception is a *captured*
+  step: the flash kernel cannot be recorded and `xpu_kernels.triton.attention`
+  does, at flash speed, but only when the compiler can see the card's matrix
+  units (`docs/experiments.md` 5c). Add a second fused attention only for that.
 * A kernel whose win is below the noise floor. Measure with the harnesses in
   `debug/` (device time, interleaved A/B, idle desktop) before writing the gate.
 * A second copy of a kernel already in ComfyUI. Move it here and import it, or

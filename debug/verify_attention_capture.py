@@ -58,36 +58,37 @@ for label, qs, ks in SHAPES:
     print(f"{label:22s} out/dq/dk/dv  this {[f'{rel(m, t):.1e}' for m, t in zip(mine, truth)]}  torch {[f'{rel(m, t):.1e}' for m, t in zip(torch_, truth)]}")
 
 print("\n== 3. device graph: capture forward+backward, replay on new data, compare with eager")
-qs, ks = (4, 10, 1024, 64), (4, 10, 77, 64)
-q, k, v, dout = make(qs, ks, 3)
-static = [t.clone().requires_grad_(True) for t in (q, k, v)]
-static_dout = dout.clone()
+CAPTURE_SHAPES = (("cross 77 (10 heads)", (4, 10, 1024, 64), (4, 10, 77, 64)),
+                  ("self 1024 (10 heads)", (4, 10, 1024, 64), (4, 10, 1024, 64)))
+for label, qs, ks in CAPTURE_SHAPES:
+    print(f"  {label}")
+    q, k, v, dout = make(qs, ks, 3)
+    static = [t.clone().requires_grad_(True) for t in (q, k, v)]
+    static_dout = dout.clone()
 
+    def step():
+        out = A.attention(*static)
+        return out, *torch.autograd.grad(out, static, static_dout)
 
-def step():
-    out = A.attention(*static)
-    return out, *torch.autograd.grad(out, static, static_dout)
-
-
-step()  # warm up (compiles) outside the capture
-torch.xpu.synchronize()
-graph = torch.xpu.XPUGraph()
-try:
-    with torch.xpu.graph(graph):
-        captured = step()
-except Exception as exc:  # noqa: BLE001 - this is the result the whole file exists to find out
-    print(f"CAPTURE FAILED: {type(exc).__name__}: {str(exc)[:300]}")
-    captured = None
-if captured is not None:
-    q2, k2, v2, dout2 = make(qs, ks, 4)
-    for dst, src in zip(static, (q2, k2, v2)):
-        dst.data.copy_(src)
-    static_dout.copy_(dout2)
-    graph.replay()
+    step()  # warm up (compiles) outside the capture
     torch.xpu.synchronize()
-    eager = grads(A.attention, q2, k2, v2, dout2)
-    for name, got, want in zip(("out", "dq", "dk", "dv"), captured, eager):
-        print(f"  replay {name}: {'identical' if torch.equal(got, want) else f'DIFFERS (rel {rel(got, want):.1e})'}")
+    graph = torch.xpu.XPUGraph()
+    try:
+        with torch.xpu.graph(graph):
+            captured = step()
+    except Exception as exc:  # noqa: BLE001 - this is the result the whole file exists to find out
+        print(f"  CAPTURE FAILED: {type(exc).__name__}: {str(exc)[:300]}")
+        captured = None
+    if captured is not None:
+        q2, k2, v2, dout2 = make(qs, ks, 4)
+        for dst, src in zip(static, (q2, k2, v2)):
+            dst.data.copy_(src)
+        static_dout.copy_(dout2)
+        graph.replay()
+        torch.xpu.synchronize()
+        eager = grads(A.attention, q2, k2, v2, dout2)
+        for name, got, want in zip(("out", "dq", "dk", "dv"), captured, eager):
+            print(f"  replay {name}: {'identical' if torch.equal(got, want) else f'DIFFERS (rel {rel(got, want):.1e})'}")
 
 print("\n== 4. device time of forward+backward (ms, min of 3 interleaved rounds)")
 print(f"{'shape':22s} {'this':>8s} {'flash':>8s} {'math':>8s}  this/flash  math/this")

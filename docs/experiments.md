@@ -248,6 +248,60 @@ rounds in one process; the first version of part 4 measured the three paths one 
 interleaved run printed 1.01x/4.33x, which is why it now interleaves.
 
 
+## 5d. The attention in a whole captured training step: 1.68x at 512, 1.07x at 1024
+
+The trainer's question after 5c was what the kernel does to a *step*. Measured with `b580-diffusion-training` at 577c96c
+(`trainer.graph_attention=triton`), 200 steps, SDXL LoRA bf16, `--rank 16 --batch-area 1.5 --param buckets.max_shapes=4`, same
+checkpoint/dataset/seed, torch 2.12.1+xpu, triton-xpu 3.7.1. The XMX setup is exactly
+`TRITON_INTEL_DEVICE_EXTENSIONS="cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io"`; without it
+`usable()` is False, with it every run logged `graph attention: the fused kernel`. Steady state is steps 21-200, median [mean];
+the mean includes the one-off first-sighting steps (3.6-4.3 s).
+
+| run | ms/step | peak device | loss@50 / @100 / @200 |
+|---|---|---|---|
+| 512/4 eager | 996 [1028] | 8357 MB | 0.1573 / 0.1021 / 0.1028 |
+| 512/4 graph + math | 923 [966] | 10025 MB | 0.1573 / 0.1021 / 0.1028 |
+| 512/4 graph + math, repeat | 968 [1004] | 10005 MB | 0.1573 / 0.1021 / 0.1028 |
+| 512/4 graph + triton | 593 [688] | 9410 MB | 0.1573 / 0.1020 / 0.1027 |
+| 512/4 graph + triton, repeat | 618 [716] | 9275 MB | 0.1572 / 0.1021 / 0.1027 |
+| 1024/1 eager | 1036 [1093] | 8554 MB | 0.2063 / 0.0914 / 0.1304 |
+| 1024/1 graph + math | 1014 [1083] | 11775 MB | 0.2062 / 0.0914 / 0.1302 |
+| 1024/1 graph + math, repeat | 1014 [1078] | 11721 MB | 0.2063 / 0.0914 / 0.1306 |
+| 1024/1 graph + triton | 963 [1040] | 10088 MB | 0.2061 / 0.0914 / 0.1304 |
+| 1024/1 graph + triton, repeat | 972 [1055] | 10144 MB | 0.2062 / 0.0913 / 0.1303 |
+
+`triton` is faster than eager at both sizes: 1.68x at 512/4 (1.49x by mean) and 1.07x at 1024/1 (1.05x by mean). The per-shape
+pairs the trainer measures in-run are 27-42 % at 512 and 2-9 % at 1024:
+
+| 512/4 shape | replay | eager | 1024/1 shape | replay | eager |
+|---|---|---|---|---|---|
+| 3x100x64 | 558 / 554 | 967 / 917 | 1x136x184 | 883 / 891 | 970 / 969 |
+| 3x64x128 | 665 / 674 | 950 / 945 | 1x204x128 | 922 / 908 | 977 / 975 |
+| 3x68x92 | 546 / 542 | 933 / 926 | 1x252x128 | 1111 / 1123 | 1187 / 1144 (run 2 drops it) |
+| 3x128x64 | 685 / 695 | 944 / 949 | 1x128x256 | 1116 / 1125 | 1155 / 1170 (both drop it) |
+
+The math graph does not pay and the trainer drops it: at 512 it replayed 890 against 906 ms eager (then the memory cap refused
+the other shapes); at 1024 its first capture ran out of memory (1.46 GiB request, 11.8 GB peak) and nothing replays. The triton
+run captures all four bucket shapes; at 512 the two rare short-batch shapes are outside `shape_counts()` and stay eager at
+~930 ms, and at 1024 the shapes replaying under 5 % faster are dropped (three kept in one run, two in the other). The graph adds
+memory outside the step's own peak: the allocator holds 7338 MB at the end of the 512 run against 6658 eager, and 8244 against
+6888 at 1024, while the per-step footprint is 6479 against 6472 MB at 512 and 6782 against 6778 MB at 1024.
+
+Loss follows `math` inside the repeated-arm noise: at 512 the two math runs read 0.1028 at step 200 and the two triton runs
+0.1027; at 1024 math reads 0.1302/0.1306 and triton 0.1304/0.1303. The three-extension list gives 591 [680] ms against
+593/618 [688/716] and the same loss, so it buys nothing at the step level; the two-extension default stays.
+
+`debug/verify_attention_capture.py` now captures both cross-77 and self-1024: replay of `out`, `dq`, `dk`, `dv` is identical on
+both, and the errors against float32 equal torch's own bf16 attention (2.2e-3 out, 2.4e-3 dq on self-1024; forward and backward
+timings unchanged from 5c).
+
+Profiler of the 512/4 triton step (`python -m run ... --perf DIR`, 70 warm-up steps, 3 timed, 3 eager-profiled): replay 608 ms,
+device busy 564 ms (93 % utilisation), 22,889 kernel launches and 195,939 operators per step, 286 us host time per launch. The
+fused attention is **71.8 ms, 12.7 % of device time**, in 700 launches (`_fwd_kernel` 31.6 ms / 280 calls, `_bwd_dkdv_kernel`
+22.9 / 140, `_bwd_dq_kernel` 14.3 / 140, `_delta_kernel` 3.0 / 140); GEMM 43 %, convolution 17 %, elementwise 10 %, copy 7 %,
+norm 4 %. The attention kernels are filed under `other` in the report because their names do not match its attention pattern.
+
+
 ## 6. Still untried
 
 Nothing, for the rotate: the last open shape (splitting a group across 4

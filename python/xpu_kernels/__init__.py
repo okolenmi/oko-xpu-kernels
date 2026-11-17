@@ -17,11 +17,18 @@ Two halves:
     reference implementation before it is used.
 
 The flat namespace below is the INT8 API (the same names are available as
-``xpu_kernels.int8.<name>``).  Run ``python -m xpu_kernels`` to self-test the
-installed library on this machine.
+``xpu_kernels.int8.<name>``).  Importing the package also sets
+``TRITON_INTEL_DEVICE_EXTENSIONS`` to the two gate-safe extensions (subgroup
+matrix multiply and 2D block I/O) unless the environment already names its own
+value: Triton otherwise asks a rusticl OpenCL platform that hides the card's
+matrix units, and the attention runs at FMA speed (``docs/experiments.md`` 5c).
+Run ``python -m xpu_kernels`` to self-test the installed library on this
+machine.
 """
 
 from __future__ import annotations
+
+from ._env import DEFAULT_DEVICE_EXTENSIONS
 
 from .int8 import (
     ACTIVATIONS,
@@ -73,5 +80,6 @@ __all__ = [
     "prepare_for_capture",
     "prepare_weight", "prepare_weight_fused", "quantize", "quantize_act", "quantize_row",
     "require_capture_ready", "rotate", "selftest", "unsupported_reason",
+    "DEFAULT_DEVICE_EXTENSIONS",
     "int8", "triton",
 ]

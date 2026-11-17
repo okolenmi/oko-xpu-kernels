@@ -2,13 +2,19 @@
 
 ## Unreleased
 
+* **The two gate-safe Triton extensions are now the default.** Importing `xpu_kernels` calls
+  `os.environ.setdefault("TRITON_INTEL_DEVICE_EXTENSIONS", "cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io")`
+  before anything imports Triton: a Mesa rusticl OpenCL platform answers the extension query for the B580 without the matrix
+  units, which lowers `tl.dot` to FMA and runs the attention at 38.6 ms instead of 0.206. A value already in the environment
+  wins; `cl_intel_bfloat16_conversions` stays off because it closes the rope's bit-exact gate (`docs/experiments.md` 5c).
+
 * **A capturable flash attention in Triton** (`xpu_kernels.triton.attention`): forward and a two-kernel backward (one owns a block of queries,
   one a block of keys; no atomics), `[batch, heads, length, head_dim]`, head dimensions 16-128, any key and query length (the 77-token
   cross-attention included), gated against torch's attention. **Measured on the B580** (`docs/experiments.md` 5c): forward+backward
   captured and replayed bit-identically on out/dq/dk/dv; batch 4 at 1024x1024, 1.576 ms against torch's flash 1.556 and the math
   backend 6.824, and 2.1-2.4e-3 from a float32 chain, the same as torch's bf16. The compiler must see the card's matrix units:
-  without `TRITON_INTEL_DEVICE_EXTENSIONS` (the module warning names it) an OpenCL platform hides them and the forward takes 38.6 ms
-  instead of 0.206. `usable()` declines in that case. The conversion extension is not free: with it the rope's bit-exact gate
+  importing `xpu_kernels` sets `TRITON_INTEL_DEVICE_EXTENSIONS` to the two gate-safe extensions, so the forward is 0.206 ms;
+  without them an OpenCL platform hides the units and it takes 38.6 ms. `usable()` declines in that case. The conversion extension is not free: with it the rope's bit-exact gate
   falls back (33 of 1,572,864 values differ by a bf16 rounding; `docs/experiments.md` 5c has both extension lists). `debug/verify_attention_capture.py`
   reproduces the check; the backward's dQ and dK/dV tables are tuned separately (`debug/bench_attention.py`).
 

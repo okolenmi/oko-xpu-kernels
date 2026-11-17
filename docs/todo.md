@@ -153,7 +153,7 @@ already checked on the CPU through Triton's interpreter; on the B580 it also com
 digit (2.1-2.4e-3 against a float32 chain, forward and all three gradients), and captures: forward+backward replayed on new data are
 bit-identical on out/dq/dk/dv. The 5b obstacle was not the kernel: Triton's Intel backend was told the card has no XMX by the Mesa
 rusticl OpenCL platform, so `tl.dot` ran at FMA speed -- 38.631 ms for the 1024x1024 forward against 0.206 ms once
-`TRITON_INTEL_DEVICE_EXTENSIONS` names the extension (187x). End to end at batch 4, forward+backward: self 1024 1.576 ms against
+`TRITON_INTEL_DEVICE_EXTENSIONS` named the extension (187x; importing `xpu_kernels` now sets the two-extension default itself). End to end at batch 4, forward+backward: self 1024 1.576 ms against
 flash 1.556 and math 6.824; the 10-head cross shape beats flash (0.328 against 0.404); the 20-head 256-token shapes are
 1.42-1.48x flash but 3.2-4.0x math. The closing criterion (replay bit-identical, at least 2x math, within ~1.3x of flash) is met at
 self-1024 and the 10-head cross shape. `usable()` refuses when Triton's target lacks the extension, because FMA loses to the math

@@ -176,7 +176,9 @@ the runtime picked the work-group size: with an explicit 64 (mode 10) it takes 0
 agreed with torch and captured, but was 20-100x slower than oneDNN, as 5b predicted. The cause was not the kernel: Triton's Intel
 backend asks every OpenCL platform for the device extensions (`triton/backends/intel/extension_utils.c`), and the Mesa rusticl
 platform answers for the same B580 without `cl_intel_subgroup_matrix_multiply_accumulate`. The target then says the card has no
-XMX and `tl.dot` is lowered to FMA. Triton's own environment knob overrides the query, before the first compile:
+XMX and `tl.dot` is lowered to FMA. Triton's own environment knob overrides the query; importing `xpu_kernels` now sets the
+two gate-safe extensions when the variable is unset (`os.environ.setdefault`, before any Triton import; a value already in the
+environment wins). The three-extension list below is the measured opt-in:
 
 ```
 TRITON_INTEL_DEVICE_EXTENSIONS="cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io cl_intel_bfloat16_conversions"
@@ -252,9 +254,10 @@ interleaved run printed 1.01x/4.33x, which is why it now interleaves.
 
 The trainer's question after 5c was what the kernel does to a *step*. Measured with `b580-diffusion-training` at 577c96c
 (`trainer.graph_attention=triton`), 200 steps, SDXL LoRA bf16, `--rank 16 --batch-area 1.5 --param buckets.max_shapes=4`, same
-checkpoint/dataset/seed, torch 2.12.1+xpu, triton-xpu 3.7.1. The XMX setup is exactly
-`TRITON_INTEL_DEVICE_EXTENSIONS="cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io"`; without it
-`usable()` is False, with it every run logged `graph attention: the fused kernel`. Steady state is steps 21-200, median [mean];
+checkpoint/dataset/seed, torch 2.12.1+xpu, triton-xpu 3.7.1. The XMX setup used for these runs was
+`TRITON_INTEL_DEVICE_EXTENSIONS="cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io"`; importing
+`xpu_kernels` now sets that same default itself, so the export is no longer needed (an explicit value wins). Without the units
+`usable()` is False, with them every run logged `graph attention: the fused kernel`. Steady state is steps 21-200, median [mean];
 the mean includes the one-off first-sighting steps (3.6-4.3 s).
 
 | run | ms/step | peak device | loss@50 / @100 / @200 |

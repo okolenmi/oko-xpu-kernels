@@ -12,9 +12,11 @@ and one that owns a block of keys (``dk``, ``dv``): no atomics, so the result do
 a block (cross-attention to 77 text tokens is the point).
 
 What it costs.  It runs near torch's flash path and several times faster than the math fallback that a captured step has to use
-(``docs/experiments.md`` 5c).  That needs Triton to see the card's matrix units: its Intel backend asks an OpenCL platform and is
-told there are none, so ``tl.dot`` lowers to FMA and the same kernel crawls.  Set ``TRITON_INTEL_DEVICE_EXTENSIONS`` before the first
-compile -- the warning below prints the three extensions -- or ``usable()`` declines.  The block and warp tables are measurements;
+(``docs/experiments.md`` 5c, 5d).  That needs Triton to see the card's matrix units: its Intel backend asks an OpenCL platform and
+is told there are none, so ``tl.dot`` lowers to FMA and the same kernel crawls.  Importing ``xpu_kernels`` sets
+``TRITON_INTEL_DEVICE_EXTENSIONS`` to the two gate-safe extensions (subgroup matrix multiply and 2D block I/O) unless the
+environment already names its own value; a user value wins, and the warning below says when the target still has no units, in
+which case ``usable()`` declines.  The block and warp tables are measurements;
 ``XPU_KERNELS_ATTENTION_CONFIG`` (``BLOCK_M,BLOCK_N,num_warps,num_stages``) overrides all three kernels, which is a probe, not a
 tuning.
 
@@ -230,18 +232,20 @@ def _warn_if_matrix_units_are_missing() -> None:
 
     Triton asks an OpenCL platform for the device extensions when one exists.  A Mesa rusticl platform answers for the same card
     and does not list ``cl_intel_subgroup_matrix_multiply_accumulate``, so the target says "no matrix units" and ``tl.dot`` is
-    lowered to FMA, which makes the kernel crawl (docs/experiments.md 5c).  The fix is the environment variable Triton's own knob
-    reads; it has to be set before the first compile because the target is cached.
+    lowered to FMA, which makes the kernel crawl (docs/experiments.md 5c).  Importing ``xpu_kernels`` sets the variable Triton's
+    own knob reads, so this warning means the environment already named a list without those extensions (a user value wins) or
+    Triton was imported and compiled before ``xpu_kernels``.
     """
     if _triton is None:
         return
     if _matrix_units_missing():
         log.warning("Triton's Intel backend compiled for a device without subgroup matrix multiply "
                     "(has_subgroup_matrix_multiply_accumulate=false), so tl.dot lowers to FMA and this attention will be slow. "
-                    "A card with XMX can be misdetected because an OpenCL platform answered the extension query; set "
-                    "TRITON_INTEL_DEVICE_EXTENSIONS='cl_intel_subgroup_matrix_multiply_accumulate "
-                    "cl_intel_subgroup_2d_block_io cl_intel_bfloat16_conversions' before the first Triton compile. The last "
-                    "extension is fastest but makes the rope's bit-exact self-test fall back (docs/experiments.md 5c).")
+                    "xpu_kernels sets TRITON_INTEL_DEVICE_EXTENSIONS='cl_intel_subgroup_matrix_multiply_accumulate "
+                    "cl_intel_subgroup_2d_block_io' when it is imported; this warning means the variable already named a list "
+                    "without those extensions (an explicit value wins) or Triton was imported and compiled before xpu_kernels. "
+                    "The bf16-conversion extension is faster for the attention but closes the rope's bit-exact gate "
+                    "(docs/experiments.md 5c).")
 
 
 _warn_if_matrix_units_are_missing()

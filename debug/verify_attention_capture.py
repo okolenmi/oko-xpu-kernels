@@ -89,7 +89,7 @@ if captured is not None:
     for name, got, want in zip(("out", "dq", "dk", "dv"), captured, eager):
         print(f"  replay {name}: {'identical' if torch.equal(got, want) else f'DIFFERS (rel {rel(got, want):.1e})'}")
 
-print("\n== 4. device time of forward+backward (ms)")
+print("\n== 4. device time of forward+backward (ms, min of 3 interleaved rounds)")
 print(f"{'shape':22s} {'this':>8s} {'flash':>8s} {'math':>8s}  this/flash  math/this")
 for label, qs, ks in SHAPES:
     q, k, v, dout = make(qs, ks, 5)
@@ -101,12 +101,17 @@ for label, qs, ks in SHAPES:
             torch.autograd.grad(out, leaves, dout)
         return go
 
-    t_mine = device_ms(run(A.attention))
-    t_flash = device_ms(run(F.scaled_dot_product_attention))
-
     def math_attention(a, b, c):
         with sdpa_kernel(SDPBackend.MATH):
             return F.scaled_dot_product_attention(a, b, c)
 
-    t_math = device_ms(run(math_attention))
+    fns = {"this": run(A.attention), "flash": run(F.scaled_dot_product_attention), "math": run(math_attention)}
+    for fn in fns.values():
+        fn()
+    torch.xpu.synchronize()
+    best = {name: float("inf") for name in fns}
+    for _ in range(3):
+        for name, fn in fns.items():
+            best[name] = min(best[name], device_ms(fn))
+    t_mine, t_flash, t_math = best["this"], best["flash"], best["math"]
     print(f"{label:22s} {t_mine:8.3f} {t_flash:8.3f} {t_math:8.3f}  {t_mine / t_flash:9.2f}x {t_math / t_mine:9.2f}x")

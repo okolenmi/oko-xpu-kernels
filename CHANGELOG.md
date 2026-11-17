@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 -- 2026-11-17
 
 * **The two gate-safe Triton extensions are now the default.** Importing `xpu_kernels` calls
   `os.environ.setdefault("TRITON_INTEL_DEVICE_EXTENSIONS", "cl_intel_subgroup_matrix_multiply_accumulate cl_intel_subgroup_2d_block_io")`

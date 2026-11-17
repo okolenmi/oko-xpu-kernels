@@ -69,7 +69,7 @@ from .capture import (
 )
 from . import int8, triton
 
-__version__ = "0.4.0.dev0"
+__version__ = "0.4.0"
 
 __all__ = [
     "ACTIVATIONS", "Int8Linear", "PAIRED_ACTIVATIONS", "TrainableInt8Linear", "available", "capture_status", "dequant",

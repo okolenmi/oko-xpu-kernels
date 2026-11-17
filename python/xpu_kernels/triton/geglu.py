@@ -161,6 +161,8 @@ def geglu(h):
     """``h[.., :I] * gelu(h[.., I:])`` for a contiguous ``h`` of shape ``[.., 2I]``; differentiable."""
     if not h.is_contiguous():
         h = h.contiguous()
+    if h.device.type not in ACCELERATORS:
+        raise RuntimeError(f"the fused GEGLU runs on {ACCELERATORS}, not {h.device.type}")
     return _Geglu.apply(h)
 
 
